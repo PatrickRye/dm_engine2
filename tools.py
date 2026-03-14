@@ -770,7 +770,7 @@ async def roll_generic_dice(formula: str,  reason: str, *, config: Annotated[Run
     if modifier_op == '+': total += modifier_val
     elif modifier_op == '-': total -= modifier_val
     
-    result = f"ECHANICAL TRUTH: Rolled {formula} for {reason}. Result:{total}"
+    result = f"MECHANICAL TRUTH: Rolled {formula} for {reason}. Result:{total}"
     await write_audit_log(config["configurable"].get("thread_id"), "Rules Engine", "roll_generic_dice Executed", result)
     return result
 
@@ -1066,7 +1066,18 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
     target_string = ", ".join([t.name for t in targets if t]) or "themselves"
     
     if entry.mechanics.damage_dice:
-        dmg = roll_generic_dice(entry.mechanics.damage_dice)
+        # Parse the dice string locally to get an integer
+        match = re.match(r"(\d+)d(\d+)(?:\s*([+-])\s*(\d+))?", entry.mechanics.damage_dice.strip().lower())
+        dmg = 0
+        if match:
+            num_dice, die_sides = int(match.group(1)), int(match.group(2))
+            modifier_op = match.group(3)
+            modifier_val = int(match.group(4)) if match.group(4) else 0
+            rolls = [random.randint(1, die_sides) for _ in range(num_dice)]
+            dmg = sum(rolls)
+            if modifier_op == '+': dmg += modifier_val
+            elif modifier_op == '-': dmg -= modifier_val
+            
         for t in targets:
             if t: t.hp.base_value -= dmg
         return f"MECHANICAL TRUTH: {caster.name} used {entry.name} on {target_string}, dealing {dmg} {entry.mechanics.damage_type} damage."

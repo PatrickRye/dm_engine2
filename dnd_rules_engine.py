@@ -1,5 +1,6 @@
 import uuid
 import random
+import re
 from enum import IntEnum
 from typing import ClassVar, Dict, Any, List, Callable, Optional, Tuple
 from pydantic import BaseModel, Field, PrivateAttr
@@ -154,13 +155,17 @@ class DamageCondition(BaseModel):
 class ConditionalDamageWeapon(MagicWeaponDecorator):
     """A decorator that deals extra damage based on target properties."""
     conditions: List[DamageCondition]
+    _subscribed = False
 
     def __init__(self, *, weapon: Weapon, **data):
         super().__init__(weapon=weapon, **data)
-        EventBus.subscribe("MeleeAttack", self.handle_attack, priority=50)
+        if not ConditionalDamageWeapon._subscribed:
+            EventBus.subscribe("MeleeAttack", self.handle_attack, priority=50)
+            ConditionalDamageWeapon._subscribed = True
 
     def handle_attack(self, event: 'GameEvent'):
-        if event.status != EventStatus.POST_EVENT or not event.payload.get("hit"):
+        # This handler should run before the main resolve_attack_handler
+        if event.status != EventStatus.PRE_EVENT:
             return
 
         attacker = BaseGameEntity.get(event.source_uuid)
@@ -168,15 +173,12 @@ class ConditionalDamageWeapon(MagicWeaponDecorator):
             return
 
         target = BaseGameEntity.get(event.target_uuid)
-        extra_damage = 0
         for condition in self.conditions:
             if condition.required_tag in target.tags or condition.required_tag == target.alignment:
-                damage = roll_dice(condition.extra_damage_dice)
-                print(f"[Engine] BONUS: {self.name} glows, dealing an extra {damage} {condition.damage_type} damage to the {condition.required_tag}!")
-                extra_damage += damage
-        
-        if extra_damage > 0:
-            event.payload["damage"] = event.payload.get("damage", 0) + extra_damage
+                if "extra_damage_dice" not in event.payload:
+                    event.payload["extra_damage_dice"] = []
+                event.payload["extra_damage_dice"].append(condition.extra_damage_dice)
+                print(f"[Engine] BONUS: {self.name} will deal extra {condition.extra_damage_dice} {condition.damage_type} damage to the {condition.required_tag}!")
 
 class Creature(BaseGameEntity):
     hp: ModifiableValue
@@ -188,6 +190,9 @@ class Creature(BaseGameEntity):
     features: List[Feature] = Field(default_factory=list)
     tags: List[str] = Field(default_factory=list)
     alignment: str = "neutral"
+    vulnerabilities: List[str] = Field(default_factory=list)
+    resistances: List[str] = Field(default_factory=list)
+    immunities: List[str] = Field(default_factory=list)
 
     @property
     def character_level(self) -> int:
@@ -242,6 +247,7 @@ class EventBus:
         cls._notify(event)
         
         event.status = EventStatus.RESOLVED
+        cls._notify(event)
         return event
 
     @classmethod
@@ -254,9 +260,21 @@ class EventBus:
 # ==========================================
 
 def roll_dice(notation: str) -> int:
-    """Simple parser for XdY (e.g., 1d8, 2d6)."""
-    count, faces = map(int, notation.lower().split('d'))
-    return sum(random.randint(1, faces) for _ in range(count))
+    """Parses and rolls generic D&D dice formulas (e.g., '1d8', '2d6+3')."""
+    match = re.match(r"(\d+)d(\d+)(?:\s*([+-])\s*(\d+))?", notation.strip().lower())
+    if not match:
+        return 0
+        
+    count, faces = int(match.group(1)), int(match.group(2))
+    modifier_op = match.group(3)
+    modifier_val = int(match.group(4)) if match.group(4) else 0
+    
+    total = sum(random.randint(1, faces) for _ in range(count))
+    
+    if modifier_op == '+': total += modifier_val
+    elif modifier_op == '-': total -= modifier_val
+    
+    return max(0, total) # Prevents negative damage
 
 def resolve_attack_handler(event: GameEvent):
     """Calculates if an attack hits and its base damage. Listens to EXECUTION phase."""
@@ -268,26 +286,63 @@ def resolve_attack_handler(event: GameEvent):
 
     attack_mod = weapon.get_attack_modifier(attacker)
     attack_bonus = attack_mod.total + weapon.magic_bonus
-    d20_roll = random.randint(1, 20)
+    
+    # Handle advantage and disadvantage
+    roll1 = random.randint(1, 20)
+    roll2 = random.randint(1, 20)
+    
+    if event.payload.get("advantage"):
+        d20_roll = max(roll1, roll2)
+        print("[Engine] Attack has ADVANTAGE, rolling twice and taking the higher roll.")
+    elif event.payload.get("disadvantage"):
+        d20_roll = min(roll1, roll2)
+        print("[Engine] Attack has DISADVANTAGE, rolling twice and taking the lower roll.")
+    else:
+        d20_roll = roll1
+
     total_attack = d20_roll + attack_bonus
     target_ac = target.ac.total
 
-    print(f"[Engine] {attacker.name} rolls a {d20_roll} + {attack_bonus} = {total_attack} vs AC {target_ac}")
+    is_critical_hit = d20_roll == 20
+    is_hit = is_critical_hit or total_attack >= target_ac
 
-    if total_attack >= target_ac:
+    print(f"[Engine] {attacker.name} rolls a {d20_roll} ({roll1}, {roll2} if adv/disadv) + {attack_bonus} = {total_attack} vs AC {target_ac}")
+
+    if is_hit:
+        if is_critical_hit:
+            print("[Engine] CRITICAL HIT!")
         print(f"[Engine] HIT!")
+        
         damage_mod = weapon.get_damage_modifier(attacker)
+        # Roll base damage dice
         base_damage = roll_dice(weapon.damage_dice) + damage_mod.total + weapon.magic_bonus
         
+        # Add conditional damage dice
+        extra_damage = 0
+        if "extra_damage_dice" in event.payload:
+            for dice in event.payload["extra_damage_dice"]:
+                extra_damage += roll_dice(dice)
+
+        total_damage = base_damage + extra_damage
+
+        # Double all dice on a critical hit
+        if is_critical_hit:
+            crit_damage = roll_dice(weapon.damage_dice)
+            if "extra_damage_dice" in event.payload:
+                for dice in event.payload["extra_damage_dice"]:
+                    crit_damage += roll_dice(dice)
+            total_damage += crit_damage
+        
         event.payload["hit"] = True
-        event.payload["damage"] = base_damage
+        event.payload["damage"] = total_damage
         event.payload["damage_type"] = weapon.damage_type
+        event.payload["critical"] = is_critical_hit
     else:
         print(f"[Engine] MISS! The attack glances off {target.name}'s armor.")
         event.payload["hit"] = False
 
 def apply_damage_handler(event: GameEvent):
-    """Applies final damage to a target. Listens to POST_EVENT phase."""
+    """Applies final damage to a target, considering immunities, resistances, and vulnerabilities."""
     if event.status != EventStatus.POST_EVENT or not event.payload.get("hit"):
         return
         
@@ -296,6 +351,19 @@ def apply_damage_handler(event: GameEvent):
     damage_type = event.payload.get("damage_type", "unknown")
 
     if damage > 0:
+        # Check for immunities first
+        if damage_type in target.immunities:
+            damage = 0
+            print(f"[Engine] {target.name} is IMMUNE to {damage_type}!")
+        else:
+            # Then check for vulnerabilities and resistances
+            if damage_type in target.vulnerabilities:
+                damage *= 2
+                print(f"[Engine] {target.name} is VULNERABLE to {damage_type}! Damage is doubled.")
+            elif damage_type in target.resistances:
+                damage = damage // 2 # Halve the damage, rounding down
+                print(f"[Engine] {target.name} is RESISTANT to {damage_type}! Damage is halved.")
+
         target.hp.base_value -= damage
         print(f"[Engine] {target.name} takes {damage} {damage_type} damage. HP remaining: {target.hp.base_value}")
 
@@ -304,7 +372,7 @@ def shield_spell_reaction_handler(event: GameEvent):
     if event.status != EventStatus.PRE_EVENT: return
     
     target: Creature = BaseGameEntity.get(event.target_uuid)
-    if target.name == "Lyra the Wizard":
+    if "can_cast_shield" in target.tags:
         print(f"[Engine] REACTION TRIGGERED: {target.name} casts Shield!")
         shield_mod = NumericalModifier(
             priority=ModifierPriority.ADDITIVE, 
@@ -314,11 +382,32 @@ def shield_spell_reaction_handler(event: GameEvent):
         target.ac.add_modifier(shield_mod)
         print(f"[Engine] {target.name}'s AC is temporarily raised to {target.ac.total}")
 
+        # Add the modifier's UUID to the event payload to be removed later
+        if "temp_mods" not in event.payload:
+            event.payload["temp_mods"] = []
+        event.payload["temp_mods"].append(shield_mod.mod_uuid)
+
+def cleanup_temp_mods_handler(event: GameEvent):
+    """Removes temporary modifiers after an event is resolved."""
+    if event.status != EventStatus.RESOLVED: return
+
+    if "temp_mods" in event.payload:
+        for mod_uuid in event.payload["temp_mods"]:
+            # This is a simplification. In a real game, you'd need to know
+            # which creature and which stat the modifier was applied to.
+            # For this example, we'll assume it's the target's AC.
+            target: Creature = BaseGameEntity.get(event.target_uuid)
+            if target:
+                target.ac.remove_modifier(mod_uuid)
+                print(f"[Engine] The Shield spell fades. {target.name}'s AC returns to {target.ac.total}")
+
+
 # Register handlers to the Event Bus
-# Higher priority numbers run first.
-EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
+# Lower priority numbers run first.
 EventBus.subscribe("MeleeAttack", shield_spell_reaction_handler, priority=1)
+EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
 EventBus.subscribe("MeleeAttack", apply_damage_handler, priority=100)
+EventBus.subscribe("MeleeAttack", cleanup_temp_mods_handler, priority=200)
 
 # ==========================================
 # 6. DEMONSTRATION SCRIPT
@@ -348,6 +437,15 @@ if __name__ == "__main__":
         equipped_weapon_uuid=sun_blade.entity_uuid
     )
 
+    wizard = Creature(
+        name="Lyra the Wizard",
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=12),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=2),
+        tags=["can_cast_shield"]
+    )
+
     zombie = Creature(
         name="Mindless Zombie",
         hp=ModifiableValue(base_value=22),
@@ -359,13 +457,23 @@ if __name__ == "__main__":
 
     # 3. Trigger an Event
     print("\n--- Paladin attacks Zombie with Sun Blade ---")
-    attack_event = GameEvent(
+    attack_event_1 = GameEvent(
         event_type="MeleeAttack",
         source_uuid=fighter.entity_uuid,
         target_uuid=zombie.entity_uuid
     )
     
-    final_event = EventBus.dispatch(attack_event)
+    final_event_1 = EventBus.dispatch(attack_event_1)
     
+    print("\n--- Paladin attacks Wizard ---")
+    attack_event_2 = GameEvent(
+        event_type="MeleeAttack",
+        source_uuid=fighter.entity_uuid,
+        target_uuid=wizard.entity_uuid
+    )
+
+    final_event_2 = EventBus.dispatch(attack_event_2)
+
     print("\n--- Final Output for LangGraph ---")
-    print(final_event.model_dump_json(indent=2))
+    print(final_event_1.model_dump_json(indent=2))
+    print(final_event_2.model_dump_json(indent=2))
