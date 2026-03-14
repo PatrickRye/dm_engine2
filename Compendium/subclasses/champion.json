@@ -1,0 +1,11 @@
+{
+    "name": "Champion",
+    "parent_class": "Fighter",
+    "features": [
+        {
+            "name": "Improved Critical",
+            "level": 3,
+            "description": "Your weapon attacks score a critical hit on a roll of 19 or 20."
+        }
+    ]
+}

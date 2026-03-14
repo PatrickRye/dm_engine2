@@ -1,0 +1,35 @@
+{
+    "name": "Fighter",
+    "features": [
+        {
+            "name": "Fighting Style",
+            "level": 1,
+            "description": "You adopt a particular style of fighting as your specialty."
+        },
+        {
+            "name": "Second Wind",
+            "level": 1,
+            "description": "You have a limited well of stamina that you can draw on to protect yourself from harm."
+        },
+        {
+            "name": "Action Surge",
+            "level": 2,
+            "description": "You can push yourself beyond your normal limits for a moment."
+        },
+        {
+            "name": "Martial Archetype",
+            "level": 3,
+            "description": "You choose an archetype that you strive to emulate in your combat styles and techniques."
+        },
+        {
+            "name": "Ability Score Improvement",
+            "level": 4,
+            "description": "You can increase one ability score of your choice by 2, or you can increase two ability scores of your choice by 1."
+        },
+        {
+            "name": "Extra Attack",
+            "level": 5,
+            "description": "You can attack twice, instead of once, whenever you take the Attack action on your turn."
+        }
+    ]
+}
