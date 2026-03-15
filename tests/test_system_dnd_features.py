@@ -6,10 +6,12 @@ from dnd_rules_engine import (
     MeleeWeapon, RangedWeapon, ActiveCondition,
 )
 from spatial_engine import spatial_service, MapData, Wall, TerrainZone
+import event_handlers
+from registry import clear_registry
 
 @pytest.fixture(autouse=True)
 def setup_system():
-    BaseGameEntity._registry.clear()
+    clear_registry()
     spatial_service._uuid_to_id.clear()
     spatial_service._id_to_uuid.clear()
     spatial_service._uuid_to_bbox.clear()

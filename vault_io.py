@@ -13,12 +13,13 @@ import glob
 from dnd_rules_engine import BaseGameEntity, Creature, ModifiableValue, MeleeWeapon, NumericalModifier, ModifierPriority, ActiveCondition, parse_duration_to_seconds
 from compendium_manager import CompendiumManager
 from spatial_engine import spatial_service
+from registry import clear_registry, get_all_entities
 
 
 async def initialize_engine_from_vault(vault_path: str):
     """Reads characters and monsters from the vault into the Deterministic Engine."""
     print("Loading entities into Deterministic Engine...")
-    BaseGameEntity._registry.clear() # Reset memory for the new turn
+    clear_registry() # Reset memory for the new turn
     
     search_pattern = os.path.join(vault_path, "**", "*.md")
     for filepath in glob.glob(search_pattern, recursive=True):
@@ -103,7 +104,7 @@ async def initialize_engine_from_vault(vault_path: str):
 async def sync_engine_to_vault():
     """Writes current Engine state (HP, etc.) back to the Obsidian files."""
     print("Syncing Engine state back to Vault...")
-    for uid, entity in BaseGameEntity._registry.items():
+    for uid, entity in get_all_entities().items():
         if not hasattr(entity, '_filepath'): continue
         
         filepath = entity._filepath

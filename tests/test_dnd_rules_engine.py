@@ -8,18 +8,21 @@ from dnd_rules_engine import (
     ModifiableValue,
     GameEvent,
     EventBus,
-    resolve_attack_handler,
-    apply_damage_handler,
     MeleeWeapon,
     ConditionalDamageWeapon,
     DamageCondition,
+)
+from event_handlers import (
+    resolve_attack_handler,
+    apply_damage_handler,
     shield_spell_reaction_handler,
 )
+from registry import clear_registry
 
 class TestDnDRulesEngine(unittest.TestCase):
     def setUp(self):
         """Reset the game state before each test."""
-        BaseGameEntity._registry.clear()
+        clear_registry()
         EventBus._listeners.clear()
         # Reset the subscription flag for ConditionalDamageWeapon
         ConditionalDamageWeapon._subscribed = False

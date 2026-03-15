@@ -13,11 +13,12 @@ from typing import Optional, Annotated, Union
 import uuid
 
 # === DETERMINISTIC ENGINE INTEGRATION ===
-from dnd_rules_engine import EventBus, GameEvent, BaseGameEntity, Creature, MeleeWeapon, roll_dice as roll_generic_dice
+from dnd_rules_engine import EventBus, GameEvent, EventStatus, BaseGameEntity, Creature, MeleeWeapon, roll_dice as roll_generic_dice
 from state import PCDetails, NPCDetails, LocationDetails, FactionDetails, ClassLevel
 from vault_io import get_journals_dir, write_audit_log, read_markdown_entity_no_lock, write_markdown_entity_no_lock, upsert_journal_section
 from compendium_manager import CompendiumManager, CompendiumEntry, MechanicEffect
 from spatial_engine import spatial_service
+import event_handlers
 
 
 
@@ -649,6 +650,13 @@ async def level_up_character(character_name: str, class_name: str, hp_increase: 
         creature = _get_entity_by_name(character_name)
         if not creature or not isinstance(creature, Creature):
             return f"Error: Creature '{character_name}' not found in the deterministic engine."
+
+        # Sync the new stats to the active OO Engine memory
+        creature.max_hp = new_max_hp
+        creature.hp.base_value += hp_increase
+        for c in creature.classes:
+            if c.class_name.lower() == class_name.lower():
+                c.level = new_level
 
         # Apply features from class definition
         class_def = await CompendiumManager.get_class_definition(vault_path, class_to_level_up.class_name)
@@ -1408,3 +1416,13 @@ async def clear_readied_action(character_name: str, *, config: Annotated[Runnabl
         await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
             
     return f"Success: Cleared readied action for {character_name}."
+
+@tool
+async def use_dash_action(entity_name: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """Allows an entity to use their action to double their movement speed for the turn."""
+    entity = _get_entity_by_name(entity_name)
+    if not entity or not isinstance(entity, Creature):
+        return f"SYSTEM ERROR: Entity '{entity_name}' not found."
+        
+    entity.movement_remaining += entity.speed
+    return f"MECHANICAL TRUTH: {entity.name} took the Dash action. Their remaining movement is now {entity.movement_remaining}ft."

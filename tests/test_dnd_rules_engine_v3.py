@@ -8,17 +8,16 @@ from dnd_rules_engine import (
     ModifiableValue,
     GameEvent,
     EventBus,
-    resolve_attack_handler,
-    apply_damage_handler,
     Weapon,
-    Item,
 )
 from effects import DamageEffect, EffectCondition
+from event_handlers import resolve_attack_handler, apply_damage_handler
+from registry import clear_registry
 
 class TestDnDRulesEngineV3(unittest.TestCase):
     def setUp(self):
         """Reset the game state before each test."""
-        BaseGameEntity._registry.clear()
+        clear_registry()
         EventBus._listeners.clear()
 
         EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)

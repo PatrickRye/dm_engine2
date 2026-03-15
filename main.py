@@ -22,6 +22,7 @@ from prompts import MASTER_PROMPT
 from vault_io import write_audit_log, upsert_journal_section, initialize_engine_from_vault, sync_engine_to_vault
 from tools import *
 from tools import _get_config_tone
+import event_handlers
 
 import time
 

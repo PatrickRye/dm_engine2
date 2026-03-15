@@ -1,10 +1,15 @@
 import uuid
 import math
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Protocol
 from pydantic import BaseModel, Field
 
-# Ensure dnd_rules_engine classes are available
-from dnd_rules_engine import BaseGameEntity
+class SpatialObject(Protocol):
+    entity_uuid: uuid.UUID
+    x: float
+    y: float
+    z: float
+    size: float
+    height: float
 
 try:
     from shapely.geometry import Point, LineString, Polygon, box
@@ -68,6 +73,7 @@ class SpatialQueryService:
         if HAS_GIS:
             p = index.Property()
             self.entity_idx = index.Index(properties=p)
+            self._entities: Dict[uuid.UUID, SpatialObject] = {}
             self._uuid_to_id: Dict[uuid.UUID, int] = {}
             self._id_to_uuid: Dict[int, uuid.UUID] = {}
             self._uuid_to_bbox: Dict[uuid.UUID, Tuple[float, float, float, float]] = {}
@@ -76,10 +82,11 @@ class SpatialQueryService:
     def load_map(self, map_data: MapData):
         self.map_data = map_data
 
-    def sync_entity(self, entity: BaseGameEntity):
+    def sync_entity(self, entity: SpatialObject):
         """Adds or updates an entity's bounding box in the Rtree spatial index."""
         if not HAS_GIS: return
         
+        self._entities[entity.entity_uuid] = entity
         new_bbox = self._get_bbox(entity)
         
         if entity.entity_uuid not in self._uuid_to_id:
@@ -107,6 +114,8 @@ class SpatialQueryService:
         del self._id_to_uuid[curr_id]
         del self._uuid_to_id[entity_uuid]
         del self._uuid_to_bbox[entity_uuid]
+        if entity_uuid in self._entities:
+            del self._entities[entity_uuid]
         
     def calculate_distance(self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float) -> float:
         """Calculates 3D distance using the map's configured metric."""
@@ -118,11 +127,11 @@ class SpatialQueryService:
         else:
             return math.hypot(dx, dy, dz)
 
-    def _get_bbox(self, entity: BaseGameEntity) -> Tuple[float, float, float, float]:
+    def _get_bbox(self, entity: SpatialObject) -> Tuple[float, float, float, float]:
         half_size = entity.size / 2.0
         return (entity.x - half_size, entity.y - half_size, entity.x + half_size, entity.y + half_size)
 
-    def _get_entity_bbox(self, entity: BaseGameEntity):
+    def _get_entity_bbox(self, entity: SpatialObject):
         if not HAS_GIS: return None
         return box(*self._get_bbox(entity))
 
@@ -143,7 +152,7 @@ class SpatialQueryService:
         origin_z = 0.0 # Default flat if not specified
         for cid in candidate_ids:
             ent_uuid = self._id_to_uuid[cid]
-            entity = BaseGameEntity.get(ent_uuid)
+            entity = self._entities.get(ent_uuid)
             if entity:
                 ent_poly = self._get_entity_bbox(entity)
                 if search_area.intersects(ent_poly):
@@ -172,7 +181,7 @@ class SpatialQueryService:
         hit_uuids = []
         for cid in candidate_ids:
             ent_uuid = self._id_to_uuid[cid]
-            entity = BaseGameEntity.get(ent_uuid)
+            entity = self._entities.get(ent_uuid)
             if entity:
                 ent_poly = self._get_entity_bbox(entity)
                 if cone_poly.intersects(ent_poly):
@@ -184,8 +193,8 @@ class SpatialQueryService:
         """Calculates distance and determines cover (None, Half, Three-Quarters, Total)."""
         if not HAS_GIS: return 0.0, "None"
         
-        source = BaseGameEntity.get(source_uuid)
-        target = BaseGameEntity.get(target_uuid)
+        source = self._entities.get(source_uuid)
+        target = self._entities.get(target_uuid)
         if not source or not target:
             return 0.0, "Total"
             
@@ -290,7 +299,8 @@ class SpatialQueryService:
     def has_line_of_sight_to_point(self, source_uuid: uuid.UUID, target_x: float, target_y: float, target_z: float = 0.0) -> bool:
         """Checks if a source entity has unbroken line of sight to a specific coordinate from ANY of its corners."""
         if not HAS_GIS: return True
-        source = BaseGameEntity.get(source_uuid)
+        
+        source = self._entities.get(source_uuid)
         if not source: return False
         
         source_poly = self._get_entity_bbox(source)
@@ -322,7 +332,7 @@ class SpatialQueryService:
             
         # Draw Entities
         for uid, eid in self._uuid_to_id.items():
-            entity = BaseGameEntity.get(uid)
+            entity = self._entities.get(uid)
             if entity:
                 x = int(entity.x / self.map_data.grid_scale)
                 y = int(entity.y / self.map_data.grid_scale)

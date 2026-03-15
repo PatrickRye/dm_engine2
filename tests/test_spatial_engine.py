@@ -3,11 +3,12 @@ import uuid
 
 from dnd_rules_engine import BaseGameEntity, Creature, ModifiableValue
 from spatial_engine import spatial_service, MapData, Wall, HAS_GIS
+from registry import clear_registry
 
 @unittest.skipIf(not HAS_GIS, "Shapely and Rtree are required (pip install shapely rtree)")
 class TestSpatialEngine(unittest.TestCase):
     def setUp(self):
-        BaseGameEntity._registry.clear()
+        clear_registry()
         if HAS_GIS:
             spatial_service.map_data = MapData()
             spatial_service._uuid_to_id.clear()
