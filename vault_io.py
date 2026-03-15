@@ -1,6 +1,7 @@
 import os
 import re
 import yaml
+import math
 import aiofiles
 import aiofiles.os as aios
 from filelock.asyncio import AsyncSoftFileLock
@@ -9,7 +10,9 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool, InjectedToolArg
 from typing import Annotated
 import glob
-from dnd_rules_engine import BaseGameEntity, Creature, ModifiableValue
+from dnd_rules_engine import BaseGameEntity, Creature, ModifiableValue, MeleeWeapon, NumericalModifier, ModifierPriority, ActiveCondition, parse_duration_to_seconds
+from compendium_manager import CompendiumManager
+from spatial_engine import spatial_service
 
 
 async def initialize_engine_from_vault(vault_path: str):
@@ -30,13 +33,70 @@ async def initialize_engine_from_vault(vault_path: str):
             if any(t in tags for t in ["pc", "npc", "monster", "creature"]):
                 entity = Creature(
                     name=yaml_data.get("name", os.path.basename(filepath).replace(".md", "")),
+                    x=float(yaml_data.get("x", 0.0)),
+                    y=float(yaml_data.get("y", 0.0)),
+                    z=float(yaml_data.get("z", 0.0)),
+                    height=float(yaml_data.get("height", yaml_data.get("size", 5.0))),
+                    max_hp=int(yaml_data.get("max_hp", yaml_data.get("hp", 10))),
                     hp=ModifiableValue(base_value=yaml_data.get("hp", 10)),
                     ac=ModifiableValue(base_value=yaml_data.get("ac", 10)),
-                    strength_mod=ModifiableValue(base_value=yaml_data.get("strength_mod", 0))
+                    strength_mod=ModifiableValue(base_value=yaml_data.get("strength_mod", math.floor((yaml_data.get("strength", yaml_data.get("str", 10)) - 10) / 2))),
+                    dexterity_mod=ModifiableValue(base_value=yaml_data.get("dexterity_mod", math.floor((yaml_data.get("dexterity", yaml_data.get("dex", 10)) - 10) / 2))),
+                    constitution_mod=ModifiableValue(base_value=yaml_data.get("constitution_mod", math.floor((yaml_data.get("constitution", yaml_data.get("con", 10)) - 10) / 2))),
+                    intelligence_mod=ModifiableValue(base_value=yaml_data.get("intelligence_mod", math.floor((yaml_data.get("intelligence", yaml_data.get("int", 10)) - 10) / 2))),
+                    wisdom_mod=ModifiableValue(base_value=yaml_data.get("wisdom_mod", math.floor((yaml_data.get("wisdom", yaml_data.get("wis", 10)) - 10) / 2))),
+                    charisma_mod=ModifiableValue(base_value=yaml_data.get("charisma_mod", math.floor((yaml_data.get("charisma", yaml_data.get("cha", 10)) - 10) / 2))),
+                    spell_save_dc=ModifiableValue(base_value=yaml_data.get("spell_save_dc", 10)),
+                    spell_attack_bonus=ModifiableValue(base_value=int(str(yaml_data.get("spell_atk", "0")).replace('+', ''))),
+                    active_mechanics=yaml_data.get("active_mechanics", []),
+                    resources=yaml_data.get("resources", {}),
+                    active_conditions=[ActiveCondition(**c) for c in yaml_data.get("active_conditions", [])] if isinstance(yaml_data.get("active_conditions", []), list) else [],
+                    concentrating_on=yaml_data.get("concentrating_on", ""),
+                    reaction_used=bool(yaml_data.get("reaction_used", False)),
+                    legendary_actions_max=int(yaml_data.get("legendary_actions_max", yaml_data.get("legendary_actions", 0))),
+                    legendary_actions_current=int(yaml_data.get("legendary_actions_current", yaml_data.get("legendary_actions", 0))),
+                    speed=int(yaml_data.get("speed", 30)),
+                    movement_remaining=int(yaml_data.get("movement_remaining", yaml_data.get("speed", 30)))
                 )
+                
+                # Bridge: Initialize and Equip the Object-Oriented Weapon
+                equipment = yaml_data.get("equipment", {})
+                main_hand = equipment.get("main_hand", "Unarmed")
+                
+                # Fallback heuristic until compendium item lookup is fully implemented
+                dmg_dice = "1d4" if "Unarmed" in main_hand else "1d8"
+                dmg_type = "bludgeoning" if "Unarmed" in main_hand else "slashing"
+                
+                weapon = MeleeWeapon(name=main_hand, damage_dice=dmg_dice, damage_type=dmg_type)
+                entity.equipped_weapon_uuid = weapon.entity_uuid
+                
+                # Bridge: Hydrate Active Mechanics (Feats/Items) into Modifiers and Tags
+                for mechanic_name in entity.active_mechanics:
+                    entry = await CompendiumManager.get_entry(vault_path, mechanic_name)
+                    if entry and entry.mechanics:
+                        # Apply qualitative tags
+                        entity.tags.extend(entry.mechanics.granted_tags)
+                        
+                        # Apply quantitative modifiers
+                        for mod_data in entry.mechanics.modifiers:
+                            target_stat = mod_data.get("stat")
+                            duration_secs = parse_duration_to_seconds(mod_data.get("duration", "-1"))
+                                    
+                            if hasattr(entity, target_stat):
+                                stat_obj = getattr(entity, target_stat)
+                                if isinstance(stat_obj, ModifiableValue):
+                                    stat_obj.add_modifier(NumericalModifier(
+                                        priority=ModifierPriority.ADDITIVE,
+                                        value=int(mod_data.get("value", 0)),
+                                        source_name=mechanic_name,
+                                        duration_seconds=duration_secs
+                                    ))
+
                 # Monkey-patch the filepath onto the object so we know where to save it later
                 entity._filepath = filepath 
                 print(f"Loaded to Engine: {entity.name} (HP: {entity.hp.base_value})")
+                
+                spatial_service.sync_entity(entity)
         except Exception as e:
             continue # Skip files that aren't formatted correctly
 
@@ -54,6 +114,22 @@ async def sync_engine_to_vault():
             if isinstance(entity, Creature):
                 yaml_data["hp"] = entity.hp.base_value
                 yaml_data["ac"] = entity.ac.base_value
+                yaml_data["x"] = entity.x
+                yaml_data["y"] = entity.y
+                yaml_data["z"] = entity.z
+                yaml_data["height"] = entity.height
+                if entity.resources:
+                    yaml_data["resources"] = entity.resources
+                if entity.active_conditions:
+                    yaml_data["active_conditions"] = [c.model_dump(exclude={'condition_id'}) for c in entity.active_conditions]
+                elif "active_conditions" in yaml_data:
+                    yaml_data["active_conditions"] = []
+            yaml_data["concentrating_on"] = entity.concentrating_on
+            yaml_data["reaction_used"] = entity.reaction_used
+            yaml_data["legendary_actions_max"] = entity.legendary_actions_max
+            yaml_data["legendary_actions_current"] = entity.legendary_actions_current
+            yaml_data["speed"] = entity.speed
+            yaml_data["movement_remaining"] = entity.movement_remaining
                 
             # Reconstruct the file
             new_yaml_str = yaml.dump(yaml_data, sort_keys=False)
@@ -204,5 +280,3 @@ async def upsert_journal_section(entity_name: str, section_header: str, content:
             await f.writelines(out_lines)
             
     return f"Success: {mode.capitalize()}ed content to '{section_header}' in {entity_name}.md."
-
-

@@ -1,0 +1,38 @@
+name: Python Pytest CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: 'pip' # Caches pip dependencies for faster subsequent runs
+
+    - name: Install System Dependencies (GIS)
+      run: |
+        sudo apt-get update
+        # rtree requires the C-library libspatialindex to be installed on Linux
+        sudo apt-get install -y libspatialindex-dev
+
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-asyncio
+        pip install pydantic shapely rtree pyyaml aiofiles filelock langchain-core langchain-google-genai langgraph fastapi uvicorn
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: Run Pytest Suite
+      run: |
+        pytest -v

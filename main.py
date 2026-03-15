@@ -32,7 +32,8 @@ MASTER_TOOLS_LIST = [
     update_character_status, manage_inventory, roll_generic_dice, perform_ability_check_or_save, search_vault_by_tag, 
     advance_time, start_combat, update_combat_state, end_combat, execute_melee_attack, 
     modify_health, query_bestiary, query_rulebook, query_campaign_module,
-    use_ability_or_spell, encode_new_compendium_entry
+    use_ability_or_spell, encode_new_compendium_entry, drop_concentration,
+    ready_action, clear_readied_action, move_entity, use_dash_action
 ]
 
 # 1. INITIALIZE THE APP FIRST
@@ -175,6 +176,7 @@ async def qa_node(state: DMState, config: RunnableConfig):
         "7. FEATS & MECHANICS: Did the DM ignore a character's active feats or spells during combat/checks? (If yes, REJECT).\n"
         "8. MAGIC ITEMS & ATTUNEMENT: Did the DM grant/use an item without tracking it, or allow exceeding 3 attuned items? (If yes, REJECT).\n"
         "9. OBSIDIAN FORMATTING: Did the DM fail to use [[Wikilinks]] for proper nouns? (If yes, REJECT).\n"
+        "10. COMPENDIUM AUDIT: If `encode_new_compendium_entry` warned about an unsupported feat/tag, did the DM explicitly notify the human player OOC? (If no, REJECT).\n"
         + tone_check +
         "\nIf ANY rule is broken, set 'approved' to False and explain exactly what to rewrite. "
         "If the DM applied a mechanic incorrectly, do not just tell them it is wrong. You MUST provide the details of the game rules needed to fix it."
@@ -347,4 +349,3 @@ async def chat_endpoint(request: ChatRequest): # <--- Added async
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
