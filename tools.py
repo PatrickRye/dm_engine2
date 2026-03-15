@@ -13,12 +13,14 @@ from typing import Optional, Annotated, Union
 import uuid
 
 # === DETERMINISTIC ENGINE INTEGRATION ===
-from dnd_rules_engine import EventBus, GameEvent, EventStatus, BaseGameEntity, Creature, MeleeWeapon, roll_dice as roll_generic_dice, ActiveCondition, ModifiableValue
+from dnd_rules_engine import EventBus, GameEvent, EventStatus, BaseGameEntity, Creature, MeleeWeapon, roll_dice as roll_generic_dice, ActiveCondition, ModifiableValue, NumericalModifier, ModifierPriority
 from state import PCDetails, NPCDetails, LocationDetails, FactionDetails, ClassLevel
 from vault_io import get_journals_dir, write_audit_log, read_markdown_entity_no_lock, write_markdown_entity_no_lock, upsert_journal_section, read_markdown_entity, edit_markdown_entity
 from compendium_manager import CompendiumManager, CompendiumEntry, MechanicEffect
 from spatial_engine import spatial_service, LightSource, Wall
 import event_handlers
+from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
+from item_system import WeaponItem, ArmorItem, WondrousItem, ItemCompendium
 
 from registry import get_all_entities
 
@@ -36,6 +38,31 @@ def _get_entity_by_name(name: str) -> Optional[BaseGameEntity]:
        if name.lower() in entity.name.lower() or entity.name.lower() in name.lower():
             return entity
     return None
+
+def _calculate_reach(entity: BaseGameEntity, is_active_turn: bool = False) -> float:
+    """Calculates effective melee reach based on weapon and traits."""
+    reach = getattr(entity, 'base_reach', 5.0)
+    tags = [t.lower() for t in getattr(entity, 'tags', [])]
+    
+    # Check equipped weapon if available on sheet
+    if hasattr(entity, 'equipment'):
+        main_hand = str(getattr(entity, 'equipment', {}).get('main_hand', '')).lower()
+        if any(w in main_hand for w in ["halberd", "glaive", "pike", "whip", "lance", "reach"]):
+            reach += 5.0
+            
+    # Explicit weapon tags
+    if any(w in tags for w in ["reach_weapon", "halberd", "glaive", "pike", "whip", "lance"]):
+        reach += 5.0
+        
+    # Class features
+    if any(f in tags for f in ["giant_stature", "path_of_the_giant"]):
+        reach += 5.0
+        
+    # Species traits (Bugbear's Long-Limbed only applies on their own turn)
+    if is_active_turn and ("bugbear" in tags or "long_limbed" in tags):
+        reach += 5.0
+        
+    return reach
 
 def _build_npc_template(title: str, context: str, details: dict, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> str:
     ctx = context.strip() if context else "Newly encountered individual. No prior background established."
@@ -121,7 +148,7 @@ def _build_pc_template(title: str, details: dict, x: float = 0.0, y: float = 0.0
     return (f"---\ntags: [pc, player]\nstatus: active\nx: {x}\ny: {y}\nz: {z}\nicon_url: \"{icon_url}\"\nclasses: {yaml.dump(classes, default_flow_style=True)}\nspecies: {species}\nbackground: {background}\n"
             f"level: 1\nmax_hp: 10\nac: 10\ngold: 0\ncurrency:\n  cp: 0\n  sp: 0\n  ep: 0\n  gp: 0\n  pp: 0\n"
             f"str: {s_str}\ndex: {s_dex}\ncon: {s_con}\nint: {s_int}\nwis: {s_wis}\ncha: {s_cha}\n"
-            f"attunement_slots: 0/3\n"
+        f"attunement_slots: 0/3\nattuned_items: []\n"
             f"equipment:\n"
             f"  armor: Unarmored\n"
             f"  shield: None\n"
@@ -195,6 +222,15 @@ async def execute_melee_attack(attacker_name: str, target_name: str, advantage: 
         return f"SYSTEM ERROR: Attacker '{attacker_name}' not found in active combat memory."
     if not target:
         return f"SYSTEM ERROR: Target '{target_name}' not found in active combat memory."
+        
+    # --- NEW RANGE VALIDATION ---
+    dist = spatial_service.calculate_distance(attacker.x, attacker.y, attacker.z, target.x, target.y, target.z)
+    is_active_turn = not (is_reaction or is_opportunity_attack or is_legendary_action)
+    base_reach = _calculate_reach(attacker, is_active_turn=is_active_turn)
+    eff_reach = base_reach + max(0, (attacker.size - 5.0) / 2.0) + max(0, (target.size - 5.0) / 2.0)
+    
+    if dist > eff_reach:
+        return f"SYSTEM ERROR: Target '{target.name}' is out of range. Distance is {dist:.1f}ft, but {attacker.name}'s effective reach is {eff_reach:.1f}ft."
         
     is_pc = any(t in attacker.tags for t in ["pc", "player"])
     if is_pc and not force_auto_roll and manual_roll_total is None:
@@ -518,10 +554,11 @@ async def fetch_entity_context(entity_names: list[str], full_read: bool = False,
 
 
 @tool
-async def equip_item(character_name: str, item_name: str, item_slot: str, new_ac_value: int = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def equip_item(character_name: str, item_name: str, item_slot: str, attune: bool = False, new_ac_value: int = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
     Equips an item to a specific slot for a character, updating their YAML file.
     This will overwrite any item currently in the specified slot.
+    If 'attune' is True, it will also consume an attunement slot and apply magical modifiers natively.
     The AI is responsible for moving the old item back to inventory using 'manage_inventory' if needed.
     
     Valid item_slot values:
@@ -535,6 +572,10 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, new_ac
     # Map general types to specific slots
     slot_map = { "weapon": "main_hand" }
     target_slot = slot_map.get(item_slot, item_slot)
+    
+    item = await ItemCompendium.load_item(vault_path, item_name)
+    old_item = None
+    old_item_name = None
 
     try:
         async with edit_markdown_entity(file_path) as state:
@@ -561,10 +602,54 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, new_ac
                 return f"Error: Invalid equipment slot '{item_slot}'. Valid slots are: {', '.join(valid_slots)} or 'ring'."
     
             equipment[final_slot] = item_name
+            old_item_name = equipment.get(final_slot, "None")
+            equipment[final_slot] = item_name if not item else item.name
+            
+            attuned_items = yaml_data.get("attuned_items", [])
+            if not isinstance(attuned_items, list): attuned_items = []
+            
+            if attune and item and getattr(item, "requires_attunement", False):
+                for tag in item.tags:
+                    if tag.startswith("requires_attunement_by_"):
+                        req = tag.replace("requires_attunement_by_", "").lower()
+                        classes = [c.get("class_name", "").lower() for c in yaml_data.get("classes", [])] if isinstance(yaml_data.get("classes", []), list) else []
+                        species = str(yaml_data.get("species", "")).lower()
+                        alignment = str(yaml_data.get("alignment", "")).lower()
+                        if req not in classes and req not in species and req not in alignment:
+                            state["save"] = False
+                            return f"SYSTEM ERROR: Character does not meet the attunement requirements ({req}) for '{item.name}'."
+
+                if len(attuned_items) >= 3 and item.name not in attuned_items:
+                    state["save"] = False
+                    return f"SYSTEM ERROR: Character is already attuned to 3 items. Unattune something first."
+                if item.name not in attuned_items:
+                    attuned_items.append(item.name)
+                    yaml_data["attuned_items"] = attuned_items
+                    yaml_data["attunement_slots"] = f"{len(attuned_items)}/3"
+            
             if new_ac_value is not None:
                 yaml_data["ac"] = new_ac_value
+            elif item and isinstance(item, ArmorItem) and target_slot == "armor":
+                pc_dex = yaml_data.get("dexterity", yaml_data.get("dex", 10))
+                dex_mod = math.floor((int(pc_dex) - 10) / 2)
+                
+                max_dex = item.max_dex_bonus
+                if max_dex is None:
+                    if item.armor_category.lower() == "medium": max_dex = 2
+                    elif item.armor_category.lower() == "heavy": max_dex = 0
+                
+                if item.armor_category.lower() == "heavy":
+                    allowed_dex = 0
+                else:
+                    allowed_dex = min(dex_mod, max_dex) if max_dex is not None and dex_mod > 0 else dex_mod
+                    
+                yaml_data["ac"] = item.base_ac + item.plus_ac_bonus + allowed_dex
+                new_ac_value = yaml_data["ac"]
     except Exception as e:
         return str(e)
+
+    if old_item_name and old_item_name != "None":
+        old_item = await ItemCompendium.load_item(vault_path, old_item_name)
 
     # Sync OO Engine state dynamically if the entity is active in memory
     engine_creature = _get_entity_by_name(character_name)
@@ -573,12 +658,127 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, new_ac
             dmg_dice = "1d4" if "Unarmed" in item_name else "1d8"
             dmg_type = "bludgeoning" if "Unarmed" in item_name else "slashing"
             new_weapon = MeleeWeapon(name=item_name, damage_dice=dmg_dice, damage_type=dmg_type)
+            if item and isinstance(item, WeaponItem):
+                new_weapon = MeleeWeapon(name=item.name, damage_dice=item.damage_dice, damage_type=item.damage_type)
+                if hasattr(item, 'magic_bonus'): new_weapon.magic_bonus = item.magic_bonus
+            else:
+                dmg_dice = "1d4" if "Unarmed" in item_name else "1d8"
+                dmg_type = "bludgeoning" if "Unarmed" in item_name else "slashing"
+                new_weapon = MeleeWeapon(name=item_name, damage_dice=dmg_dice, damage_type=dmg_type)
             engine_creature.equipped_weapon_uuid = new_weapon.entity_uuid
         if new_ac_value is not None:
             engine_creature.ac.base_value = new_ac_value
+            
+        if old_item and (not old_item.requires_attunement or old_item.name in attuned_items):
+            for mod in old_item.modifiers:
+                if hasattr(engine_creature, mod.stat):
+                    stat_obj = getattr(engine_creature, mod.stat)
+                    if isinstance(stat_obj, ModifiableValue):
+                        to_remove = [m for m in stat_obj.modifiers if m.source_name == old_item.name]
+                        for m in to_remove: stat_obj.remove_modifier(m.mod_uuid)
+                        if old_item.name in engine_creature.active_mechanics:
+                            engine_creature.active_mechanics.remove(old_item.name)
+                            
+        if item:
+            if not item.requires_attunement or attune or item.name in attuned_items:
+                for mod in item.modifiers:
+                    if hasattr(engine_creature, mod.stat):
+                        stat_obj = getattr(engine_creature, mod.stat)
+                        if isinstance(stat_obj, ModifiableValue):
+                            priority = ModifierPriority.OVERRIDE if mod.value >= 10 else ModifierPriority.ADDITIVE
+                            stat_obj.add_modifier(NumericalModifier(
+                                priority=priority,
+                                value=mod.value,
+                                source_name=item.name,
+                                duration_seconds=-1
+                            ))
+                            if item.name not in engine_creature.active_mechanics:
+                                engine_creature.active_mechanics.append(item.name)
 
     ac_msg = f". Their AC is now {new_ac_value}" if new_ac_value is not None else ""
-    return f"Success: {character_name} equipped {item_name} in the {final_slot} slot{ac_msg}."
+    attune_msg = f" and attuned to it" if attune else ""
+    return f"Success: {character_name} equipped {item_name if not item else item.name} in the {final_slot} slot{attune_msg}{ac_msg}."
+
+@tool
+async def attune_item(character_name: str, item_name: str, action: str = "attune", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Attunes or unattunes a magical item to a character.
+    Valid actions: 'attune', 'unattune'.
+    Automatically consumes an attunement slot and applies the item's passive modifiers to the native engine.
+    """
+    vault_path = config["configurable"].get("thread_id")
+    file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
+    
+    item = await ItemCompendium.load_item(vault_path, item_name)
+    if not item:
+        return f"SYSTEM ERROR: Item '{item_name}' not found in Compendium."
+        
+    if not getattr(item, "requires_attunement", False) and action.lower() == "attune":
+        return f"MECHANICAL TRUTH: '{item.name}' does not require attunement. You can just equip it."
+        
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
+            attuned_items = yaml_data.get("attuned_items", [])
+            if not isinstance(attuned_items, list): attuned_items = []
+            
+            max_slots = 3
+            
+            if action.lower() == "attune":
+                for tag in item.tags:
+                    if tag.startswith("requires_attunement_by_"):
+                        req = tag.replace("requires_attunement_by_", "").lower()
+                        classes = [c.get("class_name", "").lower() for c in yaml_data.get("classes", [])] if isinstance(yaml_data.get("classes", []), list) else []
+                        species = str(yaml_data.get("species", "")).lower()
+                        alignment = str(yaml_data.get("alignment", "")).lower()
+                        if req not in classes and req not in species and req not in alignment:
+                            state["save"] = False
+                            return f"SYSTEM ERROR: {character_name} does not meet the attunement requirements ({req}) for '{item.name}'."
+
+                if len(attuned_items) >= max_slots:
+                    state["save"] = False
+                    return f"SYSTEM ERROR: {character_name} is already attuned to {max_slots} items."
+                if item.name not in attuned_items:
+                    attuned_items.append(item.name)
+            elif action.lower() == "unattune":
+                if item.name in attuned_items:
+                    attuned_items.remove(item.name)
+                else:
+                    state["save"] = False
+                    return f"SYSTEM ERROR: {character_name} is not attuned to '{item.name}'."
+                    
+            yaml_data["attuned_items"] = attuned_items
+            yaml_data["attunement_slots"] = f"{len(attuned_items)}/{max_slots}"
+    except Exception as e:
+        return str(e)
+        
+    engine_creature = _get_entity_by_name(character_name)
+    if engine_creature and isinstance(engine_creature, Creature):
+        for mod in item.modifiers:
+            if hasattr(engine_creature, mod.stat):
+                stat_obj = getattr(engine_creature, mod.stat)
+                if isinstance(stat_obj, ModifiableValue):
+                    to_remove = [m for m in stat_obj.modifiers if m.source_name == item.name]
+                    for m in to_remove: stat_obj.remove_modifier(m.mod_uuid)
+                    
+                    if action.lower() == "attune":
+                        priority = ModifierPriority.OVERRIDE if mod.value >= 10 else ModifierPriority.ADDITIVE
+                        stat_obj.add_modifier(NumericalModifier(
+                            priority=priority,
+                            value=mod.value,
+                            source_name=item.name,
+                            duration_seconds=-1
+                        ))
+                        if item.name not in engine_creature.active_mechanics:
+                            engine_creature.active_mechanics.append(item.name)
+                    else:
+                        if item.name in engine_creature.active_mechanics:
+                            engine_creature.active_mechanics.remove(item.name)
+                            
+    if action.lower() == "attune":
+        return f"Success: {character_name} attuned to {item.name}. Active modifiers applied. Slots used: {len(attuned_items)}/{max_slots}."
+    else:
+        return f"Success: {character_name} unattuned from {item.name}. Active modifiers removed. Slots used: {len(attuned_items)}/{max_slots}."
 
 @tool
 async def use_expendable_resource(character_name: str, resource_name: str, amount_to_deduct: int = 1, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
@@ -1067,6 +1267,9 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
                    
     async with aiofiles.open(os.path.join(j_dir, "ACTIVE_COMBAT.md"), 'w', encoding='utf-8') as f: 
         await f.write(f"---\n{yaml_str}---\n\n{dataview_js}")
+        
+    # Update engine memory
+    spatial_service.active_combatants = [c["name"] for c in combatants]
     return f"Combat started! {combatants[0]['name']} goes first."
 
 
@@ -1156,13 +1359,21 @@ async def end_combat(*, config: Annotated[RunnableConfig, InjectedToolArg]) -> s
             conds = ", ".join(c["conditions"]) if c["conditions"] else "None"
             await update_character_status.ainvoke({"character_name": c["name"], "hp": str(c["hp"]), "resources": "Update Manually", "conditions": conds, "fatigue": "None"}, config)
             
+        # Flush in-memory combat states
+        ent = _get_entity_by_name(c["name"])
+        if ent and isinstance(ent, Creature):
+            ent.reaction_used = False
+            ent.legendary_actions_current = getattr(ent, 'legendary_actions_max', 0)
+            ent.movement_remaining = ent.speed
+            
+    spatial_service.active_combatants.clear()
     os.remove(file_path)
     return "Combat ended successfully. ACTIVE_COMBAT.md removed."
 
 @tool
 async def move_entity(entity_name: str, target_x: float, target_y: float, target_z: float = None, movement_type: str = "walk", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Moves an entity to a new (X, Y, Z) coordinate on the spatial grid and visually updates the combat whiteboard.
-    Valid movement_type values: 'walk', 'jump', 'climb', 'fly', 'teleport', 'crawl', 'disengage', 'forced', 'fall'.
+    Valid movement_type values: 'walk', 'jump', 'climb', 'fly', 'teleport', 'crawl', 'disengage', 'forced', 'fall', 'travel'.
     'walk' and 'crawl' will be blocked by solid walls in a straight line."""
     vault_path = config["configurable"].get("thread_id")
     entity = _get_entity_by_name(entity_name)
@@ -1204,11 +1415,14 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
         if dz > run_high or dist_3d > str_score:
             return f"SYSTEM ERROR: Jump exceeds physical limits. Max running long-jump: {str_score}ft. Max running high-jump: {run_high}ft. Call perform_ability_check_or_save for Athletics to push limits."
 
+    # --- Determine if in active combat to enforce budget (Paradigm check) ---
+    in_combat = any(c.lower() == entity_name.lower() for c in spatial_service.active_combatants)
+
     # --- NEW: Check for Opportunity Attacks via EventBus ---
     event = GameEvent(
         event_type="Movement",
         source_uuid=entity.entity_uuid,
-        payload={"target_x": target_x, "target_y": target_y, "target_z": target_z, "movement_type": movement_type, "dragged_uuids": [e.entity_uuid for e in dragged_entities]}
+        payload={"target_x": target_x, "target_y": target_y, "target_z": target_z, "movement_type": movement_type, "dragged_uuids": [e.entity_uuid for e in dragged_entities], "ignore_budget": not in_combat}
     )
     result = EventBus.dispatch(event)
     
@@ -1261,6 +1475,21 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
             base_msg += "\nSYSTEM NOTE: The entity does NOT have line of sight to the teleport destination. Ensure the specific spell allows teleporting to unseen locations, otherwise this move is invalid."
     
     attackers = result.payload.get("opportunity_attackers", [])
+    
+    # Fallback to alert DM of spatial triggers even if the engine suppressed them (e.g. reaction_used = True)
+    # execute_melee_attack will strictly enforce the reaction limits if they try to attack.
+    if movement_type.lower() not in ["teleport", "forced", "fall", "disengage"]:
+        for other_entity in get_all_entities().values():
+            if other_entity.entity_uuid != entity.entity_uuid and hasattr(other_entity, 'hp') and getattr(other_entity.hp, 'base_value', 0) > 0:
+                if other_entity.name not in attackers:
+                    base_reach = _calculate_reach(other_entity, is_active_turn=False)
+                    eff_reach = base_reach + max(0, (other_entity.size - 5.0) / 2.0) + max(0, (entity.size - 5.0) / 2.0)
+                    
+                    dist_before = spatial_service.calculate_distance(old_x, old_y, old_z, other_entity.x, other_entity.y, other_entity.z)
+                    dist_after = spatial_service.calculate_distance(target_x, target_y, target_z, other_entity.x, other_entity.y, other_entity.z)
+                    if dist_before <= eff_reach and dist_after > eff_reach:
+                        attackers.append(other_entity.name)
+
     if attackers:
         base_msg += f"\nSYSTEM ALERT: Movement provoked Opportunity Attacks from: {', '.join(attackers)}. You MUST ask player(s) if they want to use their Reaction. For NPCs, you choose. Use execute_melee_attack(is_reaction=True) to resolve."
         
@@ -1391,26 +1620,75 @@ def query_campaign_module(search_terms: list[str], current_chapter_context: str 
 
 
 @tool
-async def use_ability_or_spell(caster_name: str, ability_name: str, target_names: list[str], is_reaction: bool = False, is_legendary_action: bool = False, manual_attack_roll: int = None, is_critical: bool = False, manual_saves: dict = None, force_auto_roll: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
-    """Use this tool whenever a character casts a spell or uses a class feature."""
+async def use_ability_or_spell(caster_name: str, ability_name: str, target_names: list[str] = None, target_x: float = None, target_y: float = None, target_z: float = None, aoe_shape: str = None, aoe_size: float = None, is_reaction: bool = False, is_legendary_action: bool = False, manual_attack_roll: int = None, is_critical: bool = False, manual_saves: dict = None, force_auto_roll: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """Use this tool whenever a character casts a spell or uses a class feature.
+    If the spell is an Area of Effect (AoE) and coordinates are provided, pass target_x, target_y, aoe_shape, and aoe_size. 
+    The engine will override 'target_names' and compute the true targets and structural damage using line-of-effect raycasting."""
     vault_path = config["configurable"].get("thread_id")
     caster = _get_entity_by_name(caster_name)
     if not caster: return f"SYSTEM ERROR: Caster '{caster_name}' not found."
 
-    entry = await CompendiumManager.get_entry(vault_path, ability_name)
-    if not entry:
-        return (
-            f"CACHE MISS: '{ability_name}' is not in the Engine. "
-            f"Use `query_rulebook` to find the exact rules, then use `encode_new_compendium_entry` "
-            f"to save it. Then try casting again."
-        )
+    spell_def = await SpellCompendium.load_spell(vault_path, ability_name)
+    if spell_def:
+        mechanics_dump = spell_def.mechanics.model_dump()
+        granted_tags = spell_def.mechanics.granted_tags
+        description = spell_def.description
+        requires_attack_roll = spell_def.mechanics.requires_attack_roll
+        save_required = spell_def.mechanics.save_required
+        ability_display_name = spell_def.name
+    else:
+        item_def = await ItemCompendium.load_item(vault_path, ability_name)
+        if item_def and getattr(item_def, "active_mechanics", None):
+            mechanics_dump = item_def.active_mechanics.model_dump()
+            granted_tags = item_def.active_mechanics.granted_tags
+            description = item_def.description
+            requires_attack_roll = item_def.active_mechanics.requires_attack_roll
+            save_required = item_def.active_mechanics.save_required
+            ability_display_name = item_def.name
+        else:
+            entry = await CompendiumManager.get_entry(vault_path, ability_name)
+            if not entry:
+                return (
+                    f"CACHE MISS: '{ability_name}' is not in the Engine. "
+                    f"Use `query_rulebook` to find the exact rules, then use `encode_new_compendium_entry` "
+                    f"to save it. Then try casting again."
+                )
+            mechanics_dump = entry.mechanics.model_dump() if hasattr(entry.mechanics, "model_dump") else entry.mechanics
+            granted_tags = getattr(entry.mechanics, "granted_tags", []) if getattr(entry, "mechanics", None) else []
+            description = entry.description
+            requires_attack_roll = getattr(entry.mechanics, "requires_attack_roll", False)
+            save_required = getattr(entry.mechanics, "save_required", "")
+            ability_display_name = entry.name
     
-    targets = [_get_entity_by_name(t) for t in target_names]
-    valid_targets = [t for t in targets if t]
-    target_string = ", ".join([t.name for t in valid_targets]) or "themselves"
+    target_uuids = []
+    target_wall_ids = []
+    
+    ignore_walls = "ignore_walls" in granted_tags
+    penetrates = "penetrates_destructible" in granted_tags
+    
+    if aoe_shape and aoe_size and target_x is not None and target_y is not None:
+        shape = aoe_shape.lower()
+        oz = 0.0
+        tz = target_z
+        if shape in ["circle", "sphere", "cylinder", "cube"]:
+            ox, oy, tx, ty = target_x, target_y, None, None
+            oz = target_z if target_z is not None else 0.0
+        else: # cone, line originate from the caster
+            ox, oy, tx, ty = caster.x, caster.y, target_x, target_y
+            oz = caster.z
+            if tz is None: tz = caster.z
+            
+        hits, walls = spatial_service.get_aoe_targets(shape, aoe_size, ox, oy, tx, ty, origin_z=oz, target_z=tz, ignore_walls=ignore_walls, penetrates_destructible=penetrates)
+        target_uuids.extend(hits)
+        target_wall_ids.extend(walls)
+        target_string = f"{aoe_size}ft {shape} at coordinates ({target_x}, {target_y})"
+    else:
+        for name in (target_names or []):
+            ent = _get_entity_by_name(name)
+            if ent: target_uuids.append(ent.entity_uuid)
+        target_string = ", ".join(target_names or []) or "themselves"
     
     manual_saves = manual_saves or {}
-    requires_attack_roll = entry.mechanics.requires_attack_roll
     is_caster_pc = any(t in caster.tags for t in ["pc", "player"])
     
     if requires_attack_roll and is_caster_pc and not force_auto_roll and manual_attack_roll is None:
@@ -1418,14 +1696,14 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
         if not auto_settings.get("attack_rolls", True):
             return f"SYSTEM ALERT: {caster.name} has manual attack rolls enabled. Ask the player to roll the spell attack (including modifiers) and provide the total. Then call this tool again with `manual_attack_roll=X` (and `is_critical=True` if natural 20) or `force_auto_roll=True`."
 
-    save_required = entry.mechanics.save_required
     if save_required:
         missing_saves = []
-        for t in valid_targets:
-            if any(tag in t.tags for tag in ["pc", "player"]):
-                auto_settings = get_roll_automations(t.name)
-                if not auto_settings.get("saving_throws", True) and t.name not in manual_saves and not force_auto_roll:
-                    missing_saves.append(t.name)
+        for t_uid in target_uuids:
+            ent = _get_entity_by_name(next((e.name for e in get_all_entities().values() if e.entity_uuid == t_uid), ""))
+            if ent and any(tag in ent.tags for tag in ["pc", "player"]):
+                auto_settings = get_roll_automations(ent.name)
+                if not auto_settings.get("saving_throws", True) and ent.name not in manual_saves and not force_auto_roll:
+                    missing_saves.append(ent.name)
         if missing_saves:
             return f"SYSTEM ALERT: The following players have manual saving throws enabled: {', '.join(missing_saves)}. Ask them to roll their {save_required} saving throws (including modifiers) and provide the totals. Then call this tool again with `manual_saves={{'PlayerName': 15, ...}}` or `force_auto_roll=True`."
 
@@ -1435,8 +1713,9 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
         source_uuid=caster.entity_uuid,
         payload={
             "ability_name": ability_name,
-            "mechanics": entry.mechanics.model_dump(),
-            "target_uuids": [t.entity_uuid for t in valid_targets],
+            "mechanics": mechanics_dump,
+            "target_uuids": target_uuids,
+            "target_wall_ids": target_wall_ids,
             "current_initiative": current_init,
             "manual_attack_roll": manual_attack_roll,
             "is_critical": is_critical,
@@ -1448,14 +1727,14 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
     
     results_list = result.payload.get("results", [])
     if results_list:
-        return f"MECHANICAL TRUTH: {caster.name} cast {entry.name} on {target_string}.\n" + "\n".join(results_list)
+        return f"MECHANICAL TRUTH: {caster.name} cast {ability_display_name} on {target_string}.\n" + "\n".join(results_list)
     
-    return f"MECHANICAL TRUTH: {caster.name} used {entry.name} on {target_string}. Effect: {entry.description}"
+    return f"MECHANICAL TRUTH: {caster.name} used {ability_display_name} on {target_string}. Effect: {description}"
 
 @tool
 async def encode_new_compendium_entry(
     name: str = Field(..., description="Exact name of the ability or spell"),
-    category: str = Field(..., description="'spell', 'feature', 'feat', or 'item'"),
+    category: str = Field(..., description="'spell', 'feature', 'feat', 'item', 'weapon', or 'armor'"),
     action_type: str = Field(..., description="'Action', 'Bonus Action', 'Reaction', or 'Passive'"),
     description: str = Field(..., description="A concise summary of the mechanical rules."),
     source_reference: str = Field(..., description="Name of the rulebook and page number."),
@@ -1469,23 +1748,62 @@ async def encode_new_compendium_entry(
     """Teach the engine a new ability. Call ONLY when you receive a CACHE MISS."""
     vault_path = config["configurable"].get("thread_id")
     
-    mechanics = MechanicEffect(
-        damage_dice=damage_dice,
-        damage_type=damage_type,
-        save_required=save_required,
-        granted_tags=granted_tags
-    )
-    
-    entry = CompendiumEntry(
-        name=name,
-        category=category,
-        action_type=action_type,
-        description=description,
-        references=[source_reference],
-        mechanics=mechanics
-    )
-    
-    filepath = await CompendiumManager.save_entry(vault_path, entry)
+    if category.lower() == "spell":
+        spell_mech = SpellMechanics(
+            requires_attack_roll=action_type.lower() == "attack",
+            save_required=save_required,
+            damage_dice=damage_dice,
+            damage_type=damage_type,
+            granted_tags=granted_tags
+        )
+        spell_def = SpellDefinition(
+            name=name,
+            casting_time=action_type,
+            description=description,
+            mechanics=spell_mech
+        )
+        filepath = await SpellCompendium.save_spell(vault_path, spell_def)
+    elif category.lower() in ["item", "weapon", "armor"]:
+        if category.lower() == "weapon" or action_type.lower() == "attack":
+            item_def = WeaponItem(
+                name=name,
+                description=description,
+                damage_dice=damage_dice,
+                damage_type=damage_type,
+                tags=granted_tags
+            )
+        elif category.lower() == "armor":
+            item_def = ArmorItem(
+                name=name,
+                description=description,
+                tags=granted_tags
+            )
+        else:
+            mech = SpellMechanics(save_required=save_required, damage_dice=damage_dice, damage_type=damage_type, granted_tags=granted_tags) if (save_required or damage_dice) else None
+            item_def = WondrousItem(
+                name=name,
+                description=description,
+                tags=granted_tags,
+                active_mechanics=mech
+            )
+        filepath = await ItemCompendium.save_item(vault_path, item_def)
+    else:
+        mechanics = MechanicEffect(
+            damage_dice=damage_dice,
+            damage_type=damage_type,
+            save_required=save_required,
+            granted_tags=granted_tags
+        )
+        
+        entry = CompendiumEntry(
+            name=name,
+            category=category,
+            action_type=action_type,
+            description=description,
+            references=[source_reference],
+            mechanics=mechanics
+        )
+        filepath = await CompendiumManager.save_entry(vault_path, entry)
     
     warning = ""
     if requires_engine_update:
@@ -1763,9 +2081,10 @@ async def trigger_environmental_hazard(
     return f"MECHANICAL TRUTH: {hazard_name} triggered but had no effect."
 
 @tool
-async def manage_map_geometry(action: str, label: str = "", start_x: float = 0.0, start_y: float = 0.0, end_x: float = 0.0, end_y: float = 0.0, z: float = 0.0, height: float = 10.0, is_solid: bool = True, is_visible: bool = True, is_locked: bool = False, interact_dc: int = 15, is_temporary: bool = True, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def manage_map_geometry(action: str, label: str = "", start_x: float = 0.0, start_y: float = 0.0, end_x: float = 0.0, end_y: float = 0.0, z: float = 0.0, height: float = 10.0, is_solid: bool = True, is_visible: bool = True, is_locked: bool = False, interact_dc: int = 15, is_temporary: bool = True, hp: int = None, ac: int = 10, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
     Dynamically alters the spatial map's physical geometry (e.g., opening a door, breaking a wall, casting Wall of Stone).
+    - hp / ac: Assign Hit Points and Armor Class if the wall/door is destructible (e.g. standard wooden door = hp 18, ac 15).
     - action: 'add_wall', 'remove_wall', or 'modify_wall'
     - label: A descriptive name for the wall (e.g., 'heavy oak door', 'Wall of Stone'). Use this to target an existing wall.
     - is_solid: False means entities can walk and shoot through it (like an open door).
@@ -1775,7 +2094,7 @@ async def manage_map_geometry(action: str, label: str = "", start_x: float = 0.0
     - is_temporary: True means the wall is a temporary effect and will be cleared on map reset.
     """
     if action.lower() == "add_wall":
-        new_wall = Wall(label=label, start=(start_x, start_y), end=(end_x, end_y), z=z, height=height, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked, interact_dc=interact_dc)
+        new_wall = Wall(label=label, start=(start_x, start_y), end=(end_x, end_y), z=z, height=height, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked, interact_dc=interact_dc, hp=hp, max_hp=hp, ac=ac)
         spatial_service.add_wall(new_wall, is_temporary=is_temporary)
         return f"MECHANICAL TRUTH: Added new wall '{label}' from ({start_x}, {start_y}) to ({end_x}, {end_y}). Solid: {is_solid}, Visible: {is_visible}."
         

@@ -48,6 +48,14 @@ class Wall(BaseModel):
     interact_dc: Optional[int] = None
     trap: Optional[TrapDefinition] = None
     
+    hp: Optional[int] = None
+    max_hp: Optional[int] = None
+    ac: int = 10
+    damage_threshold: int = 0
+    immunities: List[str] = Field(default_factory=list)
+    resistances: List[str] = Field(default_factory=list)
+    vulnerabilities: List[str] = Field(default_factory=list)
+    
     @property
     def line(self):
         if not HAS_GIS: return None
@@ -82,6 +90,7 @@ class MapData(BaseModel):
     dm_map_image_path: Optional[str] = None
     player_map_image_path: Optional[str] = None
     explored_areas: List[Tuple[float, float, float]] = Field(default_factory=list) # x, y, radius
+    fow_disabled_for: List[str] = Field(default_factory=list)
 
     original_walls: List[Wall] = Field(default_factory=list)
     walls: List[Wall] = Field(default_factory=list)
@@ -96,8 +105,8 @@ class MapData(BaseModel):
     temporary_lights: List[LightSource] = Field(default_factory=list)
     
     grid_scale: float = 5.0 # 1 square = 5ft
-    pixels_per_foot: float = 15.0 # 15 pixels = 1ft
     distance_metric: str = "chebyshev" # "chebyshev" or "euclidean"
+    pixels_per_foot: float = 1.0
 
     @property
     def active_walls(self) -> List[Wall]:
@@ -118,6 +127,8 @@ class SpatialQueryService:
     """
     def __init__(self):
         self.map_data = MapData()
+        self.active_paths: Dict[str, dict] = {} # Maps entity_name -> path_data
+        self.active_combatants: List[str] = [] # Memory-state for Combat Mode
         if HAS_GIS:
             p = index.Property()
             self.entity_idx = index.Index(properties=p)
@@ -131,6 +142,8 @@ class SpatialQueryService:
     def clear(self):
         """Completely resets the spatial engine and Rtree index for testing."""
         self.map_data = MapData()
+        self.active_paths.clear()
+        self.active_combatants.clear()
         if HAS_GIS:
             self.entity_idx = index.Index(properties=index.Property())
             self._entities.clear()
@@ -139,6 +152,12 @@ class SpatialQueryService:
             self._uuid_to_bbox.clear()
             self._next_id = 0
             self._raycast_cache.clear()
+            
+    def get_wall_by_id(self, wall_id: uuid.UUID) -> Optional[Wall]:
+        """Retrieves a specific wall object from the active layers."""
+        for w in self.map_data.active_walls:
+            if w.wall_id == wall_id: return w
+        return None
             
     def reveal_fog_of_war(self, x: float, y: float, radius: float):
         """Adds a circular area to the explored regions of the current map."""
@@ -316,6 +335,141 @@ class SpatialQueryService:
                     hit_uuids.append(ent_uuid)
                     
         return hit_uuids
+        
+    def get_aoe_targets(self, shape: str, size: float, origin_x: float, origin_y: float, target_x: float = None, target_y: float = None, origin_z: float = 0.0, target_z: float = None, aoe_height: float = None, ignore_walls: bool = False, penetrates_destructible: bool = False) -> Tuple[List[uuid.UUID], List[uuid.UUID]]:
+        """Returns all valid Entities and Walls hit by an AoE, rigorously enforcing Line of Effect in 3D."""
+        if not HAS_GIS: return [], []
+        if target_z is None: target_z = origin_z
+        
+        hit_entities = []
+        hit_walls = []
+        shape = shape.lower()
+        aoe_poly = None
+        vx, vy, vz = 0.0, 0.0, 0.0
+        
+        # 1. Mathematically construct the AoE Geometry
+        if shape in ["circle", "sphere", "cylinder"]:
+            aoe_poly = Point(origin_x, origin_y).buffer(size)
+        elif shape == "cube":
+            aoe_poly = box(origin_x - size/2, origin_y - size/2, origin_x + size/2, origin_y + size/2)
+        elif shape in ["cone", "line"]:
+            if target_x is None or target_y is None: return [], []
+            
+            dx = target_x - origin_x
+            dy = target_y - origin_y
+            dz = target_z - origin_z
+            dist_3d = math.sqrt(dx**2 + dy**2 + dz**2)
+            if dist_3d > 0:
+                vx, vy, vz = dx/dist_3d, dy/dist_3d, dz/dist_3d
+            else:
+                vx, vy, vz = 1.0, 0.0, 0.0
+            
+            if shape == "cone":
+                if vx == 0 and vy == 0:
+                    aoe_poly = Point(origin_x, origin_y).buffer(size * 0.5)
+                else:
+                    angle_deg = 53.1
+                    angle_xy = math.atan2(vy, vx)
+                    start_angle = angle_xy - math.radians(angle_deg / 2)
+                    end_angle = angle_xy + math.radians(angle_deg / 2)
+                    
+                    points = [(origin_x, origin_y)]
+                    num_segments = max(4, int(angle_deg / 15))
+                    for i in range(num_segments + 1):
+                        theta = start_angle + i * (end_angle - start_angle) / num_segments
+                        points.append((origin_x + size * math.cos(theta), origin_y + size * math.sin(theta)))
+                    aoe_poly = Polygon(points)
+            else: # Line (Standard 5ft wide)
+                ex = origin_x + vx * size
+                ey = origin_y + vy * size
+                # Avoid Shapely throwing an error for degenerate linestrings if aimed completely vertically
+                if origin_x == ex and origin_y == ey:
+                    aoe_poly = Point(origin_x, origin_y).buffer(2.5)
+                else:
+                    aoe_poly = LineString([(origin_x, origin_y), (ex, ey)]).buffer(2.5)
+                
+        if not aoe_poly: return [], []
+        
+        # 2. Extract Hit Entities (with Line-of-Effect raycasting)
+        candidate_ids = list(self.entity_idx.intersection(aoe_poly.bounds))
+        for cid in candidate_ids:
+            ent_uuid = self._id_to_uuid[cid]
+            entity = self._entities.get(ent_uuid)
+            if entity and aoe_poly.intersects(self._get_entity_bbox(entity)):
+                ent_min_z = entity.z
+                ent_max_z = entity.z + getattr(entity, 'height', 5.0)
+                
+                # Z-Axis / 3D Filtering
+                is_hit = True
+                if shape == "sphere":
+                    ent_center_z = entity.z + (getattr(entity, 'height', 5.0) / 2.0)
+                    dist = self.calculate_distance(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z)
+                    if dist - (entity.size / 2.0) > size:
+                        is_hit = False
+                elif shape == "cube":
+                    half_size = size / 2.0
+                    min_cube_z = origin_z - half_size
+                    max_cube_z = origin_z + half_size
+                    if ent_max_z < min_cube_z or ent_min_z > max_cube_z:
+                        is_hit = False
+                elif shape == "cylinder":
+                    cyl_height = aoe_height if aoe_height is not None else size
+                    min_cyl_z = origin_z
+                    max_cyl_z = origin_z + cyl_height
+                    if ent_max_z < min_cyl_z or ent_min_z > max_cyl_z:
+                        is_hit = False
+                elif shape == "cone":
+                    ent_center_z = entity.z + (getattr(entity, 'height', 5.0) / 2.0)
+                    dist = self.calculate_distance(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z)
+                    if dist - (entity.size / 2.0) > size:
+                        is_hit = False
+                    else:
+                        ux = entity.x - origin_x
+                        uy = entity.y - origin_y
+                        uz = ent_center_z - origin_z
+                        mag_u = math.sqrt(ux**2 + uy**2 + uz**2)
+                        if mag_u > 0.1:
+                            cos_theta = (ux * vx + uy * vy + uz * vz) / mag_u
+                            if cos_theta < 0.85:
+                                is_hit = False
+                elif shape == "line":
+                    ent_center_z = entity.z + (getattr(entity, 'height', 5.0) / 2.0)
+                    ax, ay, az = origin_x, origin_y, origin_z
+                    bx, by, bz = origin_x + vx * size, origin_y + vy * size, origin_z + vz * size
+                    ex, ey, ez = entity.x, entity.y, ent_center_z
+                    
+                    ab_x, ab_y, ab_z = bx - ax, by - ay, bz - az
+                    ae_x, ae_y, ae_z = ex - ax, ey - ay, ez - az
+                    
+                    ab_len_sq = ab_x**2 + ab_y**2 + ab_z**2
+                    if ab_len_sq == 0:
+                        dist = self.calculate_distance(ex, ey, ez, ax, ay, az)
+                    else:
+                        t = max(0.0, min(1.0, (ae_x*ab_x + ae_y*ab_y + ae_z*ab_z) / ab_len_sq))
+                        cx, cy, cz = ax + t * ab_x, ay + t * ab_y, az + t * ab_z
+                        dist = self.calculate_distance(ex, ey, ez, cx, cy, cz)
+                        
+                    if dist - (entity.size / 2.0) > 2.5: # 5ft wide line = 2.5ft radius
+                        is_hit = False
+                        
+                if is_hit:
+                    # Check Line of Effect from the AoE origin point to the target entity
+                    ent_center_z = entity.z + (getattr(entity, 'height', 5.0) / 2.0)
+                    if ignore_walls:
+                        hit_entities.append(ent_uuid)
+                    else:
+                        blocking_wall = self.check_path_collision(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z, entity_height=0.1, check_vision=False)
+                        if not blocking_wall:
+                            hit_entities.append(ent_uuid)
+                        elif penetrates_destructible and getattr(blocking_wall, 'hp', None) is not None and blocking_wall.hp < 9999:
+                            hit_entities.append(ent_uuid)
+                    
+        # 3. Extract Hit Geometry (Walls/Doors)
+        for wall in self.map_data.active_walls:
+            if wall.line and aoe_poly.intersects(wall.line):
+                hit_walls.append(wall.wall_id)
+                
+        return hit_entities, hit_walls
 
     def get_distance_and_cover(self, source_uuid: uuid.UUID, target_uuid: uuid.UUID) -> Tuple[float, str]:
         """Calculates distance and determines cover (None, Half, Three-Quarters, Total)."""

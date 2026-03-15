@@ -129,9 +129,11 @@ async def test_5_round_combat_execution(mock_5_round_vault):
         await update_combat_state.ainvoke({"next_turn": True}, config=config)
         
         # --- ROUND 5 ---
-        # Orc1 attempts to flee the wizard, triggering an opportunity attack
-        res = await move_entity.ainvoke({"entity_name": "Orc1", "target_x": 10, "target_y": 0, "movement_type": "walk"}, config=config)
+        # Troll attempts to flee the Fighter, triggering an opportunity attack
+        # (We don't use Orc1 fleeing Wizard, because Wizard correctly spent their reaction on Shield in Round 2!)
+        res = await move_entity.ainvoke({"entity_name": "Troll", "target_x": 35, "target_y": 0, "movement_type": "walk"}, config=config)
         assert "Opportunity Attacks from" in res
+        assert "Fighter" in res
         
     # Cleanup
     res = await end_combat.ainvoke({}, config=config)

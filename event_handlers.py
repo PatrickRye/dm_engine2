@@ -10,26 +10,36 @@ from dnd_rules_engine import (
 )
 from spatial_engine import spatial_service, HAS_GIS
 from registry import get_entity, get_all_entities
+from spell_system import SpellMechanics
+from pydantic import ValidationError
 
 def resolve_spell_cast_handler(event: GameEvent):
     """Calculates spell hits, saving throws, and damage across multiple targets."""
     if event.status != EventStatus.EXECUTION: return
 
     caster: Creature = get_entity(event.source_uuid)
-    mechanics = event.payload.get("mechanics", {})
+    raw_mechanics = event.payload.get("mechanics", {})
+    
+    try:
+        mechanics = SpellMechanics.model_validate(raw_mechanics) if isinstance(raw_mechanics, dict) else raw_mechanics
+    except ValidationError as e:
+        print(f"[Engine] SYSTEM ERROR: Invalid spell mechanics payload - {e}")
+        event.status = EventStatus.CANCELLED
+        event.payload["results"] = ["SYSTEM ERROR: Invalid spell mechanics payload bypassed the tools. Event cancelled."]
+        return
+        
     target_uuids = event.payload.get("target_uuids", [])
+    target_wall_ids = event.payload.get("target_wall_ids", [])
     
     # Roll base damage/healing once for all targets
-    damage_dice = mechanics.get("damage_dice", "")
-    base_damage = roll_dice(damage_dice) if damage_dice else 0
-    damage_type = mechanics.get("damage_type", "unknown")
+    base_damage = roll_dice(mechanics.damage_dice) if mechanics.damage_dice else 0
+    damage_type = mechanics.damage_type if mechanics.damage_type else "unknown"
     
-    save_required = mechanics.get("save_required", "").lower()
-    requires_attack_roll = mechanics.get("requires_attack_roll", False)
-    half_damage_on_save = mechanics.get("half_damage_on_save", False)
+    save_required = mechanics.save_required.lower() if mechanics.save_required else ""
+    requires_attack_roll = mechanics.requires_attack_roll
+    half_damage_on_save = mechanics.half_damage_on_save
     
-    requires_concentration = mechanics.get("requires_concentration", False)
-    if requires_concentration:
+    if mechanics.requires_concentration:
         if caster.concentrating_on:
             EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=caster.entity_uuid))
         caster.concentrating_on = event.payload.get("ability_name", "Unknown")
@@ -53,7 +63,7 @@ def resolve_spell_cast_handler(event: GameEvent):
             if total_attack >= target.ac.total or attack_roll == 20:
                 hit_or_save_str = f"Hit (Rolled {total_attack} vs AC {target.ac.total})"
                 if attack_roll == 20:
-                    target_damage += roll_dice(damage_dice) # Crit
+                    target_damage += roll_dice(mechanics.damage_dice) # Crit
                     hit_or_save_str = "Critical Hit!"
             else:
                 target_damage = 0
@@ -133,9 +143,9 @@ def resolve_spell_cast_handler(event: GameEvent):
             applied_effects = True
             
         if applied_effects:
-            for cond_data in mechanics.get("conditions_applied", []):
-                cond_name = cond_data.get("condition", "Unknown")
-                duration_secs = parse_duration_to_seconds(cond_data.get("duration", "-1"))
+            for cond_data in mechanics.conditions_applied:
+                cond_name = cond_data.condition
+                duration_secs = parse_duration_to_seconds(cond_data.duration)
                 
                 target.active_conditions.append(ActiveCondition(
                     name=cond_name,
@@ -146,15 +156,15 @@ def resolve_spell_cast_handler(event: GameEvent):
                 ))
                 results.append(f"[{target.name}] is now {cond_name}!")
                 
-            for mod_data in mechanics.get("modifiers", []):
-                target_stat = mod_data.get("stat")
-                duration_secs = parse_duration_to_seconds(mod_data.get("duration", "-1"))
+            for mod_data in mechanics.modifiers:
+                target_stat = mod_data.stat
+                duration_secs = parse_duration_to_seconds(mod_data.duration)
                 if hasattr(target, target_stat):
                     stat_obj = getattr(target, target_stat)
                     if isinstance(stat_obj, ModifiableValue):
                         stat_obj.add_modifier(NumericalModifier(
                             priority=ModifierPriority.ADDITIVE,
-                            value=int(mod_data.get("value", 0)),
+                            value=mod_data.value,
                             source_name=event.payload.get("ability_name", "Unknown"),
                             duration_seconds=duration_secs,
                             applied_initiative=current_init,
@@ -166,6 +176,28 @@ def resolve_spell_cast_handler(event: GameEvent):
                 
         results.append(f"[{target.name}] {hit_or_save_str}. Took {target_damage} {damage_type} damage. HP: {target.hp.base_value}")
         
+    # 5. Process Collateral Damage to Geography (Walls/Doors)
+    if base_damage > 0 and target_wall_ids and damage_type not in ["poison", "psychic"]:
+        for wall_id in target_wall_ids:
+            wall = spatial_service.get_wall_by_id(wall_id)
+            if wall and wall.hp is not None and wall.is_solid:
+                w_dmg = base_damage
+                if damage_type in wall.immunities: w_dmg = 0
+                elif damage_type in wall.vulnerabilities: w_dmg *= 2
+                elif damage_type in wall.resistances: w_dmg //= 2
+                
+                if w_dmg < wall.damage_threshold: w_dmg = 0
+                
+                if w_dmg > 0:
+                    wall.hp -= w_dmg
+                    if wall.hp <= 0:
+                        wall.is_solid = False
+                        old_label = wall.label
+                        wall.label += " (Destroyed)"
+                        results.append(f"[Geometry] The {old_label} was hit for {w_dmg} {damage_type} damage and was DESTROYED!")
+                    else:
+                        results.append(f"[Geometry] The {wall.label} took {w_dmg} {damage_type} damage ({wall.hp}/{wall.max_hp} HP remaining).")
+
     event.payload["results"] = results
 
 def resolve_attack_handler(event: GameEvent):
@@ -175,6 +207,10 @@ def resolve_attack_handler(event: GameEvent):
     attacker: Creature = get_entity(event.source_uuid)
     target: Creature = get_entity(event.target_uuid)
     weapon: Weapon = get_entity(attacker.equipped_weapon_uuid)
+    
+    if not weapon:
+        # Fallback for entities missing a valid weapon in the registry
+        weapon = MeleeWeapon(name="Unarmed Strike", damage_dice="1d4", damage_type="bludgeoning")
 
     attack_mod = weapon.get_attack_modifier(attacker)
     attack_bonus = attack_mod.total + weapon.magic_bonus
@@ -508,7 +544,7 @@ def validate_movement_handler(event: GameEvent):
     movement_type = event.payload.get("movement_type", "walk").lower()
     
     # Teleport, fall, forced don't consume standard movement points
-    if movement_type in ["teleport", "forced", "fall"]: 
+    if movement_type in ["teleport", "forced", "fall", "travel"]: 
         return
         
     entity = get_entity(event.source_uuid)
@@ -544,12 +580,14 @@ def validate_movement_handler(event: GameEvent):
         normal_dist += diff_dist
         diff_dist = 0.0
         
-    total_cost = math.ceil(normal_dist + (diff_dist * 2)) + stand_cost # Difficult terrain costs twice as much
+    # Truncate to 2 decimal places to eliminate floating point noise before applying math.ceil
+    raw_dist = normal_dist + (diff_dist * 2)
+    total_cost = math.ceil(int(raw_dist * 100) / 100.0) + stand_cost
     
     if event.payload.get("dragged_uuids"):
         total_cost *= 2 # Dragging halves speed (costs twice as much movement per foot)
         
-    if total_cost > entity.movement_remaining:
+    if total_cost > entity.movement_remaining and not event.payload.get("ignore_budget", False):
         event.status = EventStatus.CANCELLED
         event.payload["error"] = f"Movement cost ({total_cost}ft) exceeds remaining speed ({entity.movement_remaining}ft). Normal dist: {normal_dist:.1f}ft, Difficult dist: {diff_dist:.1f}ft."
         return
@@ -590,7 +628,7 @@ def resolve_movement_handler(event: GameEvent):
                         print(f"[Engine] {entity.name} moved away from {other_ent.name}. The grapple is broken!")
                         
     # Teleportation and forced movement do not provoke opportunity attacks natively
-    if movement_type in ["teleport", "forced"]:
+    if movement_type in ["teleport", "forced", "travel"]:
         return
     
     opportunity_attackers = []
@@ -647,14 +685,15 @@ def consume_movement_handler(event: GameEvent):
     if event.status != EventStatus.POST_EVENT: return
     entity = get_entity(event.source_uuid)
     if isinstance(entity, Creature) and "cost" in event.payload:
-        entity.movement_remaining -= event.payload["cost"]
+        if not event.payload.get("ignore_budget", False):
+            entity.movement_remaining -= event.payload["cost"]
 
 def trap_movement_handler(event: GameEvent):
     """Evaluates movement to see if it intersects with trapped geometry."""
     if event.status != EventStatus.EXECUTION: return
     
     movement_type = event.payload.get("movement_type", "walk").lower()
-    if movement_type in ["teleport", "forced"]: return
+    if movement_type in ["teleport", "forced", "travel"]: return
         
     entity = get_entity(event.source_uuid)
     if not isinstance(entity, Creature): return
