@@ -3,6 +3,8 @@ import shutil
 import tempfile
 import pytest
 from unittest.mock import patch
+from dnd_rules_engine import EventBus
+from event_handlers import register_core_handlers
 
 @pytest.fixture(autouse=True)
 def mock_obsidian_vault():
@@ -14,6 +16,9 @@ def mock_obsidian_vault():
     """
     base_dir = os.path.dirname(__file__)
     resource_vault = os.path.join(base_dir, "resources", "vault")
+    
+    # Ensure the EventBus is fully populated before every test to prevent cross-test contamination
+    register_core_handlers()
     
     with tempfile.TemporaryDirectory() as temp_dir:
         # Setup isolated vault space

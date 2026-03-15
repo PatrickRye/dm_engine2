@@ -132,6 +132,12 @@ class RangedWeapon(Weapon):
     normal_range: int
     long_range: int
 
+    def get_attack_modifier(self, wielder: 'Creature') -> ModifiableValue:
+        return wielder.dexterity_mod
+
+    def get_damage_modifier(self, wielder: 'Creature') -> ModifiableValue:
+        return wielder.dexterity_mod
+
 # Decorator Pattern for Magical Weapons
 class MagicWeaponDecorator(Weapon):
     _wrapped_weapon: Weapon = PrivateAttr()

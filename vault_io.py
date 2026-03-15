@@ -9,6 +9,7 @@ from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool, InjectedToolArg
 from typing import Annotated
+from contextlib import asynccontextmanager
 import glob
 from dnd_rules_engine import BaseGameEntity, Creature, ModifiableValue, MeleeWeapon, NumericalModifier, ModifierPriority, ActiveCondition, parse_duration_to_seconds
 from compendium_manager import CompendiumManager
@@ -175,6 +176,31 @@ async def write_markdown_entity_no_lock(file_path: str, yaml_data: dict, body_te
     
     async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
         await f.write(new_content)
+
+@asynccontextmanager
+async def read_markdown_entity(file_path: str):
+    """Async context manager that locks a markdown file and yields (yaml_data, body_text) for reading."""
+    lock = AsyncSoftFileLock(f"{file_path}.lock")
+    async with lock:
+        yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
+        yield yaml_data, body_text
+
+@asynccontextmanager
+async def edit_markdown_entity(file_path: str):
+    """
+    Async context manager that locks a markdown file, yields a mutable state dict, 
+    and automatically writes it back when the block exits.
+    Set state['save'] = False to abort writing.
+    """
+    lock = AsyncSoftFileLock(f"{file_path}.lock")
+    async with lock:
+        yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
+        state = {"yaml_data": yaml_data, "body_text": body_text, "save": True}
+        
+        yield state
+        
+        if state.get("save", True):
+            await write_markdown_entity_no_lock(file_path, state["yaml_data"], state["body_text"])
 
 async def write_audit_log(vault_path: str, agent_name: str, action: str, details: str):
     log_path = os.path.join(vault_path, "Journals", "AUDIT_LOG.md")

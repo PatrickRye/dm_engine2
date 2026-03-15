@@ -6,18 +6,14 @@ from unittest.mock import patch
 
 from dnd_rules_engine import BaseGameEntity, Creature, MeleeWeapon, EventBus
 from vault_io import initialize_engine_from_vault
-from tools import equip_item, execute_melee_attack
+from tools import equip_item, execute_melee_attack, modify_health, perform_ability_check_or_save, level_up_character, move_entity
+from spatial_engine import spatial_service
 from event_handlers import resolve_attack_handler, apply_damage_handler
 from registry import clear_registry, get_all_entities, get_entity
-from tools import level_up_character
 
 @pytest.fixture(autouse=True)
 def setup_engine_state():
     clear_registry()
-    EventBus._listeners.clear()
-    # Subscribe standard handlers for the engine test
-    EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
-    EventBus.subscribe("MeleeAttack", apply_damage_handler, priority=100)
     yield
 
 @pytest.fixture
@@ -139,3 +135,93 @@ async def test_tool_level_up_character(mock_entities):
     feature_names = [f.name for f in tharion.features]
     assert "Martial Archetype" in feature_names
     assert "Improved Critical" in feature_names
+
+@pytest.mark.asyncio
+async def test_tool_ability_check_engine_coupling(mock_entities):
+    """Tests that perform_ability_check_or_save respects live in-memory Engine modifiers, not just static YAML."""
+    vault_path, char_name, target_name = mock_entities
+    await initialize_engine_from_vault(vault_path)
+    config = {"configurable": {"thread_id": vault_path}}
+    
+    # Add an active buff directly to the engine
+    entities = [e for e in get_all_entities().values() if e.name == char_name]
+    tharion: Creature = entities[0]
+    from dnd_rules_engine import NumericalModifier, ModifierPriority
+    
+    # Buff dexterity by +5 (e.g., from a magical effect like Cat's Grace)
+    tharion.dexterity_mod.add_modifier(NumericalModifier(priority=ModifierPriority.ADDITIVE, value=5, source_name="Cat's Grace"))
+    
+    # Tharion's base DEX mod in YAML is 1. With buff, it should be 6.
+    with patch('random.randint', return_value=10):
+        res = await perform_ability_check_or_save.ainvoke({"character_name": char_name, "skill_or_stat_name": "stealth"}, config=config)
+        
+    assert "10 normally + 6 stat mod" in res
+    
+@pytest.mark.asyncio
+async def test_tool_modify_health_concentration_coupling(mock_entities):
+    """Tests that modify_health successfully alerts the LLM and/or drops concentration when bypassing the EventBus."""
+    vault_path, char_name, target_name = mock_entities
+    await initialize_engine_from_vault(vault_path)
+    config = {"configurable": {"thread_id": vault_path}}
+    
+    entities = [e for e in get_all_entities().values() if e.name == char_name]
+    tharion: Creature = entities[0]
+    tharion.concentrating_on = "Haste"
+    
+    # Test 1: Damage triggers alert
+    res = modify_health.invoke({"target_name": char_name, "hp_change": -10, "reason": "Falling"}, config=config)
+    assert "SYSTEM ALERT" in res
+    assert "prompt a Constitution saving throw" in res
+    assert tharion.concentrating_on == "Haste" # Still concentrating, waiting on roll
+    
+    # Test 2: Fatal damage auto-drops
+    res2 = modify_health.invoke({"target_name": char_name, "hp_change": -20, "reason": "Falling"}, config=config)
+    assert "dropped to 0 HP and lost concentration" in res2
+    assert tharion.concentrating_on == "" # Dropped automatically!
+
+@pytest.mark.asyncio
+async def test_tool_modify_health_respects_resistances(mock_entities):
+    """Tests that modify_health enforces damage resistances and immunities without hallucinating."""
+    vault_path, char_name, target_name = mock_entities
+    await initialize_engine_from_vault(vault_path)
+    config = {"configurable": {"thread_id": vault_path}}
+    
+    entities = [e for e in get_all_entities().values() if e.name == char_name]
+    tharion: Creature = entities[0]
+    tharion.resistances.append("fire")
+    
+    # 20 Fire damage should be halved to 10
+    res = modify_health.invoke({"target_name": char_name, "hp_change": -20, "reason": "Lava Pit", "damage_type": "fire"}, config=config)
+    assert "took 10 fire HP" in res
+    assert tharion.hp.base_value == 15 # 25 base - 10
+
+@pytest.mark.asyncio
+async def test_tool_opportunity_attack_integration(mock_entities):
+    """Tests that moving out of reach triggers an OA alert and execute_melee_attack resolves it as an async task."""
+    vault_path, char_name, target_name = mock_entities
+    await initialize_engine_from_vault(vault_path)
+    config = {"configurable": {"thread_id": vault_path}}
+    
+    tharion = [e for e in get_all_entities().values() if e.name == char_name][0]
+    goblin = [e for e in get_all_entities().values() if e.name == target_name][0]
+    
+    # Setup spatial positioning (adjacent)
+    tharion.x, tharion.y = 0.0, 0.0
+    goblin.x, goblin.y = 5.0, 0.0
+    spatial_service.sync_entity(tharion)
+    spatial_service.sync_entity(goblin)
+    
+    # 1. Goblin moves away (triggers OA)
+    move_result = await move_entity.ainvoke({
+        "entity_name": target_name, "target_x": 15.0, "target_y": 0.0, "movement_type": "walk"
+    }, config=config)
+    
+    assert "Opportunity Attacks from" in move_result
+    assert char_name in move_result
+    
+    # 2. Execute the Opportunity Attack
+    with patch('random.randint', side_effect=[18, 4]): # Attack roll 18, Damage roll 4
+        oa_result = await execute_melee_attack.ainvoke({"attacker_name": char_name, "target_name": target_name, "is_opportunity_attack": True}, config=config)
+        
+    assert "MECHANICAL TRUTH: HIT!" in oa_result
+    assert tharion.reaction_used is True

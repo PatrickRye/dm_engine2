@@ -34,7 +34,9 @@ MASTER_TOOLS_LIST = [
     advance_time, start_combat, update_combat_state, end_combat, execute_melee_attack, 
     modify_health, query_bestiary, query_rulebook, query_campaign_module,
     use_ability_or_spell, encode_new_compendium_entry, drop_concentration,
-    ready_action, clear_readied_action, move_entity, use_dash_action
+    ready_action, clear_readied_action, move_entity, use_dash_action, manage_light_sources, 
+    toggle_condition, execute_grapple_or_shove, manage_map_geometry, trigger_environmental_hazard,
+    interact_with_object, manage_map_trap
 ]
 
 # 1. INITIALIZE THE APP FIRST
@@ -61,7 +63,11 @@ async def planner_node(state: DMState, config: RunnableConfig):
         1. MELEE WEAPONS: Always use `execute_melee_attack`. Never roll manually.
         2. SPELLS & CLASS FEATURES: Always use `use_ability_or_spell`. Never roll manually.
         3. SKILL CHECKS & SAVES: Use `perform_ability_check_or_save` for jumping, sneaking, perception, etc.
-        4. DAMAGE/HEALING: Use `modify_health` for falling damage, trap damage, or drinking potions.
+        4. DAMAGE/HEALING: Use `modify_health` for guaranteed/direct damage or healing (e.g., falling, drinking potions).
+        5. TRAPS & HAZARDS: Always use `trigger_environmental_hazard` for AoE effects, traps, or weather that require saving throws or attack rolls.
+        6. MAP & GEOMETRY: Use `manage_map_geometry` when players interact with physical obstacles (e.g., opening doors, breaking walls, or casting wall-creation spells).
+        7. OBJECT INTERACTION: Use `interact_with_object` to natively resolve lockpicking, forcing doors, or disarming traps.
+        8. TRAPPING GEOMETRY: Use `manage_map_trap` to attach a trap or alarm to an existing door, wall, or terrain zone.
         
         If you get a CACHE MISS on a spell or ability, use `query_rulebook` to find the rules, 
         then `encode_new_compendium_entry` to permanently save it to the engine.

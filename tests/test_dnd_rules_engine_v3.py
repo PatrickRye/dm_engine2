@@ -8,9 +8,10 @@ from dnd_rules_engine import (
     ModifiableValue,
     GameEvent,
     EventBus,
-    Weapon,
+    MeleeWeapon,
+    ConditionalDamageWeapon,
+    DamageCondition,
 )
-from effects import DamageEffect, EffectCondition
 from event_handlers import resolve_attack_handler, apply_damage_handler
 from registry import clear_registry
 
@@ -18,10 +19,8 @@ class TestDnDRulesEngineV3(unittest.TestCase):
     def setUp(self):
         """Reset the game state before each test."""
         clear_registry()
-        EventBus._listeners.clear()
-
-        EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
-        EventBus.subscribe("MeleeAttack", apply_damage_handler, priority=100)
+        # Reset the subscription flag for ConditionalDamageWeapon
+        ConditionalDamageWeapon._subscribed = False
 
     def test_weapon_with_conditional_damage_effect(self):
         attacker = Creature(
@@ -32,18 +31,12 @@ class TestDnDRulesEngineV3(unittest.TestCase):
             dexterity_mod=ModifiableValue(base_value=1),
         )
         
-        sun_blade_effect = DamageEffect(
-            damage_dice="1d8",
-            damage_type="radiant",
-            conditions=[EffectCondition(required_tag="undead")]
-        )
-        
-        sun_blade = Weapon(
+        longsword = MeleeWeapon(name="Steel Longsword", damage_dice="1d8", damage_type="slashing")
+        sun_blade = ConditionalDamageWeapon(
+            weapon=longsword,
             name="Sun Blade",
-            damage_dice="1d8",
-            damage_type="slashing",
             magic_bonus=2,
-            effects=[sun_blade_effect]
+            conditions=[DamageCondition(required_tag="undead", extra_damage_dice="1d8", damage_type="radiant")]
         )
         attacker.equipped_weapon_uuid = sun_blade.entity_uuid
 
@@ -56,7 +49,7 @@ class TestDnDRulesEngineV3(unittest.TestCase):
             tags=["undead"]
         )
 
-        with patch('random.randint', side_effect=[18, 1, 6, 5]):  # Hit, attack roll, 6 base, 5 conditional
+        with patch('random.randint', side_effect=[18, 1, 6, 5]):  # Hit, missed adv roll, 6 base, 5 conditional
             event = GameEvent(event_type="MeleeAttack", source_uuid=attacker.entity_uuid, target_uuid=target.entity_uuid)
             EventBus.dispatch(event)
         
@@ -72,18 +65,12 @@ class TestDnDRulesEngineV3(unittest.TestCase):
             dexterity_mod=ModifiableValue(base_value=1),
         )
         
-        sun_blade_effect = DamageEffect(
-            damage_dice="1d8",
-            damage_type="radiant",
-            conditions=[EffectCondition(required_tag="undead")]
-        )
-        
-        sun_blade = Weapon(
+        longsword = MeleeWeapon(name="Steel Longsword", damage_dice="1d8", damage_type="slashing")
+        sun_blade = ConditionalDamageWeapon(
+            weapon=longsword,
             name="Sun Blade",
-            damage_dice="1d8",
-            damage_type="slashing",
             magic_bonus=2,
-            effects=[sun_blade_effect]
+            conditions=[DamageCondition(required_tag="undead", extra_damage_dice="1d8", damage_type="radiant")]
         )
         attacker.equipped_weapon_uuid = sun_blade.entity_uuid
 

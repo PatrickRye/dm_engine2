@@ -9,10 +9,16 @@ from registry import clear_registry
 class TestSpatialEngine(unittest.TestCase):
     def setUp(self):
         clear_registry()
-        if HAS_GIS:
-            spatial_service.map_data = MapData()
-            spatial_service._uuid_to_id.clear()
-            spatial_service._id_to_uuid.clear()
+        spatial_service.clear()
+            
+    def create_combatant(self, name: str, x: float, y: float) -> Creature:
+        c = Creature(
+            name=name, x=x, y=y, size=5.0,
+            hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10),
+            strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0)
+        )
+        spatial_service.sync_entity(c)
+        return c
             
     def test_line_of_sight_and_cover(self):
         archer = Creature(
@@ -61,6 +67,114 @@ class TestSpatialEngine(unittest.TestCase):
         
         self.assertIn(goblin1.entity_uuid, hits) # Goblin 1 is 14ft away (hit!)
         self.assertNotIn(goblin2.entity_uuid, hits) # Goblin 2 is 141ft away (safe!)
+
+    def test_glass_window_physics(self):
+        """Test is_solid=True, is_visible=True: Blocks physical movement and provides cover, but allows Line of Sight."""
+        p1 = self.create_combatant("P1", 0.0, 0.0)
+        p2 = self.create_combatant("P2", 10.0, 0.0)
+        
+        window = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=True, label="Glass Window")
+        spatial_service.add_wall(window)
+        
+        # Can see right through it
+        self.assertTrue(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
+        
+        # Cannot move through it
+        self.assertTrue(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
+        
+        # Still provides physical cover
+        _, cover = spatial_service.get_distance_and_cover(p1.entity_uuid, p2.entity_uuid)
+        self.assertEqual(cover, "Total")
+        
+    def test_illusion_wall_physics(self):
+        """Test is_solid=False, is_visible=False: Blocks vision/LoS, but allows physical movement and projectiles."""
+        p1 = self.create_combatant("P1", 0.0, 0.0)
+        p2 = self.create_combatant("P2", 10.0, 0.0)
+        
+        fog = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=False, is_visible=False, label="Fog Cloud")
+        spatial_service.add_wall(fog)
+        
+        # Cannot see through it
+        self.assertFalse(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
+        
+        # Can walk right through it
+        self.assertFalse(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
+        
+        # Provides zero physical cover to projectiles
+        _, cover = spatial_service.get_distance_and_cover(p1.entity_uuid, p2.entity_uuid)
+        self.assertEqual(cover, "None")
+        
+    def test_dynamic_door_opening(self):
+        """Test opening a door dynamically updates the pathing and LoS cache."""
+        p1 = self.create_combatant("P1", 0.0, 0.0)
+        p2 = self.create_combatant("P2", 10.0, 0.0)
+        
+        door = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=False, label="Heavy Oak Door")
+        spatial_service.add_wall(door)
+        
+        # Closed door
+        self.assertFalse(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
+        self.assertTrue(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
+        
+        # Open the door
+        spatial_service.modify_wall(door.wall_id, is_solid=False, is_visible=True)
+        
+        # Opened door
+        self.assertTrue(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
+        self.assertFalse(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
+
+    def test_temporary_walls(self):
+        """Test that temporary walls block paths but are correctly wiped on map reset."""
+        spatial_service.map_data.original_walls = []
+        
+        # Cast Wall of Stone (temporary)
+        temp_wall = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=False)
+        spatial_service.add_wall(temp_wall, is_temporary=True)
+        
+        self.assertTrue(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
+        self.assertEqual(len(spatial_service.map_data.active_walls), 1)
+        
+        # Duration expires, reset map geometry
+        spatial_service.reset_map_geometry()
+        
+        self.assertFalse(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
+        self.assertEqual(len(spatial_service.map_data.active_walls), 0)
+
+    def test_rounding_corners_line_of_sight(self):
+        """Test that entities can peer around a corner if their bounding box extends past the wall."""
+        p1 = self.create_combatant("P1", 0.0, 0.0) # Bounding box covers y: -2.5 to 2.5
+        p2 = self.create_combatant("P2", 10.0, 0.0)
+        
+        # Wall goes from (5,0) exactly at the center-line, extending north to (5,10)
+        # The direct center-to-center path from (0,0) to (10,0) hits the corner exactly at (5,0).
+        # However, P1's southern corners (-2.5, -2.5) and (2.5, -2.5) have a clear unbroken line to P2.
+        corner_wall = Wall(start=(5.0, 0.0), end=(5.0, 10.0), is_solid=True, is_visible=False)
+        spatial_service.add_wall(corner_wall)
+        
+        # P1 can see P2 by looking "around" the bottom of the corner
+        self.assertTrue(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
+        
+        # If we extend the wall south to cover P1's entire bounding box, LoS is finally broken.
+        spatial_service.remove_wall(corner_wall.wall_id)
+        extended_wall = Wall(start=(5.0, -5.0), end=(5.0, 10.0), is_solid=True, is_visible=False)
+        spatial_service.add_wall(extended_wall)
+        
+        self.assertFalse(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
+        
+    def test_breaking_walls(self):
+        """Test physically breaking an obstacle removes it from the spatial map."""
+        p1 = self.create_combatant("P1", 0.0, 0.0)
+        p2 = self.create_combatant("P2", 10.0, 0.0)
+        
+        fragile_wall = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=False, label="Ice Wall")
+        spatial_service.add_wall(fragile_wall)
+        
+        self.assertTrue(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
+        
+        # Barbarian smashes the Ice Wall
+        spatial_service.remove_wall(fragile_wall.wall_id)
+        
+        self.assertFalse(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
 
 if __name__ == '__main__':
     unittest.main()

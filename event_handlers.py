@@ -8,7 +8,7 @@ from dnd_rules_engine import (
     ModifiableValue, NumericalModifier, ModifierPriority, ActiveCondition,
     roll_dice, parse_duration_to_seconds
 )
-from spatial_engine import spatial_service
+from spatial_engine import spatial_service, HAS_GIS
 from registry import get_entity, get_all_entities
 
 def resolve_spell_cast_handler(event: GameEvent):
@@ -222,6 +222,41 @@ def resolve_attack_handler(event: GameEvent):
             print(f"[Engine] {attacker.name} cannot hit {target.name}. Target is out of melee reach ({dist:.1f}ft > {base_reach}ft).")
             event.payload["hit"] = False
             return
+            
+    # Evaluate Spatial Logic: Illumination & Visibility
+    attacker_illum = spatial_service.get_illumination(attacker.x, attacker.y, attacker.z)
+    target_illum = spatial_service.get_illumination(target.x, target.y, target.z)
+    
+    def can_perceive(observer: Creature, target_ent: Creature, distance: float, target_illumination: str) -> bool:
+        def get_sense_range(sense_name: str) -> float:
+            for t in observer.tags:
+                if t == sense_name: return 60.0
+                if t.startswith(f"{sense_name}_"):
+                    try: return float(t.split("_")[1])
+                    except: return 60.0
+            return 0.0
+
+        if distance <= get_sense_range("truesight"): return True
+        if distance <= get_sense_range("blindsight"): return True
+        if distance <= get_sense_range("tremorsense") and "flying" not in target_ent.tags: return True
+
+        target_invisible = "invisible" in target_ent.tags or any(c.name.lower() in ["invisible", "hidden"] for c in target_ent.active_conditions)
+        if target_invisible: return False
+
+        if target_illumination == "darkness" and distance > get_sense_range("darkvision"): return False
+
+        return True
+
+    attacker_can_see_target = can_perceive(attacker, target, dist, target_illum)
+    target_can_see_attacker = can_perceive(target, attacker, dist, attacker_illum)
+
+    if not attacker_can_see_target:
+        print(f"[Engine] {target.name} is unseen by {attacker.name}. Applying DISADVANTAGE.")
+        event.payload["disadvantage"] = True
+        
+    if not target_can_see_attacker:
+        print(f"[Engine] {attacker.name} is unseen by {target.name}. Applying ADVANTAGE.")
+        event.payload["advantage"] = True
 
     cover_ac_bonus = 2 if cover == "Half" else (5 if cover == "Three-Quarters" else 0)
     target_ac = target.ac.total + cover_ac_bonus
@@ -230,10 +265,16 @@ def resolve_attack_handler(event: GameEvent):
     roll1 = random.randint(1, 20)
     roll2 = random.randint(1, 20)
     
-    if event.payload.get("advantage"):
+    has_adv = event.payload.get("advantage", False)
+    has_disadv = event.payload.get("disadvantage", False)
+    
+    if has_adv and has_disadv:
+        d20_roll = roll1
+        print("[Engine] Attack has BOTH Advantage and Disadvantage. They cancel out. Rolling normally.")
+    elif has_adv:
         d20_roll = max(roll1, roll2)
         print("[Engine] Attack has ADVANTAGE, rolling twice and taking the higher roll.")
-    elif event.payload.get("disadvantage"):
+    elif has_disadv:
         d20_roll = min(roll1, roll2)
         print("[Engine] Attack has DISADVANTAGE, rolling twice and taking the lower roll.")
     else:
@@ -246,6 +287,13 @@ def resolve_attack_handler(event: GameEvent):
 
     cover_msg = f" (Includes +{cover_ac_bonus} {cover} Cover)" if cover_ac_bonus > 0 else ""
     print(f"[Engine] {attacker.name} rolls a {d20_roll} ({roll1}, {roll2} if adv/disadv) + {attack_bonus} = {total_attack} vs AC {target_ac}{cover_msg}")
+
+    # Attacking reveals the attacker
+    hidden_conds = [c for c in attacker.active_conditions if c.name.lower() == "hidden"]
+    if hidden_conds:
+        for c in hidden_conds:
+            attacker.active_conditions.remove(c)
+        print(f"[Engine] {attacker.name} reveals themselves by attacking. 'Hidden' condition removed.")
 
     if is_hit:
         if is_critical_hit:
@@ -369,7 +417,7 @@ def handle_advance_time_event(event: GameEvent):
     for uid, entity in get_all_entities().items():
         if isinstance(entity, Creature):
             # Check all ModifiableValue attributes for temporary modifiers
-            for field_name in entity.model_fields:
+            for field_name in type(entity).model_fields:
                 stat_val = getattr(entity, field_name)
                 if isinstance(stat_val, ModifiableValue):
                     expired_mods = []
@@ -402,22 +450,30 @@ def shield_spell_reaction_handler(event: GameEvent):
     """Intercepts an attack BEFORE it resolves and magically raises AC."""
     if event.status != EventStatus.PRE_EVENT: return
     
-    target: Creature = get_entity(event.target_uuid)
-    if "can_cast_shield" in target.tags and not target.reaction_used:
-        print(f"[Engine] REACTION TRIGGERED: {target.name} casts Shield!")
-        target.reaction_used = True
-        current_init = event.payload.get("current_initiative", 0)
-        shield_mod = NumericalModifier(
-            priority=ModifierPriority.ADDITIVE, 
-            value=5, 
-            source_name="Shield Spell",
-            duration_seconds=6, # Shield lasts 1 round
-            applied_initiative=current_init
-        )
-        target.ac.add_modifier(shield_mod)
-        if "Shield Spell" not in target.active_mechanics:
-            target.active_mechanics.append("Shield Spell")
-        print(f"[Engine] {target.name}'s AC is temporarily raised to {target.ac.total}")
+    target_uuids = []
+    if event.target_uuid:
+        target_uuids.append(event.target_uuid)
+    elif "target_uuids" in event.payload:
+        target_uuids.extend(event.payload["target_uuids"])
+        
+    current_init = event.payload.get("current_initiative", 0)
+    
+    for t_uuid in target_uuids:
+        target: Creature = get_entity(t_uuid)
+        if target and "can_cast_shield" in target.tags and not target.reaction_used:
+            print(f"[Engine] REACTION TRIGGERED: {target.name} casts Shield!")
+            target.reaction_used = True
+            shield_mod = NumericalModifier(
+                priority=ModifierPriority.ADDITIVE, 
+                value=5, 
+                source_name="Shield Spell",
+                duration_seconds=6, # Shield lasts 1 round
+                applied_initiative=current_init
+            )
+            target.ac.add_modifier(shield_mod)
+            if "Shield Spell" not in target.active_mechanics:
+                target.active_mechanics.append("Shield Spell")
+            print(f"[Engine] {target.name}'s AC is temporarily raised to {target.ac.total}")
 
 def handle_drop_concentration_event(event: GameEvent):
     """Removes all modifiers and conditions applied by a concentrated spell."""
@@ -431,7 +487,7 @@ def handle_drop_concentration_event(event: GameEvent):
     
     for uid, entity in get_all_entities().items():
         if isinstance(entity, Creature):
-            for field_name in entity.model_fields:
+            for field_name in type(entity).model_fields:
                 stat_val = getattr(entity, field_name)
                 if isinstance(stat_val, ModifiableValue):
                     expired_mods = [m for m in stat_val.modifiers if m.source_name == spell_name and (m.source_uuid == caster.entity_uuid or m.source_uuid is None)]
@@ -460,6 +516,25 @@ def validate_movement_handler(event: GameEvent):
     entity = get_entity(event.source_uuid)
     if not isinstance(entity, Creature): return
     
+    # 1. Enforce Condition-Based Restrictions
+    active_conds = [c.name.lower() for c in entity.active_conditions]
+    zero_speed_conds = {"grappled", "restrained", "stunned", "paralyzed", "petrified", "unconscious"}
+    if any(cond in active_conds for cond in zero_speed_conds):
+        event.status = EventStatus.CANCELLED
+        event.payload["error"] = f"Movement failed. {entity.name} is suffering from a condition that reduces their speed to 0."
+        return
+
+    # 2. Check Prone mechanics
+    stand_cost = 0
+    if "prone" in active_conds and movement_type not in ["crawl"]:
+        stand_cost = entity.speed // 2
+        if entity.movement_remaining < stand_cost:
+            event.status = EventStatus.CANCELLED
+            event.payload["error"] = f"Movement failed. {entity.name} is Prone and does not have enough movement ({stand_cost}ft needed) to stand up. Try movement_type='crawl'."
+            return
+        entity.active_conditions = [c for c in entity.active_conditions if c.name.lower() != "prone"]
+        print(f"[Engine] {entity.name} spends {stand_cost}ft of movement to stand up from Prone.")
+
     target_x = event.payload.get("target_x")
     target_y = event.payload.get("target_y")
     target_z = event.payload.get("target_z", entity.z)
@@ -471,8 +546,11 @@ def validate_movement_handler(event: GameEvent):
         normal_dist += diff_dist
         diff_dist = 0.0
         
-    total_cost = math.ceil(normal_dist + (diff_dist * 2)) # Difficult terrain costs twice as much
+    total_cost = math.ceil(normal_dist + (diff_dist * 2)) + stand_cost # Difficult terrain costs twice as much
     
+    if event.payload.get("dragged_uuids"):
+        total_cost *= 2 # Dragging halves speed (costs twice as much movement per foot)
+        
     if total_cost > entity.movement_remaining:
         event.status = EventStatus.CANCELLED
         event.payload["error"] = f"Movement cost ({total_cost}ft) exceeds remaining speed ({entity.movement_remaining}ft). Normal dist: {normal_dist:.1f}ft, Difficult dist: {diff_dist:.1f}ft."
@@ -494,6 +572,28 @@ def resolve_movement_handler(event: GameEvent):
     target_x = event.payload.get("target_x")
     target_y = event.payload.get("target_y")
     target_z = event.payload.get("target_z", entity.z)
+    
+    # --- Grapple Breaking Checks ---
+    # 1. Did the moving entity break out of a grapple? (e.g. Thunderwaved away)
+    grappled_conds = [c for c in entity.active_conditions if c.name.lower() == "grappled" and c.source_uuid]
+    for cond in grappled_conds:
+        grappler = get_entity(cond.source_uuid)
+        if grappler:
+            dist_after = spatial_service.calculate_distance(grappler.x, grappler.y, grappler.z, target_x, target_y, target_z)
+            if dist_after > 7.5:
+                entity.active_conditions.remove(cond)
+                print(f"[Engine] {entity.name} was moved out of {grappler.name}'s reach. The grapple is broken!")
+                
+    # 2. Did the moving entity abandon a grapple they were maintaining? (e.g. Teleporting away without dragging)
+    dragged_uuids = event.payload.get("dragged_uuids", [])
+    for uid, other_ent in get_all_entities().items():
+        if isinstance(other_ent, Creature) and uid not in dragged_uuids:
+            for cond in other_ent.active_conditions:
+                if cond.name.lower() == "grappled" and cond.source_uuid == entity.entity_uuid:
+                    dist_after = spatial_service.calculate_distance(target_x, target_y, target_z, other_ent.x, other_ent.y, other_ent.z)
+                    if dist_after > 7.5:
+                        other_ent.active_conditions.remove(cond)
+                        print(f"[Engine] {entity.name} moved away from {other_ent.name}. The grapple is broken!")
     
     opportunity_attackers = []
     for uid, potential_attacker in get_all_entities().items():
@@ -538,6 +638,108 @@ def consume_movement_handler(event: GameEvent):
     if isinstance(entity, Creature) and "cost" in event.payload:
         entity.movement_remaining -= event.payload["cost"]
 
+def trap_movement_handler(event: GameEvent):
+    """Evaluates movement to see if it intersects with trapped geometry."""
+    if event.status != EventStatus.EXECUTION: return
+    
+    movement_type = event.payload.get("movement_type", "walk").lower()
+    if movement_type in ["teleport", "forced"]: return
+        
+    entity = get_entity(event.source_uuid)
+    if not isinstance(entity, Creature): return
+    
+    target_x = event.payload.get("target_x")
+    target_y = event.payload.get("target_y")
+    
+    if not HAS_GIS: return
+    from shapely.geometry import LineString
+    
+    path = LineString([(entity.x, entity.y), (target_x, target_y)])
+    traps_triggered = []
+    
+    for wall in spatial_service.map_data.active_walls:
+        if wall.trap and wall.trap.is_active and wall.trap.trigger_on_move and path.intersects(wall.line):
+            traps_triggered.append((wall.trap, target_x, target_y))
+            
+    for zone in spatial_service.map_data.active_terrain:
+        if zone.trap and zone.trap.is_active and zone.trap.trigger_on_move and path.intersects(zone.polygon):
+            traps_triggered.append((zone.trap, target_x, target_y))
+            
+    for trap, ox, oy in traps_triggered:
+        if not trap.is_active: continue
+        trap.is_active = False # Deactivate after triggering once
+        print(f"[Engine] TRAP TRIGGERED: {trap.hazard_name} during movement!")
+        
+        target_uuids = {entity.entity_uuid}
+        if trap.radius > 0:
+            spatial_hits = spatial_service.get_targets_in_radius(ox, oy, trap.radius)
+            target_uuids.update(spatial_hits)
+            
+        trap_source = Creature(
+            name=trap.hazard_name, tags=["trap"], hp=ModifiableValue(base_value=1), ac=ModifiableValue(base_value=10),
+            spell_save_dc=ModifiableValue(base_value=trap.save_dc), spell_attack_bonus=ModifiableValue(base_value=trap.attack_bonus),
+            strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0)
+        )
+        
+        mechanics = {
+            "requires_attack_roll": trap.requires_attack_roll, "save_required": trap.save_required,
+            "damage_dice": trap.damage_dice, "damage_type": trap.damage_type, "half_damage_on_save": trap.half_damage_on_save,
+            "conditions_applied": [{"condition": trap.condition_applied, "duration": "1 minute"}] if trap.condition_applied else []
+        }
+        
+        trap_event = GameEvent(event_type="SpellCast", source_uuid=trap_source.entity_uuid, payload={"ability_name": trap.hazard_name, "mechanics": mechanics, "target_uuids": list(target_uuids)})
+        trap_result = EventBus.dispatch(trap_event)
+        BaseGameEntity.remove(trap_source.entity_uuid)
+        
+        if "trap_results" not in event.payload:
+            event.payload["trap_results"] = []
+        event.payload["trap_results"].extend(trap_result.payload.get("results", []))
+
+def trap_noise_handler(event: GameEvent):
+    """Automatically tests PC stealth against global NPC passive perception when a trap is triggered."""
+    if event.status != EventStatus.POST_EVENT: return
+    
+    caster = get_entity(event.source_uuid)
+    if not caster or "trap" not in caster.tags: return
+    
+    target_uuids = event.payload.get("target_uuids", [])
+    triggering_pc = get_entity(target_uuids[0]) if target_uuids else None
+    
+    stealth_score = 10
+    if isinstance(triggering_pc, Creature):
+        stealth_score = 10 + triggering_pc.dexterity_mod.total
+        # Remove Hidden status from the PC who blundered into the trap
+        hidden_conds = [c for c in triggering_pc.active_conditions if c.name.lower() == "hidden"]
+        if hidden_conds:
+            for c in hidden_conds:
+                triggering_pc.active_conditions.remove(c)
+            if "results" not in event.payload:
+                event.payload["results"] = []
+            event.payload["results"].append(f"[{triggering_pc.name}] lost their 'Hidden' status from triggering the trap.")
+
+    alerted_npcs = []
+    for uid, ent in get_all_entities().items():
+        if isinstance(ent, Creature) and ent.hp.base_value > 0:
+            is_pc = any(t in ent.tags for t in ["pc", "player", "party_npc"])
+            if is_pc: continue
+            
+            dist = 0
+            if triggering_pc and HAS_GIS:
+                dist = spatial_service.calculate_distance(ent.x, ent.y, ent.z, triggering_pc.x, triggering_pc.y, triggering_pc.z)
+                
+            # -1 penalty to passive perception for every 10 ft of distance
+            distance_penalty = int(dist // 10)
+            passive_perception = 10 + ent.wisdom_mod.total - distance_penalty
+            
+            if passive_perception >= stealth_score:
+                alerted_npcs.append(ent.name)
+                
+    if alerted_npcs:
+        msg = f"SYSTEM ALERT: The trap generated noise! The following NPCs beat the triggering entity's Passive Stealth (DC {stealth_score}) with their Passive Perception and are now ALERTED: {', '.join(alerted_npcs)}."
+        if "results" not in event.payload:
+            event.payload["results"] = []
+        event.payload["results"].append(msg)
+
 def evasion_save_handler(event: GameEvent):
     """Intercepts dexterity saving throws to apply the Evasion feat mechanics."""
     if event.status != EventStatus.EXECUTION: return
@@ -557,16 +759,23 @@ def evasion_save_handler(event: GameEvent):
             event.payload["final_damage"] = base_damage // 2
             print(f"[Engine] {target.name} fails the save, but Evasion reduces it to half damage.")
 
-# Register handlers to the Event Bus automatically when imported
-EventBus.subscribe("MeleeAttack", shield_spell_reaction_handler, priority=1)
-EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
-EventBus.subscribe("MeleeAttack", apply_damage_handler, priority=100)
-EventBus.subscribe("SpellCast", shield_spell_reaction_handler, priority=1)
-EventBus.subscribe("SpellCast", resolve_spell_cast_handler, priority=10)
-EventBus.subscribe("SavingThrow", evasion_save_handler, priority=10)
-EventBus.subscribe("Rest", handle_rest_event, priority=10)
-EventBus.subscribe("AdvanceTime", handle_advance_time_event, priority=10)
-EventBus.subscribe("DropConcentration", handle_drop_concentration_event, priority=10)
-EventBus.subscribe("Movement", validate_movement_handler, priority=5)
-EventBus.subscribe("Movement", resolve_movement_handler, priority=10)
-EventBus.subscribe("Movement", consume_movement_handler, priority=100)
+def register_core_handlers():
+    """Registers all standard handlers to the Event Bus. Can be called to reset state."""
+    EventBus._listeners.clear()
+    EventBus.subscribe("MeleeAttack", shield_spell_reaction_handler, priority=1)
+    EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
+    EventBus.subscribe("MeleeAttack", apply_damage_handler, priority=100)
+    EventBus.subscribe("SpellCast", shield_spell_reaction_handler, priority=1)
+    EventBus.subscribe("SpellCast", resolve_spell_cast_handler, priority=10)
+    EventBus.subscribe("SpellCast", trap_noise_handler, priority=100)
+    EventBus.subscribe("SavingThrow", evasion_save_handler, priority=10)
+    EventBus.subscribe("Rest", handle_rest_event, priority=10)
+    EventBus.subscribe("AdvanceTime", handle_advance_time_event, priority=10)
+    EventBus.subscribe("DropConcentration", handle_drop_concentration_event, priority=10)
+    EventBus.subscribe("Movement", validate_movement_handler, priority=5)
+    EventBus.subscribe("Movement", resolve_movement_handler, priority=10)
+    EventBus.subscribe("Movement", trap_movement_handler, priority=15)
+    EventBus.subscribe("Movement", consume_movement_handler, priority=100)
+
+# Register handlers automatically when imported
+register_core_handlers()

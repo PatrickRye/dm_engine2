@@ -13,19 +13,19 @@ from typing import Optional, Annotated, Union
 import uuid
 
 # === DETERMINISTIC ENGINE INTEGRATION ===
-from dnd_rules_engine import EventBus, GameEvent, EventStatus, BaseGameEntity, Creature, MeleeWeapon, roll_dice as roll_generic_dice
+from dnd_rules_engine import EventBus, GameEvent, EventStatus, BaseGameEntity, Creature, MeleeWeapon, roll_dice as roll_generic_dice, ActiveCondition, ModifiableValue
 from state import PCDetails, NPCDetails, LocationDetails, FactionDetails, ClassLevel
-from vault_io import get_journals_dir, write_audit_log, read_markdown_entity_no_lock, write_markdown_entity_no_lock, upsert_journal_section
+from vault_io import get_journals_dir, write_audit_log, read_markdown_entity_no_lock, write_markdown_entity_no_lock, upsert_journal_section, read_markdown_entity, edit_markdown_entity
 from compendium_manager import CompendiumManager, CompendiumEntry, MechanicEffect
-from spatial_engine import spatial_service
+from spatial_engine import spatial_service, LightSource, Wall
 import event_handlers
 
-
+from registry import get_all_entities
 
 def _get_entity_by_name(name: str) -> Optional[BaseGameEntity]:
     """Helper to find an active entity in the engine's memory by name."""
-    for uid, entity in BaseGameEntity._registry.items():
-        if name.lower() in entity.name.lower() or entity.name.lower() in name.lower():
+    for uid, entity in get_all_entities().items():
+       if name.lower() in entity.name.lower() or entity.name.lower() in name.lower():
             return entity
     return None
 
@@ -107,7 +107,7 @@ def _build_pc_template(title: str, details: dict) -> str:
     feats = details.get("feats_and_traits", "None")
     
     return (f"---\ntags: [pc, player]\nstatus: active\nclasses: {yaml.dump(classes, default_flow_style=True)}\nspecies: {species}\nbackground: {background}\n"
-            f"level: 1\nmax_hp: 10\nac: 10\ngold: 0\n"
+            f"level: 1\nmax_hp: 10\nac: 10\ngold: 0\ncurrency:\n  cp: 0\n  sp: 0\n  ep: 0\n  gp: 0\n  pp: 0\n"
             f"str: {s_str}\ndex: {s_dex}\ncon: {s_con}\nint: {s_int}\nwis: {s_wis}\ncha: {s_cha}\n"
             f"attunement_slots: 0/3\n"
             f"equipment:\n"
@@ -154,14 +154,11 @@ def _build_party_tracker() -> str:
             f"}}\n"
             f"```\n")
 
-def _get_current_combat_initiative(vault_path: str) -> int:
+async def _get_current_combat_initiative(vault_path: str) -> int:
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
     if os.path.exists(file_path):
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            if content.startswith("---"):
-                yaml_data = yaml.safe_load(content.split("---", 2)[1]) or {}
+            async with read_markdown_entity(file_path) as (yaml_data, _):
                 combatants = yaml_data.get("combatants", [])
                 idx = yaml_data.get("current_turn_index", 0)
                 if combatants and idx < len(combatants):
@@ -173,7 +170,7 @@ def _get_current_combat_initiative(vault_path: str) -> int:
 
 
 @tool
-def execute_melee_attack(attacker_name: str, target_name: str, advantage: bool = False, disadvantage: bool = False, is_reaction: bool = False, is_legendary_action: bool = False, is_opportunity_attack: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def execute_melee_attack(attacker_name: str, target_name: str, advantage: bool = False, disadvantage: bool = False, is_reaction: bool = False, is_legendary_action: bool = False, is_opportunity_attack: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
     STRICT REQUIREMENT: Use this tool to resolve ANY melee attack between two entities.
     Do NOT hallucinate dice rolls or damage. The engine will calculate hit/miss and exact damage.
@@ -198,7 +195,7 @@ def execute_melee_attack(attacker_name: str, target_name: str, advantage: bool =
         if getattr(attacker, "legendary_actions_current", 0) <= 0: return f"SYSTEM ERROR: {attacker.name} has no Legendary Actions remaining."
         attacker.legendary_actions_current -= 1
         
-    current_init = _get_current_combat_initiative(config["configurable"].get("thread_id"))
+    current_init = await _get_current_combat_initiative(config["configurable"].get("thread_id"))
     event = GameEvent(
         event_type="MeleeAttack",
         source_uuid=attacker.entity_uuid,
@@ -226,18 +223,41 @@ def execute_melee_attack(attacker_name: str, target_name: str, advantage: bool =
     return base_msg
 
 @tool
-def modify_health(target_name: str, hp_change: int, reason: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+def modify_health(target_name: str, hp_change: int, reason: str, damage_type: str = "untyped", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
     Use this tool to apply guaranteed damage (traps, falling, auto-hit spells) or healing (potions, healing spells).
     Provide a negative hp_change for damage, positive for healing.
+    Specify damage_type (e.g., 'fire', 'bludgeoning', 'falling') so the engine can check resistances.
     """
     target = _get_entity_by_name(target_name)
     if not target:
         return f"SYSTEM ERROR: Target '{target_name}' not found."
         
+    if hp_change < 0:
+        # Route damage through engine resistance checks natively
+        dmg = abs(hp_change)
+        dt = damage_type.lower()
+        if dt in target.immunities:
+            dmg = 0
+        elif dt in target.vulnerabilities:
+            dmg *= 2
+        elif dt in target.resistances:
+            dmg //= 2
+        hp_change = -dmg
+
     target.hp.base_value += hp_change
     action = "healed for" if hp_change > 0 else "took"
-    return f"MECHANICAL TRUTH: {target.name} {action} {abs(hp_change)} HP from {reason}. Current HP: {target.hp.base_value}."
+    result_msg = f"MECHANICAL TRUTH: {target.name} {action} {abs(hp_change)} {damage_type} HP from {reason}. Current HP: {target.hp.base_value}."
+    
+    if hp_change < 0 and target.concentrating_on:
+        dc = max(10, abs(hp_change) // 2)
+        result_msg += f"\nSYSTEM ALERT: {target.name} took damage while concentrating on '{target.concentrating_on}'. You MUST prompt a Constitution saving throw (DC {dc}). If they fail, use `drop_concentration`."
+        
+    if target.hp.base_value <= 0 and target.concentrating_on:
+        EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid))
+        result_msg += f"\nSYSTEM ALERT: {target.name} dropped to 0 HP and lost concentration on '{target.concentrating_on}'."
+        
+    return result_msg
 
 
 @tool
@@ -436,17 +456,12 @@ async def update_yaml_frontmatter(entity_name: str, updates: dict, *, config: An
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{entity_name}.md")
     
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
-    async with lock: 
-        try:
-            yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
-        except Exception as e:
-            return str(e)
-            
-        for key, value in updates.items(): 
-            yaml_data[key] = value
-            
-        await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            for key, value in updates.items(): 
+                state["yaml_data"][key] = value
+    except Exception as e:
+        return str(e)
             
     return f"Success: Updated stats for {entity_name}."
 
@@ -503,42 +518,35 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, new_ac
     slot_map = { "weapon": "main_hand" }
     target_slot = slot_map.get(item_slot, item_slot)
 
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
-    async with lock:
-        try:
-            yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
-        except Exception as e:
-            return str(e)
-
-        equipment = yaml_data.get("equipment", {})
-        if not isinstance(equipment, dict):
-            return f"Error: '{character_name}.md' does not have a valid 'equipment' block."
-
-        final_slot = None
-        if target_slot == "ring":
-            # Auto-find an empty ring slot
-            if str(equipment.get("ring1", "None")) in ["None", ""]:
-                final_slot = "ring1"
-            elif str(equipment.get("ring2", "None")) in ["None", ""]:
-                final_slot = "ring2"
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
+            equipment = yaml_data.get("equipment", {})
+            if not isinstance(equipment, dict):
+                state["save"] = False
+                return f"Error: '{character_name}.md' does not have a valid 'equipment' block."
+    
+            final_slot = None
+            if target_slot == "ring":
+                if str(equipment.get("ring1", "None")) in ["None", ""]:
+                    final_slot = "ring1"
+                elif str(equipment.get("ring2", "None")) in ["None", ""]:
+                    final_slot = "ring2"
+                else:
+                    state["save"] = False
+                    return f"Error: Both ring slots are already occupied. You must specify 'ring1' or 'ring2' to overwrite one."
+            elif target_slot in equipment:
+                final_slot = target_slot
             else:
-                return f"Error: Both ring slots are already occupied. You must specify 'ring1' or 'ring2' to overwrite one."
-        elif target_slot in equipment:
-            final_slot = target_slot
-        else:
-            valid_slots = list(equipment.keys())
-            return f"Error: Invalid equipment slot '{item_slot}'. Valid slots are: {', '.join(valid_slots)} or 'ring'."
-
-        equipment[final_slot] = item_name
-        
-        updates = {"equipment": equipment}
-        if new_ac_value is not None:
-            updates["ac"] = new_ac_value
-        
-        for key, value in updates.items(): 
-            yaml_data[key] = value
-
-        await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
+                valid_slots = list(equipment.keys())
+                state["save"] = False
+                return f"Error: Invalid equipment slot '{item_slot}'. Valid slots are: {', '.join(valid_slots)} or 'ring'."
+    
+            equipment[final_slot] = item_name
+            if new_ac_value is not None:
+                yaml_data["ac"] = new_ac_value
+    except Exception as e:
+        return str(e)
 
     # Sync OO Engine state dynamically if the entity is active in memory
     engine_creature = _get_entity_by_name(character_name)
@@ -561,38 +569,34 @@ async def use_expendable_resource(character_name: str, resource_name: str, amoun
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
     
     log_message = ""
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
     
     # 1. ACQUIRE LOCK: Read and Write the YAML
-    async with lock:
-        try:
-            yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
-        except Exception as e:
-            return str(e)
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
+            resources = yaml_data.get("resources", {})
+            if not isinstance(resources, dict): resources = {}
+                
+            target_key = next((k for k in resources.keys() if resource_name.lower() in k.lower()), None)
             
-        resources = yaml_data.get("resources", {})
-        if not isinstance(resources, dict): resources = {}
-            
-        target_key = next((k for k in resources.keys() if resource_name.lower() in k.lower()), None)
-        
-        if not target_key:
-            return f"Error: Resource '{resource_name}' not found on {character_name}'s sheet. Available: {list(resources.keys())}"
-            
-        val_str = str(resources[target_key])
-        match = re.match(r"(\d+)\s*/\s*(\d+)", val_str)
-        if match:
-            current_val = int(match.group(1))
-            max_val = int(match.group(2))
-            new_val = max(0, current_val - amount_to_deduct)
-            resources[target_key] = f"{new_val}/{max_val}"
-            
-            yaml_data["resources"] = resources
-            await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
-            
-            # Prepare the log message but DO NOT call the tool inside the lock!
-            log_message = f"- Used {amount_to_deduct}x {target_key}. ({new_val}/{max_val} remaining)."
-        else:
-            return f"Error: Resource '{target_key}' has invalid format '{val_str}'. Expected 'current/max' (e.g., '2/3')."
+            if not target_key:
+                state["save"] = False
+                return f"Error: Resource '{resource_name}' not found on {character_name}'s sheet. Available: {list(resources.keys())}"
+                
+            val_str = str(resources[target_key])
+            match = re.match(r"(\d+)\s*/\s*(\d+)", val_str)
+            if match:
+                current_val = int(match.group(1))
+                max_val = int(match.group(2))
+                new_val = max(0, current_val - amount_to_deduct)
+                resources[target_key] = f"{new_val}/{max_val}"
+                
+                log_message = f"- Used {amount_to_deduct}x {target_key}. ({new_val}/{max_val} remaining)."
+            else:
+                state["save"] = False
+                return f"Error: Resource '{target_key}' has invalid format '{val_str}'. Expected 'current/max' (e.g., '2/3')."
+    except Exception as e:
+        return str(e)
 
     # 2. LOCK RELEASED: Safely call the next tool
     # Sync OO Engine state dynamically if the entity is active in memory
@@ -620,65 +624,52 @@ async def level_up_character(character_name: str, class_name: str, hp_increase: 
     if not await aios.path.exists(file_path): 
         return f"Error: Could not locate '{character_name}.md'."
         
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
-    async with lock:
-        try:
-            yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
-        except Exception as e:
-            return str(e)
-
-        pc_details = PCDetails(**yaml_data)
-        
-        # Find the class to level up
-        class_to_level_up = None
-        for c in pc_details.classes:
-            if c.class_name.lower() == class_name.lower():
-                class_to_level_up = c
-                break
-        
-        if not class_to_level_up:
-            return f"Error: Class '{class_name}' not found on character '{character_name}'."
-
-        class_to_level_up.level += 1
-        new_level = class_to_level_up.level
-        
-        # Update HP
-        new_max_hp = pc_details.hp + hp_increase
-        pc_details.hp = new_max_hp
-        
-        # Get creature from engine to apply features
-        creature = _get_entity_by_name(character_name)
-        if not creature or not isinstance(creature, Creature):
-            return f"Error: Creature '{character_name}' not found in the deterministic engine."
-
-        # Sync the new stats to the active OO Engine memory
-        creature.max_hp = new_max_hp
-        creature.hp.base_value += hp_increase
-        for c in creature.classes:
-            if c.class_name.lower() == class_name.lower():
-                c.level = new_level
-
-        # Apply features from class definition
-        class_def = await CompendiumManager.get_class_definition(vault_path, class_to_level_up.class_name)
-        if class_def:
-            creature.apply_features(class_def, new_level)
-        
-        # Apply features from subclass definition
-        if class_to_level_up.subclass_name:
-            subclass_def = await CompendiumManager.get_subclass_definition(vault_path, class_to_level_up.subclass_name)
-            if subclass_def:
-                creature.apply_subclass_features(subclass_def, new_level)
-        
-        # Update YAML data
-        updates = {
-            "level": pc_details.character_level,
-            "max_hp": new_max_hp,
-            "classes": [c.model_dump() for c in pc_details.classes]
-        }
-        for key, value in updates.items(): 
-            yaml_data[key] = value
-
-        await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
+            pc_details = PCDetails(**yaml_data)
+            
+            class_to_level_up = None
+            for c in pc_details.classes:
+                if c.class_name.lower() == class_name.lower():
+                    class_to_level_up = c
+                    break
+            
+            if not class_to_level_up:
+                state["save"] = False
+                return f"Error: Class '{class_name}' not found on character '{character_name}'."
+    
+            class_to_level_up.level += 1
+            new_level = class_to_level_up.level
+            
+            new_max_hp = pc_details.hp + hp_increase
+            pc_details.hp = new_max_hp
+            
+            creature = _get_entity_by_name(character_name)
+            if not creature or not isinstance(creature, Creature):
+                state["save"] = False
+                return f"Error: Creature '{character_name}' not found in the deterministic engine."
+    
+            creature.max_hp = new_max_hp
+            creature.hp.base_value += hp_increase
+            for c in creature.classes:
+                if c.class_name.lower() == class_name.lower():
+                    c.level = new_level
+    
+            class_def = await CompendiumManager.get_class_definition(vault_path, class_to_level_up.class_name)
+            if class_def: creature.apply_features(class_def, new_level)
+            
+            if class_to_level_up.subclass_name:
+                subclass_def = await CompendiumManager.get_subclass_definition(vault_path, class_to_level_up.subclass_name)
+                if subclass_def: creature.apply_subclass_features(subclass_def, new_level)
+            
+            yaml_data.update({
+                "level": pc_details.character_level,
+                "max_hp": new_max_hp,
+                "classes": [c.model_dump() for c in pc_details.classes]
+            })
+    except Exception as e:
+        return str(e)
     
     new_features = [f.name for f in creature.features if f.level == new_level]
     if new_features:
@@ -688,41 +679,117 @@ async def level_up_character(character_name: str, class_name: str, hp_increase: 
     return f"Success: {character_name} leveled up to level {new_level} {class_name}. Max HP is now {new_max_hp}."
 
 @tool
-async def manage_inventory(character_name: str, item_name: str, action: str, quantity: int = 1, gold_change: int = 0, context_log: str = "", metadata: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
-    """Adds or removes an item/gold from a character's YAML inventory."""
+async def manage_inventory(character_name: str, item_name: str, action: str, quantity: int = 1, gold_change: int = 0, cp_change: int = 0, sp_change: int = 0, ep_change: int = 0, gp_change: int = 0, pp_change: int = 0, context_log: str = "", metadata: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Adds or removes an item and/or currency from a character's YAML inventory. 
+    Handles quantity stacking (e.g. 'Torch (x5)') and partial removals.
+    It automatically exchanges currencies if spending exceeds the specific denomination.
+    """
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
     
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
-    async with lock:
-        try:
-            yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
-        except Exception as e:
-            return str(e)
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
             
-        current_gold = int(yaml_data.get("gold", 0))
-        new_gold = current_gold + gold_change
-        if new_gold < 0: return f"Transaction Failed: Not enough gold."
-        yaml_data["gold"] = new_gold
-        
-        inventory = yaml_data.get("inventory", [])
-        if not isinstance(inventory, list): inventory = []
-        
-        if action.lower() == "add" and item_name: 
-            item_str = f"{item_name} (x{quantity})"
-            if metadata: item_str += f" [{metadata}]"
-            inventory.append(item_str)
-        elif action.lower() == "remove" and item_name:
-            item_to_remove = next((item for item in inventory if item_name.lower() in item.lower()), None)
-            if item_to_remove: inventory.remove(item_to_remove)
-            else: return f"Error: '{item_name}' not found."
+            # Handle Currency
+            if "currency" in yaml_data and isinstance(yaml_data["currency"], dict):
+                curr = yaml_data["currency"]
+                cp, sp, ep, gp, pp = int(curr.get("cp", 0)), int(curr.get("sp", 0)), int(curr.get("ep", 0)), int(curr.get("gp", 0)), int(curr.get("pp", 0))
+            else:
+                cp, sp, ep, gp, pp = 0, 0, 0, int(yaml_data.get("gold", 0)), 0
+                
+            gp += gold_change + gp_change
+            cp += cp_change
+            sp += sp_change
+            ep += ep_change
+            pp += pp_change
+    
+            total_copper = cp + (sp * 10) + (ep * 50) + (gp * 100) + (pp * 1000)
+            if total_copper < 0:
+                state["save"] = False
+                return "Transaction Failed: Not enough currency to cover the cost."
+                
+            if cp < 0 or sp < 0 or ep < 0 or gp < 0:
+                pp = total_copper // 1000
+                rem = total_copper % 1000
+                gp = rem // 100
+                rem %= 100
+                ep = rem // 50
+                rem %= 50
+                sp = rem // 10
+                cp = rem % 10
+    
+            yaml_data["currency"] = {"cp": cp, "sp": sp, "ep": ep, "gp": gp, "pp": pp}
+            if "gold" in yaml_data or "gold" not in yaml_data:
+                yaml_data["gold"] = gp 
             
-        yaml_data["inventory"] = inventory
-        await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
-        
+            inventory = yaml_data.get("inventory", [])
+            if not isinstance(inventory, list): inventory = []
+            
+            def parse_item(i_str):
+                qty, meta = 1, ""
+                name_part = str(i_str)
+                meta_match = re.search(r'\[(.*?)\]', name_part)
+                if meta_match:
+                    meta = meta_match.group(1)
+                    name_part = name_part.replace(f"[{meta}]", "").strip()
+                qty_match = re.search(r'\(\s*x(\d+)\s*\)', name_part)
+                if qty_match:
+                    qty = int(qty_match.group(1))
+                    name_part = name_part.replace(f"(x{qty_match.group(1)})", "").strip()
+                return name_part.strip(), qty, meta
+    
+            if action.lower() == "add" and item_name:
+                found = False
+                for i, item_str in enumerate(inventory):
+                    i_name, i_qty, i_meta = parse_item(item_str)
+                    if i_name.lower() == item_name.lower() and i_meta == metadata:
+                        new_qty = i_qty + quantity
+                        new_str = f"{i_name} (x{new_qty})"
+                        if metadata: new_str += f" [{metadata}]"
+                        inventory[i] = new_str
+                        found = True
+                        break
+                if not found:
+                    item_str = f"{item_name}"
+                    if quantity > 1: item_str += f" (x{quantity})"
+                    if metadata: item_str += f" [{metadata}]"
+                    inventory.append(item_str)
+                    
+            elif action.lower() == "remove" and item_name:
+                item_index = -1
+                for i, item_str in enumerate(inventory):
+                    i_name, _, _ = parse_item(item_str)
+                    if item_name.lower() in i_name.lower():
+                        item_index = i
+                        break
+                        
+                if item_index != -1:
+                    i_name, i_qty, i_meta = parse_item(inventory[item_index])
+                    if i_qty > quantity:
+                        new_qty = i_qty - quantity
+                        new_str = f"{i_name}"
+                        if new_qty > 1: new_str += f" (x{new_qty})"
+                        if i_meta: new_str += f" [{i_meta}]"
+                        inventory[item_index] = new_str
+                    else:
+                        inventory.pop(item_index)
+                else:
+                    state["save"] = False
+                    return f"Error: '{item_name}' not found in inventory."
+                
+            yaml_data["inventory"] = inventory
+    except Exception as e:
+        return str(e)
+         
     if context_log: 
         await upsert_journal_section.ainvoke({"entity_name": character_name, "section_header": "Event Log", "content": f"- **Inventory**: {context_log}", "mode": "append"}, config)
-    return f"Success. Gold is now {new_gold}. Event logged."
+
+    curr_str = f"{gp}gp"
+    if pp > 0 or ep > 0 or sp > 0 or cp > 0:
+        curr_str = f"{pp}pp, {gp}gp, {ep}ep, {sp}sp, {cp}cp"
+    return f"Success. Currency is now {curr_str}. Event logged."
 
 
 @tool
@@ -748,15 +815,22 @@ async def perform_ability_check_or_save(character_name: str, skill_or_stat_name:
     clean_skill = skill_or_stat_name.lower().strip()
     base_stat = skill_map.get(clean_skill, clean_skill)
     
-    if base_stat != "none":
-        lock = AsyncSoftFileLock(f"{file_path}.lock")
-        async with lock:
-            try:
-                yaml_data, _ = await read_markdown_entity_no_lock(file_path)
+    stat_mod = 0
+    engine_creature = _get_entity_by_name(character_name)
+    
+    if engine_creature and isinstance(engine_creature, Creature) and base_stat != "none":
+        # 1. PREFERRED: Read from OO Engine to capture live buffs/debuffs
+        stat_obj = getattr(engine_creature, f"{base_stat}_mod", None)
+        if stat_obj:
+            stat_mod = stat_obj.total
+    elif base_stat != "none":
+        # 2. FALLBACK: Read from YAML if entity is out of scope/inactive
+        try:
+            async with read_markdown_entity(file_path) as (yaml_data, _):
                 stat_score = int(yaml_data.get(base_stat, yaml_data.get(base_stat[:3], 10)))
                 stat_mod = math.floor((stat_score - 10) / 2)
-            except Exception: pass
-                
+        except Exception: pass
+                    
     total_mod = stat_mod + extra_modifier
     
     if is_passive:
@@ -807,8 +881,32 @@ async def perform_ability_check_or_save(character_name: str, skill_or_stat_name:
             bonus_str = f" + [{bonus_dice}: {bonus_total}]"
         
     total = base_roll + total_mod + bonus_total
+    
+    # Query Environmental Lighting to alert the DM for Stealth and Perception checks
+    illum_alert = ""
+    if engine_creature and isinstance(engine_creature, Creature):
+        illum = spatial_service.get_illumination(engine_creature.x, engine_creature.y, engine_creature.z)
+        
+        has_enhanced_vision = any(s in tag for tag in engine_creature.tags for s in ["darkvision", "blindsight", "truesight", "tremorsense"])
+        is_deafened = any(c.name.lower() == "deafened" for c in engine_creature.active_conditions)
+        
+        if clean_skill in ["perception", "investigation"]:
+            if illum == "darkness" and not has_enhanced_vision:
+                illum_alert = "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. Sight-based checks automatically fail (Hearing/Smell still work)."
+            elif illum == "dim" and not has_enhanced_vision:
+                illum_alert = "\nSYSTEM ALERT: Character is in DIM LIGHT. Disadvantage (-5 to Passive) on sight-based checks."
+                
+            if is_deafened:
+                illum_alert += "\nSYSTEM ALERT: Character is DEAFENED. Hearing-based checks automatically fail."
+                
+        elif clean_skill == "stealth":
+            if illum == "bright": illum_alert = "\nSYSTEM ALERT: Character is in BRIGHT LIGHT. They cannot hide without physical cover or invisibility."
+            elif illum == "darkness": illum_alert = "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. They are heavily obscured and can hide freely. If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
+            elif illum == "dim": illum_alert = "\nSYSTEM ALERT: Character is in DIM LIGHT. They are lightly obscured and can hide. If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
+            
     result_str = f"MECHANICAL TRUTH: Roll Result ({clean_skill}): {base_roll} {roll_type_str} + {total_mod} stat mod{bonus_str} = {total}. "
     result_str += "\nHIDDEN ROLL: Narrate sensory experience only." if is_hidden else "\nYou may reveal the total to the player."
+    result_str += illum_alert
        
     await write_audit_log(vault_path, "Rules Engine", "perform_ability_check_or_save Executed", result_str)
     return result_str
@@ -853,13 +951,11 @@ async def search_vault_by_tag(target_tag: str, *, config: Annotated[RunnableConf
         if not filename.endswith(".md"): continue
         file_path = os.path.join(j_dir, filename)
         
-        lock = AsyncSoftFileLock(f"{file_path}.lock")
-        async with lock:
-            try:
-                yaml_data, _ = await read_markdown_entity_no_lock(file_path)
+        try:
+            async with read_markdown_entity(file_path) as (yaml_data, _):
                 if target_tag.lower() in [tag.lower() for tag in yaml_data.get("tags", [])]:
                     matching_files.append(filename.replace(".md", ""))
-            except Exception: pass
+        except Exception: pass
                     
     return f"Entities matching '{target_tag}': " + ", ".join(matching_files) if matching_files else f"No entities found with tag: {target_tag}"
 
@@ -871,10 +967,8 @@ async def advance_time(days: int = 0, hours: int = 0, minutes: int = 0, seconds:
     file_path = os.path.join(get_journals_dir(vault_path), "CAMPAIGN_MASTER.md")
         
     current_day, current_hour, current_minute, current_second = 1, 8, 0, 0
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
-    async with lock:
-        try:
-            yaml_data, _ = await read_markdown_entity_no_lock(file_path)
+    try:
+        async with read_markdown_entity(file_path) as (yaml_data, _):
             day_match = re.search(r'\d+', str(yaml_data.get("current_date", "Day 1")))
             if day_match: current_day = int(day_match.group())
             time_str = str(yaml_data.get("in_game_time", "08:00:00"))
@@ -883,7 +977,7 @@ async def advance_time(days: int = 0, hours: int = 0, minutes: int = 0, seconds:
                 current_hour = int(parts[0])
                 current_minute = int(parts[1]) if len(parts) > 1 else 0
                 current_second = int(parts[2]) if len(parts) > 2 else 0
-        except Exception: pass
+    except Exception: pass
                 
     total_seconds = current_second + seconds
     total_minutes = current_minute + minutes + (total_seconds // 60)
@@ -912,10 +1006,8 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
     for pc in pc_names:
         file_path = os.path.join(j_dir, f"{pc}.md")
         pc_dex_mod, pc_hp, pc_ac, pc_x, pc_y, pc_z = 0, 10, 10, 0.0, 0.0, 0.0
-        lock = AsyncSoftFileLock(f"{file_path}.lock")
-        async with lock:
-            try:
-                yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
+        try:
+            async with read_markdown_entity(file_path) as (yaml_data, body_text):
                 pc_dex_mod = math.floor((int(yaml_data.get("dexterity", yaml_data.get("dex", 10))) - 10) / 2)
                 pc_hp = int(yaml_data.get("max_hp", 10))
                 pc_ac = int(yaml_data.get("ac", 10))
@@ -924,7 +1016,7 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
                 pc_z = float(yaml_data.get("z", 0.0))
                 hp_match = re.search(r'- Current HP:\s*(\d+)', body_text)
                 if hp_match: pc_hp = int(hp_match.group(1))
-            except Exception: pass # Ignores missing PCs or syntax errors, defaulting to 10
+        except Exception: pass # Ignores missing PCs or syntax errors, defaulting to 10
             
         combatants.append({"name": pc, "init": random.randint(1, 20) + pc_dex_mod, "hp": pc_hp, "max_hp": pc_hp, "ac": pc_ac, "conditions": [], "is_pc": True, "x": pc_x, "y": pc_y, "z": pc_z})
     
@@ -952,65 +1044,57 @@ async def update_combat_state(combatant_name: str = None, hp_change: int = 0, ad
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
     if added_conditions is None: added_conditions = []
     
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
     advance_global_clock = False
     new_init = None
-    async with lock:
-        try:
-            yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
-        except Exception as e:
-            return str(e)
-        
-        log_msg = []
-        combatants = yaml_data.get("combatants", [])
-        if combatant_name:
-            for c in combatants:
-                if c["name"].lower() == combatant_name.lower():
-                    if hp_change != 0:
-                        c["hp"] = max(0, min(c["max_hp"], c["hp"] + hp_change))
-                        log_msg.append(f"{c['name']} {'healed' if hp_change > 0 else 'took damage'}. HP: {c['hp']}/{c['max_hp']}.")
-                    if added_conditions:
-                        c["conditions"].extend(added_conditions)
-                        log_msg.append(f"{c['name']} gained conditions: {', '.join(added_conditions)}.")
-                        
-        if next_turn and not force_advance:
-            current_combatant = combatants[yaml_data.get("current_turn_index", 0)]
-            interrupts = []
-            for c in combatants:
-                if c["name"] == current_combatant["name"] or c["hp"] <= 0: continue
-                eng_ent = _get_entity_by_name(c["name"])
-                if eng_ent and isinstance(eng_ent, Creature) and eng_ent.legendary_actions_current > 0:
-                    interrupts.append(f"{c['name']} ({eng_ent.legendary_actions_current} LA left)")
-            
-            if interrupts:
-                yaml_data["combatants"] = combatants
-                await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
-                return f"SYSTEM ALERT: Turn advancement paused! {', '.join(interrupts)} have Legendary Actions. Use combat tools with `is_legendary_action=True` to execute them, then call `update_combat_state(next_turn=True, force_advance=True)` to proceed."
-
-        if next_turn:
-            yaml_data["current_turn_index"] = (yaml_data.get("current_turn_index", 0) + 1) % len(combatants)
-            if yaml_data["current_turn_index"] == 0: 
-                yaml_data["round"] = yaml_data.get("round", 1) + 1
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
+            log_msg = []
+            combatants = yaml_data.get("combatants", [])
+            if combatant_name:
+                for c in combatants:
+                    if c["name"].lower() == combatant_name.lower():
+                        if hp_change != 0:
+                            c["hp"] = max(0, min(c["max_hp"], c["hp"] + hp_change))
+                            log_msg.append(f"{c['name']} {'healed' if hp_change > 0 else 'took damage'}. HP: {c['hp']}/{c['max_hp']}.")
+                        if added_conditions:
+                            c["conditions"].extend(added_conditions)
+                            log_msg.append(f"{c['name']} gained conditions: {', '.join(added_conditions)}.")
+                            
+            if next_turn and not force_advance:
+                current_combatant = combatants[yaml_data.get("current_turn_index", 0)]
+                interrupts = []
+                for c in combatants:
+                    if c["name"] == current_combatant["name"] or c["hp"] <= 0: continue
+                    eng_ent = _get_entity_by_name(c["name"])
+                    if eng_ent and isinstance(eng_ent, Creature) and eng_ent.legendary_actions_current > 0:
+                        interrupts.append(f"{c['name']} ({eng_ent.legendary_actions_current} LA left)")
                 
-                advance_global_clock = True
+                if interrupts:
+                    return f"SYSTEM ALERT: Turn advancement paused! {', '.join(interrupts)} have Legendary Actions. Use combat tools with `is_legendary_action=True` to execute them, then call `update_combat_state(next_turn=True, force_advance=True)` to proceed."
+    
+            if next_turn:
+                yaml_data["current_turn_index"] = (yaml_data.get("current_turn_index", 0) + 1) % len(combatants)
+                if yaml_data["current_turn_index"] == 0: 
+                    yaml_data["round"] = yaml_data.get("round", 1) + 1
+                    advance_global_clock = True
+                    
+                loop_counter = 0
+                while combatants[yaml_data["current_turn_index"]]["hp"] <= 0 and loop_counter < len(combatants):
+                     yaml_data["current_turn_index"] = (yaml_data["current_turn_index"] + 1) % len(combatants)
+                     loop_counter += 1
+                     
+                new_init = combatants[yaml_data["current_turn_index"]]["init"]
+                log_msg.append(f"Turn advanced to {combatants[yaml_data['current_turn_index']]['name']}.")
                 
-            loop_counter = 0
-            while combatants[yaml_data["current_turn_index"]]["hp"] <= 0 and loop_counter < len(combatants):
-                 yaml_data["current_turn_index"] = (yaml_data["current_turn_index"] + 1) % len(combatants)
-                 loop_counter += 1
-                 
-            new_init = combatants[yaml_data["current_turn_index"]]["init"]
-            log_msg.append(f"Turn advanced to {combatants[yaml_data['current_turn_index']]['name']}.")
-            
-            # Reset reactions and legendary actions for the character whose turn is starting
-            new_turn_ent = _get_entity_by_name(combatants[yaml_data['current_turn_index']]['name'])
-            if new_turn_ent and isinstance(new_turn_ent, Creature):
-                new_turn_ent.reaction_used = False
-                new_turn_ent.legendary_actions_current = new_turn_ent.legendary_actions_max
-                new_turn_ent.movement_remaining = new_turn_ent.speed # Refresh movement for new turn
-            
-        yaml_data["combatants"] = combatants
-        await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
+                # Reset reactions and legendary actions for the character whose turn is starting
+                new_turn_ent = _get_entity_by_name(combatants[yaml_data['current_turn_index']]['name'])
+                if new_turn_ent and isinstance(new_turn_ent, Creature):
+                    new_turn_ent.reaction_used = False
+                    new_turn_ent.legendary_actions_current = new_turn_ent.legendary_actions_max
+                    new_turn_ent.movement_remaining = new_turn_ent.speed # Refresh movement for new turn
+    except Exception as e:
+        return str(e)
             
     if advance_global_clock:
         await advance_time.ainvoke({"seconds": 6, "trigger_events": False}, config)
@@ -1028,14 +1112,13 @@ async def end_combat(*, config: Annotated[RunnableConfig, InjectedToolArg]) -> s
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
     
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
-    async with lock:
-        try:
-            yaml_data, _ = await read_markdown_entity_no_lock(file_path)
-        except Exception as e:
-            return str(e)
+    try:
+        async with read_markdown_entity(file_path) as (yaml_data, _):
+            combatants = yaml_data.get("combatants", [])
+    except Exception as e:
+        return str(e)
             
-    for c in yaml_data.get("combatants", []):
+    for c in combatants:
         if c.get("is_pc"):
             conds = ", ".join(c["conditions"]) if c["conditions"] else "None"
             await update_character_status.ainvoke({"character_name": c["name"], "hp": str(c["hp"]), "resources": "Update Manually", "conditions": conds, "fatigue": "None"}, config)
@@ -1058,16 +1141,27 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
     dz = target_z - old_z
     dist_3d = spatial_service.calculate_distance(old_x, old_y, old_z, target_x, target_y, target_z)
     
+    # --- Identify Dragged Entities ---
+    dragged_entities = []
+    if movement_type.lower() not in ["teleport", "fall", "forced"]:
+        for uid, ent in get_all_entities().items():
+            if isinstance(ent, Creature):
+                for cond in ent.active_conditions:
+                    if cond.name.lower() == "grappled" and cond.source_uuid == entity.entity_uuid:
+                        dragged_entities.append(ent)
+    
     # --- Check for Wall Collisions ---
     if movement_type.lower() in ["walk", "crawl", "disengage"]:
         if dz > 1.5: return "SYSTEM ERROR: Cannot walk up vertical distances. Use 'jump', 'climb', or 'fly'."
-        if spatial_service.check_path_collision(old_x, old_y, old_z, target_x, target_y, target_z, entity.height):
+        blocking_wall = spatial_service.check_path_collision(old_x, old_y, old_z, target_x, target_y, target_z, entity.height)
+        if blocking_wall:
             str_score = (entity.strength_mod.total * 2) + 10
             run_jump, stand_jump = str_score, str_score // 2
             run_high, stand_high = 3 + entity.strength_mod.total, max(1, (3 + entity.strength_mod.total) // 2)
-            return (f"SYSTEM ERROR: Movement blocked! A solid wall or obstacle intersects the straight-line path from ({old_x}, {old_y}, {old_z}) to ({target_x}, {target_y}, {target_z}).\n"
+            lock_msg = f" It is locked (DC {blocking_wall.interact_dc}). Use `interact_with_object` to pick/force it." if blocking_wall.is_locked else ""
+            return (f"SYSTEM ERROR: Movement blocked! Collided with '{blocking_wall.label}'.{lock_msg}\n"
                     f"DM DIRECTIVE: You must inform the player their path is blocked and discuss options:\n"
-                    f"1. **Walk Around/Climb:** Execute multiple shorter `move_entity` calls to navigate corners or scale the obstacle.\n"
+                    f"1. **Interact/Walk Around/Climb:** Execute multiple shorter `move_entity` calls to navigate corners, or open the obstacle if it is a door.\n"
                     f"2. **Jump:** {entity.name} can running-long-jump {run_jump}ft (standing {stand_jump}ft) and running-high-jump {run_high}ft (standing {stand_high}ft). Running jumps require 10ft of prior movement. Call `perform_ability_check_or_save` for Athletics if it exceeds bounds, then `move_entity` with `movement_type='jump'`.\n"
                     f"3. **Crawl/Squeeze:** If there's a gap, they can crawl (costs double movement).\n"
                     f"4. **Magic:** Spells like Misty Step can `teleport` past obstacles.")
@@ -1081,7 +1175,7 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
     event = GameEvent(
         event_type="Movement",
         source_uuid=entity.entity_uuid,
-        payload={"target_x": target_x, "target_y": target_y, "target_z": target_z, "movement_type": movement_type}
+        payload={"target_x": target_x, "target_y": target_y, "target_z": target_z, "movement_type": movement_type, "dragged_uuids": [e.entity_uuid for e in dragged_entities]}
     )
     result = EventBus.dispatch(event)
     
@@ -1095,6 +1189,17 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
     
     spatial_service.sync_entity(entity)
     
+    # Apply movement to dragged entities
+    dx, dy = target_x - old_x, target_y - old_y
+    drag_msg_parts = []
+    for dragged in dragged_entities:
+        new_dx, new_dy, new_dz = dragged.x + dx, dragged.y + dy, dragged.z + dz
+        dragged.x, dragged.y, dragged.z = new_dx, new_dy, new_dz
+        spatial_service.sync_entity(dragged)
+        if hasattr(dragged, '_filepath'):
+            await update_yaml_frontmatter.ainvoke({"entity_name": dragged.name, "updates": {"x": new_dx, "y": new_dy, "z": new_dz}}, config)
+        drag_msg_parts.append(dragged.name)
+        
     # Persist the change to the entity's file
     if hasattr(entity, '_filepath'):
         await update_yaml_frontmatter.ainvoke({"entity_name": entity.name, "updates": {"x": target_x, "y": target_y, "z": target_z}}, config)
@@ -1102,19 +1207,20 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
     # Visually update the active combat board if it exists
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
     if os.path.exists(file_path):
-        lock = AsyncSoftFileLock(f"{file_path}.lock")
-        async with lock:
-            try:
-                yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
-                combatants = yaml_data.get("combatants", [])
-                for c in combatants:
-                    if c["name"].lower() == entity_name.lower():
+        try:
+            async with edit_markdown_entity(file_path) as state:
+                yaml_data = state["yaml_data"]
+                for c in yaml_data.get("combatants", []):
+                    if c.get("name", "").lower() == entity_name.lower():
                         c["x"], c["y"] = target_x, target_y
-                yaml_data["combatants"] = combatants
-                await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
-            except Exception: pass
+                    elif c.get("name", "") in drag_msg_parts:
+                        c["x"], c["y"] = c.get("x", 0) + dx, c.get("y", 0) + dy
+        except Exception: pass
             
     base_msg = f"MECHANICAL TRUTH: {entity.name} moved from ({old_x}, {old_y}) to ({target_x}, {target_y}) via {movement_type}."
+    
+    if drag_msg_parts:
+        base_msg += f" They automatically dragged {', '.join(drag_msg_parts)} with them."
     
     if movement_type.lower() == "teleport":
         can_see = spatial_service.has_line_of_sight_to_point(entity.entity_uuid, target_x, target_y)
@@ -1124,6 +1230,10 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
     attackers = result.payload.get("opportunity_attackers", [])
     if attackers:
         base_msg += f"\nSYSTEM ALERT: Movement provoked Opportunity Attacks from: {', '.join(attackers)}. You MUST ask player(s) if they want to use their Reaction. For NPCs, you choose. Use execute_melee_attack(is_reaction=True) to resolve."
+        
+    if "trap_results" in result.payload and result.payload["trap_results"]:
+        trap_msg = "\n".join(result.payload["trap_results"])
+        base_msg += f"\nSYSTEM ALERT: TRAP TRIGGERED during movement!\n{trap_msg}"
         
     return base_msg
 
@@ -1266,7 +1376,7 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
     valid_targets = [t for t in targets if t]
     target_string = ", ".join([t.name for t in valid_targets]) or "themselves"
     
-    current_init = _get_current_combat_initiative(vault_path)
+    current_init = await _get_current_combat_initiative(vault_path)
     event = GameEvent(
         event_type="SpellCast",
         source_uuid=caster.entity_uuid,
@@ -1376,21 +1486,17 @@ async def ready_action(character_name: str, action_description: str, trigger_con
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
     
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
-    async with lock:
-        try:
-            yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
-        except Exception as e:
-            return str(e)
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
+            readied = yaml_data.get("readied_actions", [])
+            if not isinstance(readied, list): readied = []
             
-        readied = yaml_data.get("readied_actions", [])
-        if not isinstance(readied, list): readied = []
-        
-        readied = [ra for ra in readied if ra.get("character") != character_name]
-        readied.append({"character": character_name, "action": action_description, "trigger": trigger_condition})
-        yaml_data["readied_actions"] = readied
-        
-        await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
+            readied = [ra for ra in readied if ra.get("character") != character_name]
+            readied.append({"character": character_name, "action": action_description, "trigger": trigger_condition})
+            yaml_data["readied_actions"] = readied
+    except Exception as e:
+        return str(e)
         
     return f"MECHANICAL TRUTH: {character_name} readied an action. Trigger: '{trigger_condition}'."
 
@@ -1400,20 +1506,16 @@ async def clear_readied_action(character_name: str, *, config: Annotated[Runnabl
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
     
-    lock = AsyncSoftFileLock(f"{file_path}.lock")
-    async with lock:
-        try:
-            yaml_data, body_text = await read_markdown_entity_no_lock(file_path)
-        except Exception as e:
-            return str(e)
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
+            readied = yaml_data.get("readied_actions", [])
+            if not isinstance(readied, list): readied = []
             
-        readied = yaml_data.get("readied_actions", [])
-        if not isinstance(readied, list): readied = []
-        
-        readied = [ra for ra in readied if ra.get("character") != character_name]
-        yaml_data["readied_actions"] = readied
-        
-        await write_markdown_entity_no_lock(file_path, yaml_data, body_text)
+            readied = [ra for ra in readied if ra.get("character") != character_name]
+            yaml_data["readied_actions"] = readied
+    except Exception as e:
+        return str(e)
             
     return f"Success: Cleared readied action for {character_name}."
 
@@ -1426,3 +1528,345 @@ async def use_dash_action(entity_name: str, *, config: Annotated[RunnableConfig,
         
     entity.movement_remaining += entity.speed
     return f"MECHANICAL TRUTH: {entity.name} took the Dash action. Their remaining movement is now {entity.movement_remaining}ft."
+
+@tool
+async def manage_light_sources(action: str, label: str, x: float = 0.0, y: float = 0.0, z: float = 5.0, bright_radius: float = 20.0, dim_radius: float = 40.0, attached_to_entity: str = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """Dynamically adds or removes light sources (e.g. torches, spells) from the spatial environment."""
+    if action.lower() == "add":
+        ent_uuid = None
+        ent_msg = ""
+        if attached_to_entity:
+            entity = _get_entity_by_name(attached_to_entity)
+            if entity:
+                ent_uuid = entity.entity_uuid
+                x, y, z = entity.x, entity.y, entity.z
+                ent_msg = f" attached to {entity.name}"
+            else:
+                return f"SYSTEM ERROR: Entity '{attached_to_entity}' not found."
+                
+        new_light = LightSource(label=label, x=x, y=y, z=z, bright_radius=bright_radius, dim_radius=dim_radius, attached_to_entity_uuid=ent_uuid)
+        spatial_service.map_data.lights.append(new_light)
+        return f"MECHANICAL TRUTH: Added light source '{label}' at ({x}, {y}, {z}){ent_msg} with Bright/Dim radii ({bright_radius}/{dim_radius})."
+    elif action.lower() == "remove":
+        initial_count = len(spatial_service.map_data.lights)
+        spatial_service.map_data.lights = [l for l in spatial_service.map_data.lights if l.label.lower() != label.lower()]
+        if len(spatial_service.map_data.lights) < initial_count: return f"MECHANICAL TRUTH: Removed light source '{label}'."
+        return f"SYSTEM ERROR: Light source '{label}' not found."
+    return "SYSTEM ERROR: Invalid action. Use 'add' or 'remove'."
+
+@tool
+async def interact_with_object(character_name: str, target_label: str, interaction_type: str, stat_used: str = "dexterity", extra_modifier: int = 0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Resolves a character trying to pick a lock, force open a door, or disarm a trap on the spatial map.
+    - interaction_type: 'lockpick' (uses Dex), 'force' (uses Str), 'disarm' (uses Dex or Int).
+    - stat_used: 'dexterity', 'strength', or 'intelligence'.
+    """
+    character = _get_entity_by_name(character_name)
+    if not character: return f"SYSTEM ERROR: Character '{character_name}' not found."
+    
+    target_walls = [w for w in spatial_service.map_data.active_walls if target_label.lower() in w.label.lower()]
+    if not target_walls:
+        return f"SYSTEM ERROR: No object found matching '{target_label}'. Check the map."
+        
+    target = target_walls[0]
+    
+    if not target.is_locked and interaction_type in ["lockpick", "force"]:
+        spatial_service.modify_wall(target.wall_id, is_solid=False, is_visible=True)
+        return f"MECHANICAL TRUTH: {target.label} was not locked. {character.name} simply opened it."
+        
+    if target.interact_dc is None:
+        return f"MECHANICAL TRUTH: {target.label} cannot be interacted with in that way (No DC assigned). It might require a specific key or magical mechanism."
+
+    # Calculate modifier
+    stat_mod = getattr(character, f"{stat_used.lower()}_mod").total if hasattr(character, f"{stat_used.lower()}_mod") else 0
+    
+    # Give standard proficiency bonus if using lockpicks or forcing
+    prof_bonus = math.ceil(character.character_level / 4) + 1 if character.character_level > 0 else 2
+    total_mod = stat_mod + prof_bonus + extra_modifier
+    
+    roll = random.randint(1, 20)
+    total = roll + total_mod
+    
+    log = f"{character.name} attempts to {interaction_type} the {target.label}. Rolled {roll} + {total_mod} = {total} vs DC {target.interact_dc}. "
+    
+    if total >= target.interact_dc:
+        if interaction_type in ["lockpick", "force"]:
+            spatial_service.modify_wall(target.wall_id, is_locked=False, is_solid=False, is_visible=True)
+            if target.trap: target.trap.is_active = False # Bypassed successfully
+            return f"MECHANICAL TRUTH: SUCCESS! {log} The {target.label} is now unlocked and opened."
+        else:
+            if target.trap: target.trap.is_active = False
+            return f"MECHANICAL TRUTH: SUCCESS! {log} The {target.label} is safely disarmed/resolved."
+    else:
+        msg = f"MECHANICAL TRUTH: FAILURE! {log} The attempt failed."
+        if target.trap and target.trap.is_active and target.trap.trigger_on_interact_fail:
+            target.trap.is_active = False
+            trap = target.trap
+            trap_msg = await trigger_environmental_hazard.ainvoke({
+                "hazard_name": trap.hazard_name,
+                "target_names": [character.name],
+                "origin_x": target.start[0], "origin_y": target.start[1], 
+                "radius": trap.radius if trap.radius > 0 else None,
+                "requires_attack_roll": trap.requires_attack_roll, "attack_bonus": trap.attack_bonus,
+                "save_required": trap.save_required, "save_dc": trap.save_dc,
+                "damage_dice": trap.damage_dice, "damage_type": trap.damage_type,
+                "half_damage_on_save": trap.half_damage_on_save,
+                "condition_applied": trap.condition_applied
+            }, config=config)
+            msg += f"\nSYSTEM ALERT: TRAP TRIGGERED!\n{trap_msg}"
+            
+        return msg
+
+@tool
+async def trigger_environmental_hazard(
+    hazard_name: str, 
+    target_names: list[str] = None,
+    origin_x: float = None, origin_y: float = None, radius: float = None,
+    requires_attack_roll: bool = False, attack_bonus: int = 5,
+    save_required: str = "", save_dc: int = 15,
+    damage_dice: str = "", damage_type: str = "", half_damage_on_save: bool = True,
+    condition_applied: str = "",
+    *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
+    """
+    Triggers a trap or environmental hazard (e.g. Fireball trap, Poison Darts, Cave-in).
+    You can target specific entities OR an area (using origin_x, origin_y, radius).
+    Automatically resolves attack rolls or saving throws, applies damage/conditions, and checks concentration.
+    """
+    if target_names is None: target_names = []
+    
+    target_uuids = set()
+    for name in target_names:
+        ent = _get_entity_by_name(name)
+        if ent: target_uuids.add(ent.entity_uuid)
+        
+    if origin_x is not None and origin_y is not None and radius is not None:
+        spatial_hits = spatial_service.get_targets_in_radius(origin_x, origin_y, radius)
+        target_uuids.update(spatial_hits)
+        
+    if not target_uuids:
+        return f"MECHANICAL TRUTH: {hazard_name} triggered, but no valid targets were in range."
+
+    trap_source = Creature(
+        name=hazard_name,
+        tags=["trap"],
+        spell_save_dc=ModifiableValue(base_value=save_dc),
+        spell_attack_bonus=ModifiableValue(base_value=attack_bonus),
+        hp=ModifiableValue(base_value=1),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0)
+    )
+    
+    cond_list = [{"condition": condition_applied, "duration": "1 minute"}] if condition_applied else []
+    mechanics = {
+        "requires_attack_roll": requires_attack_roll,
+        "save_required": save_required.lower(),
+        "damage_dice": damage_dice,
+        "damage_type": damage_type.lower(),
+        "half_damage_on_save": half_damage_on_save,
+        "conditions_applied": cond_list
+    }
+    
+    current_init = await _get_current_combat_initiative(config["configurable"].get("thread_id"))
+    
+    event = GameEvent(
+        event_type="SpellCast",
+        source_uuid=trap_source.entity_uuid,
+        payload={
+            "ability_name": hazard_name,
+            "mechanics": mechanics,
+            "target_uuids": list(target_uuids),
+            "current_initiative": current_init
+        }
+    )
+    
+    result = EventBus.dispatch(event)
+    BaseGameEntity.remove(trap_source.entity_uuid)
+    
+    results_list = result.payload.get("results", [])
+    if results_list:
+        return f"MECHANICAL TRUTH: {hazard_name} triggered!\n" + "\n".join(results_list)
+        
+    return f"MECHANICAL TRUTH: {hazard_name} triggered but had no effect."
+
+@tool
+async def manage_map_geometry(action: str, label: str = "", start_x: float = 0.0, start_y: float = 0.0, end_x: float = 0.0, end_y: float = 0.0, z: float = 0.0, height: float = 10.0, is_solid: bool = True, is_visible: bool = True, is_locked: bool = False, interact_dc: int = 15, is_temporary: bool = True, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Dynamically alters the spatial map's physical geometry (e.g., opening a door, breaking a wall, casting Wall of Stone).
+    - action: 'add_wall', 'remove_wall', or 'modify_wall'
+    - label: A descriptive name for the wall (e.g., 'heavy oak door', 'Wall of Stone'). Use this to target an existing wall.
+    - is_solid: False means entities can walk and shoot through it (like an open door).
+    - is_visible: False means entities can see through it (like a glass window).
+    - is_locked: True if the door/obstacle requires a key or check to open.
+    - interact_dc: The DC to pick the lock or force the door.
+    - is_temporary: True means the wall is a temporary effect and will be cleared on map reset.
+    """
+    if action.lower() == "add_wall":
+        new_wall = Wall(label=label, start=(start_x, start_y), end=(end_x, end_y), z=z, height=height, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked, interact_dc=interact_dc)
+        spatial_service.add_wall(new_wall, is_temporary=is_temporary)
+        return f"MECHANICAL TRUTH: Added new wall '{label}' from ({start_x}, {start_y}) to ({end_x}, {end_y}). Solid: {is_solid}, Visible: {is_visible}."
+        
+    elif action.lower() in ["remove_wall", "modify_wall"]:
+        target_walls = [w for w in spatial_service.map_data.active_walls if label.lower() in w.label.lower()]
+        if not target_walls:
+            return f"SYSTEM ERROR: No wall found matching label '{label}'. Please check the map or provide a broader label."
+            
+        target = target_walls[0]
+        if action.lower() == "remove_wall":
+            spatial_service.remove_wall(target.wall_id)
+            return f"MECHANICAL TRUTH: Removed wall/obstacle '{target.label}'."
+        else:
+            spatial_service.modify_wall(target.wall_id, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked)
+            return f"MECHANICAL TRUTH: Modified wall/obstacle '{target.label}'. Solid: {is_solid}, Visible: {is_visible}."
+            
+    return "SYSTEM ERROR: Invalid action. Use 'add_wall', 'remove_wall', or 'modify_wall'."
+
+@tool
+async def manage_map_trap(target_label: str, hazard_name: str, trigger_on_interact_fail: bool = False, trigger_on_move: bool = False, requires_attack_roll: bool = False, attack_bonus: int = 5, save_required: str = "", save_dc: int = 15, damage_dice: str = "", damage_type: str = "", condition_applied: str = "", radius: float = 0.0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Attaches a trap or alarm to an existing wall, door, or terrain zone on the spatial map.
+    The trap will automatically trigger if someone fails to pick the lock/force it, or if someone moves through it.
+    """
+    from spatial_engine import TrapDefinition
+    
+    target = None
+    for w in spatial_service.map_data.active_walls:
+        if target_label.lower() in w.label.lower():
+            target = w
+            break
+    if not target:
+        for t in spatial_service.map_data.active_terrain:
+            if target_label.lower() in t.label.lower():
+                target = t
+                break
+                
+    if not target:
+        return f"SYSTEM ERROR: No wall, door, or terrain found matching '{target_label}'."
+        
+    target.trap = TrapDefinition(
+        hazard_name=hazard_name, requires_attack_roll=requires_attack_roll, attack_bonus=attack_bonus,
+        save_required=save_required.lower(), save_dc=save_dc,
+        damage_dice=damage_dice, damage_type=damage_type.lower(),
+        condition_applied=condition_applied,
+        trigger_on_interact_fail=trigger_on_interact_fail,
+        trigger_on_move=trigger_on_move,
+        radius=radius
+    )
+    return f"MECHANICAL TRUTH: Successfully trapped '{target.label}' with '{hazard_name}'."
+
+@tool
+async def toggle_condition(character_name: str, condition_name: str, is_active: bool, source_character_name: str = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """Applies or removes a condition (e.g. 'Hidden', 'Prone', 'Poisoned') from an entity's sheet."""
+    vault_path = config["configurable"].get("thread_id")
+    file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
+    
+    source_ent = _get_entity_by_name(source_character_name) if source_character_name else None
+    source_uuid = source_ent.entity_uuid if source_ent else None
+    source_name = source_ent.name if source_ent else "Manual"
+
+    # Update memory
+    engine_creature = _get_entity_by_name(character_name)
+    if engine_creature and isinstance(engine_creature, Creature):
+        if is_active:
+            if not any(c.name.lower() == condition_name.lower() for c in engine_creature.active_conditions):
+                engine_creature.active_conditions.append(ActiveCondition(name=condition_name.capitalize(), source_name=source_name, source_uuid=source_uuid))
+                
+            # Instant mechanical enforcement for 0-speed conditions
+            zero_speed = {"grappled", "restrained", "stunned", "paralyzed", "petrified", "unconscious"}
+            if condition_name.lower() in zero_speed:
+                engine_creature.movement_remaining = 0
+        else:
+            engine_creature.active_conditions = [c for c in engine_creature.active_conditions if c.name.lower() != condition_name.lower()]
+    
+    # Update YAML
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
+            conds = yaml_data.get("active_conditions", [])
+            if isinstance(conds, list):
+                if is_active:
+                    if not any(isinstance(c, dict) and c.get("name", "").lower() == condition_name.lower() for c in conds):
+                        new_cond = {"name": condition_name.capitalize(), "duration_seconds": -1, "source_name": source_name, "applied_initiative": 0}
+                        if source_uuid: new_cond["source_uuid"] = str(source_uuid)
+                        conds.append(new_cond)
+                else:
+                    conds = [c for c in conds if not (isinstance(c, dict) and c.get("name", "").lower() == condition_name.lower())]
+            
+            yaml_data["active_conditions"] = conds
+            if engine_creature:
+                yaml_data["movement_remaining"] = engine_creature.movement_remaining
+    except Exception as e:
+        return str(e)
+        
+    state = "applied to" if is_active else "removed from"
+    result_msg = f"MECHANICAL TRUTH: Condition '{condition_name}' was {state} {character_name}."
+    
+    # Add Contextual DM Alerts based on D&D 5e Rules
+    if is_active:
+        cond_lower = condition_name.lower()
+        zero_speed = {"grappled", "restrained", "stunned", "paralyzed", "petrified", "unconscious"}
+        if cond_lower in zero_speed:
+            result_msg += f"\nSYSTEM ALERT: '{condition_name.capitalize()}' reduces speed to 0. They cannot move until freed."
+        elif cond_lower == "prone":
+            result_msg += "\nSYSTEM ALERT: 'Prone' means standing up costs half their movement speed. Melee attacks against them have Advantage."
+        elif cond_lower == "frightened":
+            result_msg += "\nSYSTEM ALERT: 'Frightened' means they have Disadvantage on attacks/checks while the source is visible, and CANNOT willingly move closer to it."
+        elif cond_lower in ["dazed", "confused"]:
+            result_msg += f"\nSYSTEM ALERT: '{condition_name.capitalize()}' restricts actions and movement. Review the specific ability rules."
+            
+    return result_msg
+
+@tool
+async def execute_grapple_or_shove(attacker_name: str, target_name: str, action_type: str, shove_type: str = "prone", throw_distance: float = 10.0, advantage: bool = False, disadvantage: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Resolves a contested Athletics check for a Grapple, Shove, or Throw. action_type must be 'grapple', 'shove', or 'throw'.
+    The engine automatically calculates the correct Modifiers based on the entities' stats.
+    """
+    attacker = _get_entity_by_name(attacker_name)
+    target = _get_entity_by_name(target_name)
+    
+    if not attacker or not target:
+        return "SYSTEM ERROR: Attacker or Target not found in active memory."
+        
+    att_roll1, att_roll2 = random.randint(1, 20), random.randint(1, 20)
+    if advantage and not disadvantage: att_roll = max(att_roll1, att_roll2)
+    elif disadvantage and not advantage: att_roll = min(att_roll1, att_roll2)
+    else: att_roll = att_roll1
+        
+    tgt_roll = random.randint(1, 20)
+    
+    # Force engine to evaluate accurate modifiers natively
+    attacker_mod = attacker.strength_mod.total
+    target_mod = max(target.strength_mod.total, target.dexterity_mod.total) # Target resists with better of Athletics/Acrobatics
+    
+    att_total = att_roll + attacker_mod
+    tgt_total = tgt_roll + target_mod
+    
+    log = f"Contest: {attacker.name} ({att_roll} + {attacker_mod} = {att_total}) vs {target.name} ({tgt_roll} + {target_mod} = {tgt_total}). "
+    
+    # In D&D 5e, ties result in the situation remaining unchanged (defender wins ties).
+    if att_total > tgt_total:
+        log += "Attacker wins! "
+        if action_type.lower() == "grapple":
+            res = await toggle_condition.ainvoke({"character_name": target_name, "condition_name": "Grappled", "is_active": True, "source_character_name": attacker.name}, config=config)
+            log += f"{target.name} is now Grappled by {attacker.name}. (Target speed reduced to 0). "
+        elif action_type.lower() in ["shove", "throw"]:
+            if shove_type.lower() == "prone" and action_type.lower() == "shove":
+                res = await toggle_condition.ainvoke({"character_name": target_name, "condition_name": "Prone", "is_active": True}, config=config)
+                log += f"{target.name} is knocked Prone. "
+            else:
+                dist_to_move = 5.0 if action_type.lower() == "shove" else throw_distance
+                dx, dy = target.x - attacker.x, target.y - attacker.y
+                dist = math.hypot(dx, dy)
+                if dist == 0: dx, dy, dist = 1, 0, 1 # Fallback if exactly stacked
+                nx, ny = target.x + (dx / dist) * dist_to_move, target.y + (dy / dist) * dist_to_move
+                move_res = await move_entity.ainvoke({"entity_name": target_name, "target_x": round(nx, 1), "target_y": round(ny, 1), "movement_type": "forced"}, config=config)
+                log += f"{target.name} is {'shoved' if action_type.lower() == 'shove' else 'thrown'} {dist_to_move} feet away. " + move_res
+                if action_type.lower() == "throw":
+                    res = await toggle_condition.ainvoke({"character_name": target_name, "condition_name": "Prone", "is_active": True}, config=config)
+                    log += f" {target.name} lands Prone."
+    else:
+        log += "Defender wins! Nothing happens."
+        
+    return f"MECHANICAL TRUTH: {log}"

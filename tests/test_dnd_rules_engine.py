@@ -23,13 +23,8 @@ class TestDnDRulesEngine(unittest.TestCase):
     def setUp(self):
         """Reset the game state before each test."""
         clear_registry()
-        EventBus._listeners.clear()
         # Reset the subscription flag for ConditionalDamageWeapon
         ConditionalDamageWeapon._subscribed = False
-
-        EventBus.subscribe("MeleeAttack", shield_spell_reaction_handler, priority=1)
-        EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
-        EventBus.subscribe("MeleeAttack", apply_damage_handler, priority=100)
 
 
     def test_demonstration_scenario(self):
@@ -120,6 +115,7 @@ class TestDnDRulesEngine(unittest.TestCase):
             ac=ModifiableValue(base_value=10),
             strength_mod=ModifiableValue(base_value=3),
             dexterity_mod=ModifiableValue(base_value=1),
+            tags=["blindsight_60"]
         )
         weapon = MeleeWeapon(name="Sword", damage_dice="1d8", damage_type="slashing")
         attacker.equipped_weapon_uuid = weapon.entity_uuid
@@ -130,6 +126,7 @@ class TestDnDRulesEngine(unittest.TestCase):
             ac=ModifiableValue(base_value=15),
             strength_mod=ModifiableValue(base_value=0),
             dexterity_mod=ModifiableValue(base_value=0),
+            tags=["blindsight_60"]
         )
         
         # Test Advantage (should take the higher roll: 18)
