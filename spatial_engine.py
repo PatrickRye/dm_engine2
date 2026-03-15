@@ -77,11 +77,37 @@ class LightSource(BaseModel):
     attached_to_entity_uuid: Optional[uuid.UUID] = None
 
 class MapData(BaseModel):
+    map_name: str = "Active Map"
+    dm_map_image_path: Optional[str] = None
+    player_map_image_path: Optional[str] = None
+    explored_areas: List[Tuple[float, float, float]] = Field(default_factory=list) # x, y, radius
+
+    original_walls: List[Wall] = Field(default_factory=list)
     walls: List[Wall] = Field(default_factory=list)
+    temporary_walls: List[Wall] = Field(default_factory=list)
+    
+    original_terrain: List[TerrainZone] = Field(default_factory=list)
     terrain: List[TerrainZone] = Field(default_factory=list)
+    temporary_terrain: List[TerrainZone] = Field(default_factory=list)
+    
+    original_lights: List[LightSource] = Field(default_factory=list)
     lights: List[LightSource] = Field(default_factory=list)
+    temporary_lights: List[LightSource] = Field(default_factory=list)
+    
     grid_scale: float = 5.0 # 1 square = 5ft
     distance_metric: str = "chebyshev" # "chebyshev" or "euclidean"
+
+    @property
+    def active_walls(self) -> List[Wall]:
+        return self.walls + self.temporary_walls
+        
+    @property
+    def active_terrain(self) -> List[TerrainZone]:
+        return self.terrain + self.temporary_terrain
+        
+    @property
+    def active_lights(self) -> List[LightSource]:
+        return self.lights + self.temporary_lights
 
 class SpatialQueryService:
     """
@@ -111,6 +137,18 @@ class SpatialQueryService:
             self._uuid_to_bbox.clear()
             self._next_id = 0
             self._raycast_cache.clear()
+            
+    def reveal_fog_of_war(self, x: float, y: float, radius: float):
+        """Adds a circular area to the explored regions of the current map."""
+        # Quantize to prevent endless floating point arrays
+        qx, qy, qr = round(x, 1), round(y, 1), round(radius, 1)
+        # Simple optimization: check if already fully enveloped by another explored area
+        for ex, ey, er in self.map_data.explored_areas:
+            dist = math.hypot(qx - ex, qy - ey)
+            if dist + qr <= er:
+                return # Already fully explored
+                
+        self.map_data.explored_areas.append((qx, qy, qr))
 
     def invalidate_cache(self):
         """Clears the raycast cache when map geometry changes."""
@@ -393,7 +431,7 @@ class SpatialQueryService:
             
         path = LineString([(start_x, start_y), (end_x, end_y)])
         for wall in self.map_data.active_walls:
-            blocks = (not wall.is_visible) if check_vision else wall.is_solid
+            blocks = wall.is_visible if check_vision else wall.is_solid
             if blocks and path.intersects(wall.line):
                 min_z = min(start_z, end_z)
                 max_z = max(start_z, end_z) + entity_height
@@ -443,7 +481,7 @@ class SpatialQueryService:
             path = LineString([s_corner, (target_x, target_y)])
             corner_blocked = False
             for wall in self.map_data.active_walls:
-                if not wall.is_visible and path.intersects(wall.line):
+                if wall.is_visible and path.intersects(wall.line):
                     if not (source.z + getattr(source, 'height', 5.0) <= wall.z or target_z >= wall.z + wall.height):
                         corner_blocked = True
                         break

@@ -44,6 +44,7 @@ class TestSpatialEngine(unittest.TestCase):
         # Add a solid wall directly between them
         wall = Wall(start=(10.0, -10.0), end=(10.0, 10.0))
         spatial_service.map_data.walls.append(wall)
+        spatial_service.invalidate_cache()
         
         self.assertFalse(spatial_service.has_line_of_sight(archer.entity_uuid, goblin.entity_uuid))
         dist, cover = spatial_service.get_distance_and_cover(archer.entity_uuid, goblin.entity_uuid)
@@ -51,6 +52,7 @@ class TestSpatialEngine(unittest.TestCase):
         
         # Move wall so it only blocks the bottom half of the Goblin's bounding box
         spatial_service.map_data.walls[0] = Wall(start=(10.0, 0.0), end=(10.0, 10.0))
+        spatial_service.invalidate_cache()
         dist, cover = spatial_service.get_distance_and_cover(archer.entity_uuid, goblin.entity_uuid)
         self.assertIn(cover, ["Half", "Three-Quarters"])
         
@@ -73,7 +75,7 @@ class TestSpatialEngine(unittest.TestCase):
         p1 = self.create_combatant("P1", 0.0, 0.0)
         p2 = self.create_combatant("P2", 10.0, 0.0)
         
-        window = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=True, label="Glass Window")
+        window = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=False, label="Glass Window")
         spatial_service.add_wall(window)
         
         # Can see right through it
@@ -91,7 +93,7 @@ class TestSpatialEngine(unittest.TestCase):
         p1 = self.create_combatant("P1", 0.0, 0.0)
         p2 = self.create_combatant("P2", 10.0, 0.0)
         
-        fog = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=False, is_visible=False, label="Fog Cloud")
+        fog = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=False, is_visible=True, label="Fog Cloud")
         spatial_service.add_wall(fog)
         
         # Cannot see through it
@@ -109,7 +111,7 @@ class TestSpatialEngine(unittest.TestCase):
         p1 = self.create_combatant("P1", 0.0, 0.0)
         p2 = self.create_combatant("P2", 10.0, 0.0)
         
-        door = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=False, label="Heavy Oak Door")
+        door = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=True, label="Heavy Oak Door")
         spatial_service.add_wall(door)
         
         # Closed door
@@ -117,7 +119,7 @@ class TestSpatialEngine(unittest.TestCase):
         self.assertTrue(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
         
         # Open the door
-        spatial_service.modify_wall(door.wall_id, is_solid=False, is_visible=True)
+        spatial_service.modify_wall(door.wall_id, is_solid=False, is_visible=False)
         
         # Opened door
         self.assertTrue(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
@@ -128,7 +130,7 @@ class TestSpatialEngine(unittest.TestCase):
         spatial_service.map_data.original_walls = []
         
         # Cast Wall of Stone (temporary)
-        temp_wall = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=False)
+        temp_wall = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=True)
         spatial_service.add_wall(temp_wall, is_temporary=True)
         
         self.assertTrue(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
@@ -148,7 +150,7 @@ class TestSpatialEngine(unittest.TestCase):
         # Wall goes from (5,0) exactly at the center-line, extending north to (5,10)
         # The direct center-to-center path from (0,0) to (10,0) hits the corner exactly at (5,0).
         # However, P1's southern corners (-2.5, -2.5) and (2.5, -2.5) have a clear unbroken line to P2.
-        corner_wall = Wall(start=(5.0, 0.0), end=(5.0, 10.0), is_solid=True, is_visible=False)
+        corner_wall = Wall(start=(5.0, 0.0), end=(5.0, 10.0), is_solid=True, is_visible=True)
         spatial_service.add_wall(corner_wall)
         
         # P1 can see P2 by looking "around" the bottom of the corner
@@ -156,7 +158,7 @@ class TestSpatialEngine(unittest.TestCase):
         
         # If we extend the wall south to cover P1's entire bounding box, LoS is finally broken.
         spatial_service.remove_wall(corner_wall.wall_id)
-        extended_wall = Wall(start=(5.0, -5.0), end=(5.0, 10.0), is_solid=True, is_visible=False)
+        extended_wall = Wall(start=(5.0, -5.0), end=(5.0, 10.0), is_solid=True, is_visible=True)
         spatial_service.add_wall(extended_wall)
         
         self.assertFalse(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
@@ -166,7 +168,7 @@ class TestSpatialEngine(unittest.TestCase):
         p1 = self.create_combatant("P1", 0.0, 0.0)
         p2 = self.create_combatant("P2", 10.0, 0.0)
         
-        fragile_wall = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=False, label="Ice Wall")
+        fragile_wall = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True, is_visible=True, label="Ice Wall")
         spatial_service.add_wall(fragile_wall)
         
         self.assertTrue(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))

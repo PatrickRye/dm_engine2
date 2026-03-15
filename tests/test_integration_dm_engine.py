@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from dnd_rules_engine import BaseGameEntity, Creature, MeleeWeapon, EventBus
 from vault_io import initialize_engine_from_vault
-from tools import equip_item, execute_melee_attack, modify_health, perform_ability_check_or_save, level_up_character, move_entity
+from tools import equip_item, execute_melee_attack, modify_health, perform_ability_check_or_save, level_up_character, move_entity, manage_skill_challenge
 from spatial_engine import spatial_service
 from event_handlers import resolve_attack_handler, apply_damage_handler
 from registry import clear_registry, get_all_entities, get_entity
@@ -27,6 +27,9 @@ def mock_entities(mock_obsidian_vault):
         
     with open(os.path.join(journals_dir, f"{target_name}.md"), "w", encoding="utf-8") as f:
         f.write(f"---\nname: {target_name}\ntags: [monster]\nhp: 7\nac: 15\nstrength_mod: -1\ndexterity_mod: 2\nequipment: {{main_hand: Dagger}}\n---\n")
+        
+    with open(os.path.join(journals_dir, "CAMPAIGN_MASTER.md"), "w", encoding="utf-8") as f:
+        f.write("---\ntags: [campaign]\n---\n# Campaign Master\n\n## Major Milestones (Event Log)\n- Started.\n")
         
     # Setup mock JSON compendium files for the Level Up Test
     comp_dir = os.path.join(mock_obsidian_vault, "Compendium")
@@ -100,7 +103,7 @@ async def test_tool_to_eventbus_combat(mock_entities):
     await initialize_engine_from_vault(vault_path)
     config = {"configurable": {"thread_id": vault_path}}
     
-    with patch('random.randint', side_effect=[20, 10, 4, 4]): 
+    with patch('random.randint', side_effect=[20, 20, 4, 4, 4]): 
         result = await execute_melee_attack.ainvoke({"attacker_name": char_name, "target_name": target_name}, config=config)
     
     assert "MECHANICAL TRUTH: HIT!" in result
@@ -220,8 +223,29 @@ async def test_tool_opportunity_attack_integration(mock_entities):
     assert char_name in move_result
     
     # 2. Execute the Opportunity Attack
-    with patch('random.randint', side_effect=[18, 4]): # Attack roll 18, Damage roll 4
+    with patch('random.randint', side_effect=[18, 18, 4]): # Attack roll 18, Damage roll 4
         oa_result = await execute_melee_attack.ainvoke({"attacker_name": char_name, "target_name": target_name, "is_opportunity_attack": True}, config=config)
         
     assert "MECHANICAL TRUTH: HIT!" in oa_result
     assert tharion.reaction_used is True
+
+@pytest.mark.asyncio
+async def test_tool_manage_skill_challenge(mock_entities):
+    """Tests that a skill challenge creates a whiteboard, tracks stats, and logs completion to the master log."""
+    vault_path, _, _ = mock_entities
+    config = {"configurable": {"thread_id": vault_path}}
+    
+    res1 = await manage_skill_challenge.ainvoke({"action": "start", "name": "Escape the Cave", "max_successes": 3, "max_failures": 3}, config=config)
+    assert "started" in res1
+    
+    res2 = await manage_skill_challenge.ainvoke({"action": "update", "successes_delta": 1, "note": "Jumped a chasm"}, config=config)
+    assert "[1/3 Successes]" in res2
+    
+    res3 = await manage_skill_challenge.ainvoke({"action": "update", "successes_delta": 2}, config=config)
+    assert "VICTORY" in res3
+    
+    res4 = await manage_skill_challenge.ainvoke({"action": "end", "note": "The party escaped safely."}, config=config)
+    assert "ended" in res4
+    
+    with open(os.path.join(vault_path, "Journals", "CAMPAIGN_MASTER.md"), "r", encoding="utf-8") as f:
+        assert "The party escaped safely." in f.read()

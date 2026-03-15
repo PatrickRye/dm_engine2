@@ -41,6 +41,7 @@ def test_spatial_line_of_sight_and_cover():
     spatial_service.sync_entity(target)
 
     # Create a wall that blocks exactly half the target (Y from 0 to 5)
+    spatial_service.invalidate_cache()
     wall = Wall(start=(5, 0), end=(5, 5), z=0, height=10, is_solid=True)
     spatial_service.map_data.walls.append(wall)
 
@@ -50,6 +51,7 @@ def test_spatial_line_of_sight_and_cover():
     # Extend wall to block entirely
     wall.start = (5, 5)
     wall.end = (5, -5) # Now perfectly spans Y: 5 to -5, completely covering the 5x5 bounding box
+    spatial_service.invalidate_cache()
     dist, cover = spatial_service.get_distance_and_cover(attacker.entity_uuid, target.entity_uuid)
     assert cover == "Total"
 
@@ -68,12 +70,13 @@ def test_spatial_movement_blocked_by_wall():
     """Tests that 3D pathing math accurately detects wall collisions, including vertical bounds."""
     wall = Wall(start=(5, -5), end=(5, 5), z=0, height=10, is_solid=True)
     spatial_service.map_data.walls.append(wall)
+    spatial_service.invalidate_cache()
     
     # 1. Straight path through the wall should collide
-    assert spatial_service.check_path_collision(0, 0, 0, 10, 0, 0) is True
+    assert spatial_service.check_path_collision(0, 0, 0, 10, 0, 0) is not None
     
     # 2. Flying over the wall (Z=15) avoids the 10ft high wall entirely
-    assert spatial_service.check_path_collision(0, 0, 15, 10, 0, 15) is False
+    assert spatial_service.check_path_collision(0, 0, 15, 10, 0, 15) is None
 
 def test_spatial_illumination_and_walls():
     """Tests that light sources correctly calculate bright/dim/darkness, obstructed by walls."""
@@ -89,6 +92,7 @@ def test_spatial_illumination_and_walls():
     # Add wall blocking LoS to the (10,0,0) point
     wall = Wall(start=(5, -5), end=(5, 5), z=0, height=10, is_solid=True)
     spatial_service.map_data.walls.append(wall)
+    spatial_service.invalidate_cache()
     
     # 4. Behind wall should now be pitch black
     assert spatial_service.get_illumination(10, 0, 0) == "darkness"

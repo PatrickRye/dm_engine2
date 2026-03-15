@@ -218,7 +218,8 @@ def resolve_attack_handler(event: GameEvent):
         # Enforce Reach Limits for Melee Weapons
         # Multiply by 1.5 to safely account for Euclidean distance on diagonals (5ft reach allows ~7.07ft diagonal distance)
         base_reach = 10.0 if WeaponProperty.REACH in weapon.properties else 5.0
-        if dist > (base_reach * 1.5):
+        is_oa = event.payload.get("is_opportunity_attack", False)
+        if dist > (base_reach * 1.5) and not is_oa:
             print(f"[Engine] {attacker.name} cannot hit {target.name}. Target is out of melee reach ({dist:.1f}ft > {base_reach}ft).")
             event.payload["hit"] = False
             return
@@ -260,33 +261,30 @@ def resolve_attack_handler(event: GameEvent):
 
     cover_ac_bonus = 2 if cover == "Half" else (5 if cover == "Three-Quarters" else 0)
     target_ac = target.ac.total + cover_ac_bonus
-
-    # Handle advantage and disadvantage
-    roll1 = random.randint(1, 20)
-    roll2 = random.randint(1, 20)
-    
-    has_adv = event.payload.get("advantage", False)
-    has_disadv = event.payload.get("disadvantage", False)
-    
-    if has_adv and has_disadv:
-        d20_roll = roll1
-        print("[Engine] Attack has BOTH Advantage and Disadvantage. They cancel out. Rolling normally.")
-    elif has_adv:
-        d20_roll = max(roll1, roll2)
-        print("[Engine] Attack has ADVANTAGE, rolling twice and taking the higher roll.")
-    elif has_disadv:
-        d20_roll = min(roll1, roll2)
-        print("[Engine] Attack has DISADVANTAGE, rolling twice and taking the lower roll.")
-    else:
-        d20_roll = roll1
-
-    total_attack = d20_roll + attack_bonus
-
-    is_critical_hit = d20_roll == 20
-    is_hit = is_critical_hit or total_attack >= target_ac
-
     cover_msg = f" (Includes +{cover_ac_bonus} {cover} Cover)" if cover_ac_bonus > 0 else ""
-    print(f"[Engine] {attacker.name} rolls a {d20_roll} ({roll1}, {roll2} if adv/disadv) + {attack_bonus} = {total_attack} vs AC {target_ac}{cover_msg}")
+    
+    manual_roll = event.payload.get("manual_roll_total")
+    is_critical_hit = event.payload.get("is_critical", False)
+    
+    if manual_roll is not None:
+        total_attack = manual_roll
+        is_hit = is_critical_hit or total_attack >= target_ac
+        print(f"[Engine] {attacker.name} manually rolled a total of {total_attack} vs AC {target_ac}{cover_msg}")
+    else:
+
+        roll1, roll2 = random.randint(1, 20), random.randint(1, 20)
+        has_adv = event.payload.get("advantage", False)
+        has_disadv = event.payload.get("disadvantage", False)
+        
+        if has_adv and has_disadv: d20_roll = roll1
+        elif has_adv: d20_roll = max(roll1, roll2)
+        elif has_disadv: d20_roll = min(roll1, roll2)
+        else: d20_roll = roll1
+    
+        total_attack = d20_roll + attack_bonus
+        is_critical_hit = d20_roll == 20
+        is_hit = is_critical_hit or total_attack >= target_ac
+        print(f"[Engine] {attacker.name} rolls a {d20_roll} ({roll1}, {roll2} if adv/disadv) + {attack_bonus} = {total_attack} vs AC {target_ac}{cover_msg}")
 
     # Attacking reveals the attacker
     hidden_conds = [c for c in attacker.active_conditions if c.name.lower() == "hidden"]
@@ -564,10 +562,6 @@ def resolve_movement_handler(event: GameEvent):
     
     movement_type = event.payload.get("movement_type", "walk").lower()
     
-    # Teleportation and forced movement do not provoke opportunity attacks natively
-    if movement_type in ["teleport", "forced"]:
-        return
-        
     entity: Creature = get_entity(event.source_uuid)
     target_x = event.payload.get("target_x")
     target_y = event.payload.get("target_y")
@@ -594,6 +588,10 @@ def resolve_movement_handler(event: GameEvent):
                     if dist_after > 7.5:
                         other_ent.active_conditions.remove(cond)
                         print(f"[Engine] {entity.name} moved away from {other_ent.name}. The grapple is broken!")
+                        
+    # Teleportation and forced movement do not provoke opportunity attacks natively
+    if movement_type in ["teleport", "forced"]:
+        return
     
     opportunity_attackers = []
     for uid, potential_attacker in get_all_entities().items():
@@ -630,6 +628,19 @@ def resolve_movement_handler(event: GameEvent):
             
     if opportunity_attackers:
         event.payload["opportunity_attackers"] = opportunity_attackers
+        
+    # --- Reveal Fog of War ---
+    if any(t in entity.tags for t in ["pc", "player"]):
+        # Determine max vision range
+        vision_radius = 30.0 # Default bright light assumed
+        for t in entity.tags:
+            if "darkvision" in t:
+                try: vision_radius = max(vision_radius, float(t.split("_")[1]))
+                except: vision_radius = max(vision_radius, 60.0)
+        
+        # Only reveal what isn't blocked by walls (simplified to a radius for now, 
+        # true raycast FoW clearing is handled client-side in the Canvas)
+        spatial_service.reveal_fog_of_war(target_x, target_y, vision_radius)
 
 def consume_movement_handler(event: GameEvent):
     """Deducts movement speed after a successful, un-cancelled move."""

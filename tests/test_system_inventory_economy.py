@@ -3,7 +3,7 @@ import pytest
 import yaml
 from unittest.mock import patch
 
-from tools import manage_inventory
+from tools import manage_inventory, generate_random_loot
 
 @pytest.fixture
 def mock_inventory_entity(mock_obsidian_vault):
@@ -140,3 +140,20 @@ async def test_inventory_stealing_looting_and_bartering(mock_inventory_entity):
         npc_yaml = yaml.safe_load(f.read().split("---")[1])
         assert "Shortbow" in npc_yaml["inventory"]
         assert "Torch (x40)" in npc_yaml["inventory"]
+        
+@pytest.mark.asyncio
+async def test_generate_random_loot(mock_inventory_entity):
+    """Tests that the random loot generator successfully builds string outputs based on CR tables."""
+    vault_path, _, _ = mock_inventory_entity
+    config = {"configurable": {"thread_id": vault_path}}
+    
+    # 1. Test Low Level Individual
+    with patch('random.randint', return_value=15): # Roll 15 usually triggers CP
+        res1 = await generate_random_loot.ainvoke({"challenge_rating": 2, "loot_type": "individual"}, config=config)
+        assert "cp" in res1
+        
+    # 2. Test Mid Level Hoard
+    with patch('random.randint', return_value=95): # Roll 95 triggers magic items
+        res2 = await generate_random_loot.ainvoke({"challenge_rating": 6, "loot_type": "hoard"}, config=config)
+        assert "gp" in res2
+        assert "Weapon" in res2 or "Cloak" in res2 or "Ring" in res2

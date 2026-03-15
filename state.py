@@ -22,6 +22,7 @@ class Describable(BaseModel):
     """Base model for any entity that can be described with text."""
     appearance: str = Field(default="", description="Physical description. IMPROVISE if not provided.")
     current_appearance: str = Field(default="", description="Current situational appearance. IMPROVISE.")
+    icon_url: str = Field(default="", description="Relative vault path to the top-down token/avatar image for the VTT map (e.g., 'Assets/tokens/goblin.png').")
     misc_notes: str = Field(default="", description="Catch-all for extra lore, rumors, dark secrets, or 'Jazz'.")
 
 class Social(Describable):
@@ -101,4 +102,3 @@ class EntityDetails(PCDetails, NPCDetails, LocationDetails, FactionDetails):
     When creating a new entity, prefer using the more specific models like PCDetails, NPCDetails, etc.
     """
     pass
-

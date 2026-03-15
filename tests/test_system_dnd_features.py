@@ -54,7 +54,7 @@ def test_system_barovian_church_ranged_combat():
     # 4. Execution: Ranger shoots Doru behind the pew.
     # Doru is at x=20. Wall is at x=15. Ranger is at x=10.
     # The wall is 3ft high, Doru is 5ft high. This should grant Half Cover (+2 AC).
-    with patch('random.randint', side_effect=[14, 1, 5]): # Roll 14 (atk1), 1 (atk2), 5 (dmg) + 3 DEX = 8 dmg
+    with patch('random.randint', side_effect=[14, 14, 5]): # Roll 14 + 3 DEX = 17 vs AC 17 (15 + 2 Cover). HIT!
         atk_event = GameEvent(event_type="MeleeAttack", source_uuid=ranger.entity_uuid, target_uuid=vampire.entity_uuid)
         EventBus.dispatch(atk_event)
         
@@ -87,7 +87,7 @@ def test_system_sentinel_feat_interaction():
     
     # 2. Simulate AI deciding to use Reaction to attack
     fighter.reaction_used = True
-    with patch('random.randint', side_effect=[15, 6, 6]): # 15 (attack 1), 6 (attack 2), 6 (damage)
+    with patch('random.randint', side_effect=[15, 15, 6]): # 15 + 4 = 19 vs AC 12 (Hit). Dmg 6 + 4 = 10.
         oa_event = GameEvent(event_type="MeleeAttack", source_uuid=fighter.entity_uuid, target_uuid=goblin.entity_uuid)
         
         # In production, main.py intercepts the OA flag and modifies goblin.movement_remaining if hit
@@ -276,9 +276,12 @@ async def test_system_spell_illumination_areas():
 @pytest.mark.asyncio
 async def test_system_stealth_and_hidden_combat():
     """Tests that characters can gain the 'Hidden' condition, gain advantage, and lose it upon attacking."""
-    rogue = Creature(name="Rogue", x=0, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    rogue = Creature(name="Rogue", x=5, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
     target = Creature(name="Guard", x=10, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
     
+    dagger = MeleeWeapon(name="Dagger", damage_dice="1d4", damage_type="piercing")
+    rogue.equipped_weapon_uuid = dagger.entity_uuid
+
     spatial_service.sync_entity(rogue)
     spatial_service.sync_entity(target)
     spatial_service.map_data.lights.clear() # Pitch black
@@ -327,7 +330,7 @@ async def test_system_grapple_contest_success_and_fail():
     config = {"configurable": {"thread_id": "dummy"}}
     
     # Test 1: Attacker Wins (Roll 15 vs 5)
-    with patch('random.randint', side_effect=[15, 5]):
+    with patch('random.randint', side_effect=[15, 15, 5]):
         res = await execute_grapple_or_shove.ainvoke({"attacker_name": "Orc", "target_name": "Bard", "action_type": "grapple"}, config=config)
         assert "Attacker wins" in res
         assert any(c.name == "Grappled" for c in target.active_conditions)
@@ -336,7 +339,7 @@ async def test_system_grapple_contest_success_and_fail():
     # Test 2: Defender Wins Tie (Roll 10 vs 12, tying total at 14)
     target.active_conditions = []
     target.movement_remaining = 30
-    with patch('random.randint', side_effect=[10, 12]):
+    with patch('random.randint', side_effect=[10, 10, 12]):
         res = await execute_grapple_or_shove.ainvoke({"attacker_name": "Orc", "target_name": "Bard", "action_type": "grapple"}, config=config)
         assert "Defender wins" in res
         assert not any(c.name == "Grappled" for c in target.active_conditions)
@@ -360,9 +363,9 @@ async def test_system_shove_movement_direction():
         
     config = {"configurable": {"thread_id": "dummy"}}
     
-    with patch('random.randint', side_effect=[15, 5]):
+    with patch('random.randint', side_effect=[15, 15, 5]):
         res = await execute_grapple_or_shove.ainvoke({"attacker_name": "Orc", "target_name": "Bard", "action_type": "shove", "shove_type": "away"}, config=config)
-        assert "shoved 5 feet away" in res
+        assert "shoved 5.0 feet away" in res
         assert target.x == 10.0
         assert target.y == 0.0
 
@@ -384,14 +387,14 @@ async def test_system_throw_breaks_grapple_and_knocks_prone():
     config = {"configurable": {"thread_id": "dummy"}}
     
     # 1. Attacker successfully grapples Target
-    with patch('random.randint', side_effect=[15, 5]):
+    with patch('random.randint', side_effect=[15, 15, 5]):
         await execute_grapple_or_shove.ainvoke({"attacker_name": "Orc", "target_name": "Bard", "action_type": "grapple"}, config=config)
         
     assert any(c.name == "Grappled" for c in target.active_conditions)
     assert target.movement_remaining == 0
     
     # 2. Attacker successfully throws Target 15 feet
-    with patch('random.randint', side_effect=[18, 4]):
+    with patch('random.randint', side_effect=[18, 18, 4]):
         res = await execute_grapple_or_shove.ainvoke({"attacker_name": "Orc", "target_name": "Bard", "action_type": "throw", "throw_distance": 15.0}, config=config)
         
     assert "thrown 15.0 feet away" in res
@@ -408,7 +411,7 @@ async def test_system_throw_breaks_grapple_and_knocks_prone():
 async def test_system_blindsight_vs_invisibility():
     """System test: Blindsight ignores invisibility and darkness."""
     bat = Creature(name="Giant Bat", tags=["blindsight_60"], x=0, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
-    invisible_mage = Creature(name="Mage", tags=["invisible"], x=30, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    invisible_mage = Creature(name="Mage", tags=["invisible"], x=5, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
     
     bite = MeleeWeapon(name="Bite", damage_dice="1d4", damage_type="piercing")
     bat.equipped_weapon_uuid = bite.entity_uuid
@@ -429,8 +432,8 @@ async def test_system_blindsight_vs_invisibility():
 async def test_system_tremorsense_vs_flying():
     """System test: Tremorsense works in darkness but fails on flying targets."""
     bulette = Creature(name="Bulette", tags=["tremorsense_60"], x=0, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
-    ground_target = Creature(name="Fighter", x=30, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
-    flying_target = Creature(name="Aarakocra", tags=["flying"], x=30, y=30, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    ground_target = Creature(name="Fighter", x=5, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    flying_target = Creature(name="Aarakocra", tags=["flying"], x=5, y=5, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
     
     bite = MeleeWeapon(name="Bite", damage_dice="4d12", damage_type="piercing")
     bulette.equipped_weapon_uuid = bite.entity_uuid
@@ -534,7 +537,7 @@ async def test_system_trap_interaction_fail():
     }, config=config)
     
     # 2. Interact - Fail (Roll 5 lockpick + Mod fails DC 20. Then Roll 5 Save fails DC 15. Damage rolls 8)
-    with patch('random.randint', side_effect=[5, 5, 8]):
+    with patch('random.randint', side_effect=[5, 8, 5, 5]):
         res = await interact_with_object.ainvoke({"character_name": "Rogue", "target_label": "Chest", "interaction_type": "lockpick"}, config=config)
         
     assert "FAILURE" in res
@@ -587,7 +590,7 @@ async def test_system_trap_movement_trigger():
     await manage_map_trap.ainvoke({"target_label": "Suspicious Floor", "hazard_name": "Fire Rune", "trigger_on_move": True, "save_required": "dexterity", "save_dc": 15, "damage_dice": "2d6", "damage_type": "fire"}, config=config)
     
     # 2. Move through
-    with patch('random.randint', side_effect=[5, 6, 4]): # Save roll 5 (fails), Dmg roll 6 and 4 (Total 10)
+    with patch('random.randint', side_effect=[6, 4, 5, 5]): # Dmg roll 6 and 4 (Total 10), Save roll 5, 5
         res = await move_entity.ainvoke({"entity_name": "Fighter", "target_x": 20, "target_y": 0, "movement_type": "walk"}, config=config)
         
     assert "TRAP TRIGGERED during movement" in res

@@ -22,6 +22,14 @@ import event_handlers
 
 from registry import get_all_entities
 
+_CHARACTER_AUTOMATIONS = {}
+
+def update_roll_automations(character_name: str, automations: dict):
+    _CHARACTER_AUTOMATIONS[character_name] = automations
+
+def get_roll_automations(character_name: str) -> dict:
+    return _CHARACTER_AUTOMATIONS.get(character_name, {"hidden_rolls": True, "saving_throws": True, "skill_checks": True, "attack_rolls": True})
+
 def _get_entity_by_name(name: str) -> Optional[BaseGameEntity]:
     """Helper to find an active entity in the engine's memory by name."""
     for uid, entity in get_all_entities().items():
@@ -29,7 +37,7 @@ def _get_entity_by_name(name: str) -> Optional[BaseGameEntity]:
             return entity
     return None
 
-def _build_npc_template(title: str, context: str, details: dict) -> str:
+def _build_npc_template(title: str, context: str, details: dict, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> str:
     ctx = context.strip() if context else "Newly encountered individual. No prior background established."
     appearance = details.get("appearance", "")
     current_appearance = details.get("current_appearance", "")
@@ -43,8 +51,9 @@ def _build_npc_template(title: str, context: str, details: dict) -> str:
     stats = details.get("stat_block", "No stat block provided.")
     misc = details.get("misc_notes", "")
     code_switch = details.get("code_switching", "Unknown.")
+    icon_url = details.get("icon_url", "")
 
-    return (f"---\ntags: [npc]\nstatus: active\norigin: Unknown\ncurrent_location: Unknown\n---\n"
+    return (f"---\ntags: [npc]\nstatus: active\norigin: Unknown\ncurrent_location: Unknown\nx: {x}\ny: {y}\nz: {z}\nicon_url: \"{icon_url}\"\n---\n"
             f"# {title}\n\n## Summary - Current State\n- {ctx[:150]}...\n\n"
             f"## Background & Motives\n- {ctx}\n- **Long-Term Goals**: {long_term_goals}\n- **Aliases & Titles**: {aliases}\n\n"
             f"## Appearance\n- **Base Appearance**: {appearance}\n\n"
@@ -58,13 +67,14 @@ def _build_npc_template(title: str, context: str, details: dict) -> str:
 def _build_location_template(title: str, context: str, details: dict) -> str:
     ctx = context.strip() if context else "Newly discovered area."
     demographics = details.get("demographics", "")
+    icon_url = details.get("icon_url", "")
     government = details.get("government", "")
     establishments = details.get("establishments", "")
     landmarks = details.get("key_features_and_landmarks", "")
     misc = details.get("misc_notes", "")
     diversity = details.get("diversity", "Unknown population makeup.")
     
-    return (f"---\ntags: [location]\n---\n# {title}\n\n## Summary - Current State\n- {ctx}\n\n"
+    return (f"---\ntags: [location]\nicon_url: \"{icon_url}\"\n---\n# {title}\n\n## Summary - Current State\n- {ctx}\n\n"
             f"## Demographics & Culture\n- **Native Dialect(s)**: {demographics}\n- **Diversity**: {diversity}\n\n"
             f"## Government & Defenses\n- {government}\n\n"
             f"## Key Features & Landmarks\n- {landmarks}\n\n"
@@ -76,18 +86,20 @@ def _build_location_template(title: str, context: str, details: dict) -> str:
 def _build_faction_template(title: str, context: str, details: dict) -> str:
     ctx = context.strip() if context else "Newly discovered faction."
     goals = details.get("goals", "")
+    icon_url = details.get("icon_url", "")
     assets = details.get("assets", "")
     key_npcs = details.get("key_npcs", "")
     misc = details.get("misc_notes", "")
     
-    return (f"---\ntags: [faction]\nstatus: active\n---\n# {title}\n\n## Summary - Current State\n- {ctx}\n\n"
+    return (f"---\ntags: [faction]\nstatus: active\nicon_url: \"{icon_url}\"\n---\n# {title}\n\n## Summary - Current State\n- {ctx}\n\n"
             f"## Goals\n- {goals}\n\n## Assets & Resources\n- {assets}\n\n## Key NPCs\n- {key_npcs}\n\n## Party Disposition\n- Neutral\n\n## Event History\n- \n\n"
             f"## Additional Lore & Jazz\n{misc}\n")
 
-def _build_pc_template(title: str, details: dict) -> str:
+def _build_pc_template(title: str, details: dict, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> str:
     appearance = details.get("appearance", "")
     current_appearance = details.get("current_appearance", "")
     long_term_goals = details.get("long_term_goals", "")
+    icon_url = details.get("icon_url", "")
     immediate_goals = details.get("immediate_goals", "")
     aliases = details.get("aliases_and_titles", "")
     misc = details.get("misc_notes", "")
@@ -106,7 +118,7 @@ def _build_pc_template(title: str, details: dict) -> str:
     profs = details.get("proficiencies", "None")
     feats = details.get("feats_and_traits", "None")
     
-    return (f"---\ntags: [pc, player]\nstatus: active\nclasses: {yaml.dump(classes, default_flow_style=True)}\nspecies: {species}\nbackground: {background}\n"
+    return (f"---\ntags: [pc, player]\nstatus: active\nx: {x}\ny: {y}\nz: {z}\nicon_url: \"{icon_url}\"\nclasses: {yaml.dump(classes, default_flow_style=True)}\nspecies: {species}\nbackground: {background}\n"
             f"level: 1\nmax_hp: 10\nac: 10\ngold: 0\ncurrency:\n  cp: 0\n  sp: 0\n  ep: 0\n  gp: 0\n  pp: 0\n"
             f"str: {s_str}\ndex: {s_dex}\ncon: {s_con}\nint: {s_int}\nwis: {s_wis}\ncha: {s_cha}\n"
             f"attunement_slots: 0/3\n"
@@ -170,7 +182,7 @@ async def _get_current_combat_initiative(vault_path: str) -> int:
 
 
 @tool
-async def execute_melee_attack(attacker_name: str, target_name: str, advantage: bool = False, disadvantage: bool = False, is_reaction: bool = False, is_legendary_action: bool = False, is_opportunity_attack: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def execute_melee_attack(attacker_name: str, target_name: str, advantage: bool = False, disadvantage: bool = False, is_reaction: bool = False, is_legendary_action: bool = False, is_opportunity_attack: bool = False, manual_roll_total: int = None, is_critical: bool = False, force_auto_roll: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
     STRICT REQUIREMENT: Use this tool to resolve ANY melee attack between two entities.
     Do NOT hallucinate dice rolls or damage. The engine will calculate hit/miss and exact damage.
@@ -184,6 +196,12 @@ async def execute_melee_attack(attacker_name: str, target_name: str, advantage: 
     if not target:
         return f"SYSTEM ERROR: Target '{target_name}' not found in active combat memory."
         
+    is_pc = any(t in attacker.tags for t in ["pc", "player"])
+    if is_pc and not force_auto_roll and manual_roll_total is None:
+        auto_settings = get_roll_automations(attacker.name)
+        if not auto_settings.get("attack_rolls", True):
+            return f"SYSTEM ALERT: {attacker.name} has manual attack rolls enabled. Ask the player to roll the attack (including modifiers) and provide the total, OR ask if they want the engine to automate it. Then call this tool again with `manual_roll_total=X` (and `is_critical=True` if they rolled a natural 20) or `force_auto_roll=True`."
+
     if is_opportunity_attack:
         is_reaction = True
         
@@ -200,7 +218,7 @@ async def execute_melee_attack(attacker_name: str, target_name: str, advantage: 
         event_type="MeleeAttack",
         source_uuid=attacker.entity_uuid,
         target_uuid=target.entity_uuid,
-        payload={"advantage": advantage, "disadvantage": disadvantage, "current_initiative": current_init}
+        payload={"advantage": advantage, "disadvantage": disadvantage, "current_initiative": current_init, "is_opportunity_attack": is_opportunity_attack, "manual_roll_total": manual_roll_total, "is_critical": is_critical}
     )
     
     result = EventBus.dispatch(event)
@@ -261,7 +279,7 @@ def modify_health(target_name: str, hp_change: int, reason: str, damage_type: st
 
 
 @tool
-async def create_new_entity(entity_name: str, entity_type: str, background_context: str = "", details: Union[PCDetails, NPCDetails, LocationDetails, FactionDetails] = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def create_new_entity(entity_name: str, entity_type: str, background_context: str = "", details: Union[PCDetails, NPCDetails, LocationDetails, FactionDetails] = None, x: float = 0.0, y: float = 0.0, z: float = 0.0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Generates schema-compliant Markdown files."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{entity_name}.md")
@@ -277,7 +295,7 @@ async def create_new_entity(entity_name: str, entity_type: str, background_conte
     e_type = entity_type.upper()
     try:
         if e_type == "NPC":
-            content = _build_npc_template(display_title, background_context, details_dict)
+            content = _build_npc_template(display_title, background_context, details_dict, x, y, z)
         elif e_type == "LOCATION":
             content = _build_location_template(display_title, background_context, details_dict)
         elif e_type == "FACTION":
@@ -290,7 +308,7 @@ async def create_new_entity(entity_name: str, entity_type: str, background_conte
                        f"## Alternate Routes & Consequences\n- (Track 'Fail Forward' paths here. If a party fails to find a clue, log the alternate NPC or method generated to keep the plot moving. Log the consequences of past failures.)\n\n## Major Milestones (Event Log)\n- \n\n"
                        f"## Additional Lore & Jazz\n{details_dict.get('misc_notes', '')}\n")
         elif e_type in ["PC", "PLAYER"]:
-            content = _build_pc_template(display_title, details_dict)
+            content = _build_pc_template(display_title, details_dict, x, y, z)
             async with aiofiles.open(file_path, 'w', encoding='utf-8') as f: 
                 await f.write(content)
             # AUTOMATED D&D BEYOND DATAVIEW SHEET
@@ -418,7 +436,7 @@ async def create_new_entity(entity_name: str, entity_type: str, background_conte
 
 
 @tool
-async def flesh_out_entity(entity_name: str, entity_type: str, background_context: str = "", details: Union[PCDetails, NPCDetails, LocationDetails, FactionDetails] = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def flesh_out_entity(entity_name: str, entity_type: str, background_context: str = "", details: Union[PCDetails, NPCDetails, LocationDetails, FactionDetails] = None, x: float = 0.0, y: float = 0.0, z: float = 0.0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Use this tool to completely rewrite and 'Flesh Out' an existing file."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{entity_name}.md")
@@ -432,13 +450,13 @@ async def flesh_out_entity(entity_name: str, entity_type: str, background_contex
     e_type = entity_type.upper()
     try:
         if e_type == "NPC":
-            content = _build_npc_template(display_title, background_context, details_dict)
+            content = _build_npc_template(display_title, background_context, details_dict, x, y, z)
         elif e_type == "LOCATION":
             content = _build_location_template(display_title, background_context, details_dict)
         elif e_type == "FACTION":
             content = _build_faction_template(display_title, background_context, details_dict)
         elif e_type in ["PC", "PLAYER"]:
-            content = _build_pc_template(display_title, details_dict)
+            content = _build_pc_template(display_title, details_dict, x, y, z)
         else:
             return f"Error: Unsupported entity type for flesh_out_entity: {e_type}"
 
@@ -793,7 +811,7 @@ async def manage_inventory(character_name: str, item_name: str, action: str, qua
 
 
 @tool
-async def perform_ability_check_or_save(character_name: str, skill_or_stat_name: str, is_hidden: bool = False, is_passive: bool = False, advantage: bool = False, disadvantage: bool = False, extra_modifier: int = 0, bonus_dice: str = None, luck_points_used: int = 0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def perform_ability_check_or_save(character_name: str, skill_or_stat_name: str, is_hidden: bool = False, is_passive: bool = False, advantage: bool = False, disadvantage: bool = False, extra_modifier: int = 0, bonus_dice: str = None, luck_points_used: int = 0, manual_roll_total: int = None, force_auto_roll: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
     STRICT RULE: Use this ONLY for out-of-combat skill checks (Perception, Persuasion, Stealth) 
     or environmental Saving Throws (dodging a falling rock).
@@ -833,6 +851,14 @@ async def perform_ability_check_or_save(character_name: str, skill_or_stat_name:
                     
     total_mod = stat_mod + extra_modifier
     
+    is_pc = any(t in engine_creature.tags for t in ["pc", "player"]) if engine_creature else False
+    if is_pc and not is_passive and not force_auto_roll and manual_roll_total is None:
+        auto_settings = get_roll_automations(character_name)
+        if is_hidden and not auto_settings.get("hidden_rolls", True):
+            return f"SYSTEM ALERT: {character_name} has manual hidden rolls enabled. Ask the player to privately roll {clean_skill} and provide the total (including modifiers), OR ask if they want the engine to automate it. Then call this tool again with `manual_roll_total=X` or `force_auto_roll=True`."
+        elif not is_hidden and not auto_settings.get("skill_checks", True):
+            return f"SYSTEM ALERT: {character_name} has manual skill checks enabled. Ask the player to roll {clean_skill} and provide the total (including modifiers), OR ask if they want the engine to automate it. Then call this tool again with `manual_roll_total=X` or `force_auto_roll=True`."
+
     if is_passive:
         total = 10 + total_mod + (5 if advantage else (-5 if disadvantage else 0))
         result_str = f"Passive {clean_skill.capitalize()} Score: {total}.\nDM DIRECTIVE: Narrate using 'Describe to Me'."
@@ -840,47 +866,54 @@ async def perform_ability_check_or_save(character_name: str, skill_or_stat_name:
         return result_str
         
 # --- 1. RESOLVE 5.5e BOOLEAN STATES ---
-    if luck_points_used > 0:
-        advantage = True  # In 5.5e, Luck explicitly grants Advantage
-        
-    num_d20s = 1
-    if advantage or disadvantage: 
-        num_d20s = 2
-    if advantage and disadvantage: 
-        num_d20s = 1  # They perfectly cancel each other out
-        
-    rolls = [random.randint(1, 20) for _ in range(num_d20s)]
-    
-    # --- 2. EVALUATE FINAL POOL ---
-    if advantage and not disadvantage:
-        base_roll = max(rolls)
-        roll_type_str = f"Advantage {rolls}"
-        if luck_points_used > 0: 
-            roll_type_str += " (via Luck)"
-            
-    elif disadvantage and not advantage:
-        base_roll = min(rolls)
-        roll_type_str = f"Disadvantage {rolls}"
-        
+    if manual_roll_total is not None:
+        total = manual_roll_total
+        base_roll = "Manual"
+        roll_type_str = "manually"
+        bonus_str = ""
+        total_mod = 0 # Included in manual string
     else:
-        # This catches standard rolls AND canceled out Adv/Dis rolls
-        base_roll = rolls[0]
-        roll_type_str = "normally"
-        if luck_points_used > 0 and disadvantage:
-            roll_type_str += f" {rolls} (Disadvantage canceled by Luck)"
+        if luck_points_used > 0:
+            advantage = True  # In 5.5e, Luck explicitly grants Advantage
             
-    # --- 3. RESOLVE BONUS DICE (Bless/Bane) ---
-    bonus_total = 0
-    bonus_str = ""
-    if bonus_dice:
-        match = re.match(r"([+-]?)\s*(\d+)d(\d+)", bonus_dice.strip().lower())
-        if match:
-            sign, num, sides = match.group(1) or '+', int(match.group(2)), int(match.group(3))
-            b_rolls = [random.randint(1, sides) for _ in range(num)]
-            bonus_total = sum(b_rolls) if sign != '-' else -sum(b_rolls)
-            bonus_str = f" + [{bonus_dice}: {bonus_total}]"
+        num_d20s = 1
+        if advantage or disadvantage: 
+            num_d20s = 2
+        if advantage and disadvantage: 
+            num_d20s = 1  # They perfectly cancel each other out
+            
+        rolls = [random.randint(1, 20) for _ in range(num_d20s)]
         
-    total = base_roll + total_mod + bonus_total
+        # --- 2. EVALUATE FINAL POOL ---
+        if advantage and not disadvantage:
+            base_roll = max(rolls)
+            roll_type_str = f"Advantage {rolls}"
+            if luck_points_used > 0: 
+                roll_type_str += " (via Luck)"
+                
+        elif disadvantage and not advantage:
+            base_roll = min(rolls)
+            roll_type_str = f"Disadvantage {rolls}"
+            
+        else:
+            # This catches standard rolls AND canceled out Adv/Dis rolls
+            base_roll = rolls[0]
+            roll_type_str = "normally"
+            if luck_points_used > 0 and disadvantage:
+                roll_type_str += f" {rolls} (Disadvantage canceled by Luck)"
+                
+        # --- 3. RESOLVE BONUS DICE (Bless/Bane) ---
+        bonus_total = 0
+        bonus_str = ""
+        if bonus_dice:
+            match = re.match(r"([+-]?)\s*(\d+)d(\d+)", bonus_dice.strip().lower())
+            if match:
+                sign, num, sides = match.group(1) or '+', int(match.group(2)), int(match.group(3))
+                b_rolls = [random.randint(1, sides) for _ in range(num)]
+                bonus_total = sum(b_rolls) if sign != '-' else -sum(b_rolls)
+                bonus_str = f" + [{bonus_dice}: {bonus_total}]"
+            
+        total = base_roll + total_mod + bonus_total
     
     # Query Environmental Lighting to alert the DM for Stealth and Perception checks
     illum_alert = ""
@@ -1358,7 +1391,7 @@ def query_campaign_module(search_terms: list[str], current_chapter_context: str 
 
 
 @tool
-async def use_ability_or_spell(caster_name: str, ability_name: str, target_names: list[str], is_reaction: bool = False, is_legendary_action: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def use_ability_or_spell(caster_name: str, ability_name: str, target_names: list[str], is_reaction: bool = False, is_legendary_action: bool = False, manual_attack_roll: int = None, is_critical: bool = False, manual_saves: dict = None, force_auto_roll: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Use this tool whenever a character casts a spell or uses a class feature."""
     vault_path = config["configurable"].get("thread_id")
     caster = _get_entity_by_name(caster_name)
@@ -1376,6 +1409,26 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
     valid_targets = [t for t in targets if t]
     target_string = ", ".join([t.name for t in valid_targets]) or "themselves"
     
+    manual_saves = manual_saves or {}
+    requires_attack_roll = entry.mechanics.requires_attack_roll
+    is_caster_pc = any(t in caster.tags for t in ["pc", "player"])
+    
+    if requires_attack_roll and is_caster_pc and not force_auto_roll and manual_attack_roll is None:
+        auto_settings = get_roll_automations(caster.name)
+        if not auto_settings.get("attack_rolls", True):
+            return f"SYSTEM ALERT: {caster.name} has manual attack rolls enabled. Ask the player to roll the spell attack (including modifiers) and provide the total. Then call this tool again with `manual_attack_roll=X` (and `is_critical=True` if natural 20) or `force_auto_roll=True`."
+
+    save_required = entry.mechanics.save_required
+    if save_required:
+        missing_saves = []
+        for t in valid_targets:
+            if any(tag in t.tags for tag in ["pc", "player"]):
+                auto_settings = get_roll_automations(t.name)
+                if not auto_settings.get("saving_throws", True) and t.name not in manual_saves and not force_auto_roll:
+                    missing_saves.append(t.name)
+        if missing_saves:
+            return f"SYSTEM ALERT: The following players have manual saving throws enabled: {', '.join(missing_saves)}. Ask them to roll their {save_required} saving throws (including modifiers) and provide the totals. Then call this tool again with `manual_saves={{'PlayerName': 15, ...}}` or `force_auto_roll=True`."
+
     current_init = await _get_current_combat_initiative(vault_path)
     event = GameEvent(
         event_type="SpellCast",
@@ -1384,7 +1437,10 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
             "ability_name": ability_name,
             "mechanics": entry.mechanics.model_dump(),
             "target_uuids": [t.entity_uuid for t in valid_targets],
-            "current_initiative": current_init
+            "current_initiative": current_init,
+            "manual_attack_roll": manual_attack_roll,
+            "is_critical": is_critical,
+            "manual_saves": manual_saves
         }
     )
     
@@ -1621,11 +1677,12 @@ async def interact_with_object(character_name: str, target_label: str, interacti
 async def trigger_environmental_hazard(
     hazard_name: str, 
     target_names: list[str] = None,
-    origin_x: float = None, origin_y: float = None, radius: float = None,
+    origin_x: Optional[float] = None, origin_y: Optional[float] = None, radius: Optional[float] = None,
     requires_attack_roll: bool = False, attack_bonus: int = 5,
     save_required: str = "", save_dc: int = 15,
     damage_dice: str = "", damage_type: str = "", half_damage_on_save: bool = True,
     condition_applied: str = "",
+    manual_attack_roll: int = None, is_critical: bool = False, manual_saves: dict = None, force_auto_roll: bool = False,
     *, config: Annotated[RunnableConfig, InjectedToolArg]
 ) -> str:
     """
@@ -1633,6 +1690,7 @@ async def trigger_environmental_hazard(
     You can target specific entities OR an area (using origin_x, origin_y, radius).
     Automatically resolves attack rolls or saving throws, applies damage/conditions, and checks concentration.
     """
+    manual_saves = manual_saves or {}
     if target_names is None: target_names = []
     
     target_uuids = set()
@@ -1646,6 +1704,17 @@ async def trigger_environmental_hazard(
         
     if not target_uuids:
         return f"MECHANICAL TRUTH: {hazard_name} triggered, but no valid targets were in range."
+        
+    if save_required:
+        missing_saves = []
+        for t_uuid in target_uuids:
+            ent = BaseGameEntity.get(t_uuid)
+            if ent and any(tag in ent.tags for tag in ["pc", "player"]):
+                auto_settings = get_roll_automations(ent.name)
+                if not auto_settings.get("saving_throws", True) and ent.name not in manual_saves and not force_auto_roll:
+                    missing_saves.append(ent.name)
+        if missing_saves:
+            return f"SYSTEM ALERT: The following players have manual saving throws enabled: {', '.join(missing_saves)}. Ask them to roll their {save_required} saving throws (including modifiers) and provide the totals. Then call this tool again with `manual_saves={{'PlayerName': 15, ...}}` or `force_auto_roll=True`."
 
     trap_source = Creature(
         name=hazard_name,
@@ -1677,7 +1746,10 @@ async def trigger_environmental_hazard(
             "ability_name": hazard_name,
             "mechanics": mechanics,
             "target_uuids": list(target_uuids),
-            "current_initiative": current_init
+            "current_initiative": current_init,
+            "manual_attack_roll": manual_attack_roll,
+            "is_critical": is_critical,
+            "manual_saves": manual_saves
         }
     )
     
@@ -1818,6 +1890,72 @@ async def toggle_condition(character_name: str, condition_name: str, is_active: 
     return result_msg
 
 @tool
+async def manage_skill_challenge(action: str, name: str = "", max_successes: int = 3, max_failures: int = 3, successes_delta: int = 0, failures_delta: int = 0, note: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Manages a Skill Challenge or Progress Clock for complex non-combat encounters (chases, negotiations, puzzles).
+    - action: 'start', 'update', or 'end'.
+    - name: The title of the challenge (required for 'start').
+    - max_successes / max_failures: The threshold to win or lose (used in 'start').
+    - successes_delta / failures_delta: Add to the current totals (used in 'update').
+    - note: A brief log of what happened (e.g. "Rogue successfully picked the lock (+1 Success)").
+    """
+    vault_path = config["configurable"].get("thread_id")
+    j_dir = get_journals_dir(vault_path)
+    file_path = os.path.join(j_dir, "ACTIVE_CHALLENGE.md")
+
+    if action.lower() == "start":
+        yaml_data = {
+            "tags": ["challenge_whiteboard"],
+            "challenge_name": name,
+            "successes": 0, "max_successes": max_successes,
+            "failures": 0, "max_failures": max_failures,
+            "history": [note] if note else []
+        }
+        dataview_js = (
+            "```dataviewjs\nconst p = dv.current(); if (!p) return;\n"
+            "dv.header(2, `⏱️ Skill Challenge: ${p.challenge_name}`);\n"
+            "dv.paragraph(`**Successes:** ${p.successes} / ${p.max_successes} 🟩`);\n"
+            "dv.paragraph(`**Failures:** ${p.failures} / ${p.max_failures} 🟥`);\n"
+            "if (p.history && p.history.length > 0) {\n    dv.header(3, \"📜 History\");\n    dv.list(p.history);\n}\n```\n"
+        )
+        yaml_str = yaml.dump(yaml_data, sort_keys=False, default_flow_style=False)
+        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+            await f.write(f"---\n{yaml_str}---\n\n{dataview_js}")
+        return f"MECHANICAL TRUTH: Skill Challenge '{name}' started. Target: {max_successes} Successes before {max_failures} Failures."
+
+    elif action.lower() == "update":
+        if not os.path.exists(file_path): return "SYSTEM ERROR: No active skill challenge found. Use action='start' first."
+        try:
+            async with edit_markdown_entity(file_path) as state:
+                yaml_data = state["yaml_data"]
+                yaml_data["successes"] += successes_delta
+                yaml_data["failures"] += failures_delta
+                if note: yaml_data.setdefault("history", []).append(note)
+                s, ms = yaml_data["successes"], yaml_data["max_successes"]
+                f, mf = yaml_data["failures"], yaml_data["max_failures"]
+                
+                outcome = "VICTORY" if s >= ms else ("DEFEAT" if f >= mf else "")
+        except Exception as e: return str(e)
+        
+        if outcome:
+            return f"MECHANICAL TRUTH: Challenge updated. [{s}/{ms} Successes] | [{f}/{mf} Failures]. SYSTEM ALERT: The challenge has reached a {outcome} condition! Use manage_skill_challenge(action='end') to close it out and resolve the narrative consequences."
+        return f"MECHANICAL TRUTH: Challenge updated. [{s}/{ms} Successes] | [{f}/{mf} Failures]. Log: {note}"
+
+    elif action.lower() == "end":
+        if not os.path.exists(file_path): return "SYSTEM ERROR: No active skill challenge found."
+        try:
+            async with read_markdown_entity(file_path) as (yaml_data, _):
+                s, f, c_name = yaml_data.get("successes", 0), yaml_data.get("failures", 0), yaml_data.get("challenge_name", "Challenge")
+        except Exception: s, f, c_name = 0, 0, "Unknown"
+
+        os.remove(file_path)
+        summary = f"Completed Skill Challenge: '{c_name}' with {s} Successes and {f} Failures. {note}"
+        await upsert_journal_section.ainvoke({"entity_name": "CAMPAIGN_MASTER", "section_header": "Major Milestones (Event Log)", "content": f"- {summary}", "mode": "append"}, config)
+        return f"MECHANICAL TRUTH: Skill Challenge '{c_name}' ended and removed from whiteboard. Event logged to CAMPAIGN_MASTER."
+        
+    return "SYSTEM ERROR: Invalid action. Use 'start', 'update', or 'end'."
+
+@tool
 async def execute_grapple_or_shove(attacker_name: str, target_name: str, action_type: str, shove_type: str = "prone", throw_distance: float = 10.0, advantage: bool = False, disadvantage: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
     Resolves a contested Athletics check for a Grapple, Shove, or Throw. action_type must be 'grapple', 'shove', or 'throw'.
@@ -1870,3 +2008,86 @@ async def execute_grapple_or_shove(attacker_name: str, target_name: str, action_
         log += "Defender wins! Nothing happens."
         
     return f"MECHANICAL TRUTH: {log}"
+
+@tool
+async def generate_random_loot(challenge_rating: int = 1, loot_type: str = "hoard", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Generates random D&D loot based on Challenge Rating (CR) and loot type ('individual' or 'hoard').
+    Returns a formatted string of generated currency and items.
+    Use this ONLY for improvising unscripted, homebrew rooms or random encounters. Do NOT use if the campaign module explicitly specifies the loot.
+    """
+    cp, sp, ep, gp, pp = 0, 0, 0, 0, 0
+    items = []
+    
+    cr = challenge_rating
+    if loot_type.lower() == "individual":
+        if cr <= 4:
+            roll = random.randint(1, 100)
+            if roll <= 30: cp = sum(random.randint(1, 6) for _ in range(5))
+            elif roll <= 60: sp = sum(random.randint(1, 6) for _ in range(4))
+            elif roll <= 70: ep = sum(random.randint(1, 6) for _ in range(3))
+            elif roll <= 95: gp = sum(random.randint(1, 6) for _ in range(3))
+            else: pp = sum(random.randint(1, 6) for _ in range(1))
+        elif cr <= 10:
+            roll = random.randint(1, 100)
+            if roll <= 30: cp, ep = sum(random.randint(1, 6) for _ in range(4)) * 100, sum(random.randint(1, 6) for _ in range(1)) * 10
+            elif roll <= 60: sp, gp = sum(random.randint(1, 6) for _ in range(6)) * 10, sum(random.randint(1, 6) for _ in range(2)) * 10
+            elif roll <= 70: ep, gp = sum(random.randint(1, 6) for _ in range(3)) * 10, sum(random.randint(1, 6) for _ in range(2)) * 10
+            elif roll <= 95: gp = sum(random.randint(1, 6) for _ in range(4)) * 10
+            else: gp, pp = sum(random.randint(1, 6) for _ in range(2)) * 10, sum(random.randint(1, 6) for _ in range(3))
+        else: # 11+
+            gp = sum(random.randint(1, 6) for _ in range(4)) * 100
+            pp = sum(random.randint(1, 6) for _ in range(1)) * 10
+    else: # Hoard
+        if cr <= 4:
+            cp, sp, gp = sum(random.randint(1, 6) for _ in range(6)) * 100, sum(random.randint(1, 6) for _ in range(3)) * 100, sum(random.randint(1, 6) for _ in range(2)) * 10
+            roll = random.randint(1, 100)
+            if 37 <= roll <= 78: items.append(f"10gp Gem (x{random.randint(2, 12)})")
+            elif 79 <= roll <= 100: items.append(f"25gp Art Object (x{random.randint(2, 8)})")
+            if roll > 50: items.append("Potion of Healing")
+            if roll > 90: items.append(random.choice(["+1 Weapon", "Bag of Holding", "Wand of Magic Missiles"]))
+        elif cr <= 10:
+            cp, sp = sum(random.randint(1, 6) for _ in range(2)) * 100, sum(random.randint(1, 6) for _ in range(2)) * 1000
+            gp, pp = sum(random.randint(1, 6) for _ in range(6)) * 100, sum(random.randint(1, 6) for _ in range(3)) * 10
+            roll = random.randint(1, 100)
+            if 29 <= roll <= 68: items.append(f"50gp Gem (x{random.randint(3, 18)})")
+            elif 69 <= roll <= 100: items.append(f"250gp Art Object (x{random.randint(2, 8)})")
+            if roll > 60: items.append(random.choice(["Potion of Greater Healing", "Scroll of Fireball"]))
+            if roll > 80: items.append(random.choice(["+2 Weapon", "Cloak of Displacement", "Ring of Protection"]))
+        else: # 11+
+            gp, pp = sum(random.randint(1, 6) for _ in range(4)) * 1000, sum(random.randint(1, 6) for _ in range(5)) * 100
+            items.append(random.choice(["1000gp Gem", "2500gp Art Object"]) + f" (x{random.randint(1, 4)})")
+            items.append(random.choice(["+3 Weapon", "Staff of Power", "Robe of the Archmagi"]))
+
+    loot_str = []
+    for cur, name in [(pp, "pp"), (gp, "gp"), (ep, "ep"), (sp, "sp"), (cp, "cp")]:
+        if cur > 0: loot_str.append(f"{cur} {name}")
+        
+    res = "Loot Generated:\n- Currency: " + (", ".join(loot_str) if loot_str else "None")
+    if items: res += "\n- Items: " + ", ".join(items)
+        
+    await write_audit_log(config["configurable"].get("thread_id"), "Rules Engine", "Generated Random Loot", res)
+    return f"MECHANICAL TRUTH: {res}\nDM DIRECTIVE: Describe the characters finding this loot. If they take it, use `manage_inventory` to add the currency/items to their sheets."
+
+@tool
+async def ingest_battlemap_json(map_json_str: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Parses a complete JSON map payload (generated by the Vision Map Ingestion model) 
+    and natively bulk-loads all walls, terrain, and lights into the Spatial Engine.
+    """
+    import json
+    from spatial_engine import MapData
+    try:
+        # Clean markdown code blocks if the LLM wrapped the JSON payload
+        clean_json = map_json_str.strip()
+        if clean_json.startswith("```json"): clean_json = clean_json[7:]
+        elif clean_json.startswith("```"): clean_json = clean_json[3:]
+        if clean_json.endswith("```"): clean_json = clean_json[:-3]
+            
+        map_dict = json.loads(clean_json.strip())
+        new_map_data = MapData(**map_dict)
+        spatial_service.load_map(new_map_data)
+        
+        return f"MECHANICAL TRUTH: Successfully ingested battlemap. Loaded {len(new_map_data.walls)} walls, {len(new_map_data.terrain)} terrain zones, and {len(new_map_data.lights)} light sources."
+    except Exception as e:
+        return f"SYSTEM ERROR: Failed to parse or load map JSON. Details: {str(e)}"

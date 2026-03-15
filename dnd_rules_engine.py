@@ -22,6 +22,7 @@ class BaseGameEntity(BaseModel):
     """
     entity_uuid: uuid.UUID = Field(default_factory=uuid.uuid4)
     name: str
+    icon_url: str = ""
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0

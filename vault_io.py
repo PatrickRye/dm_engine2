@@ -15,10 +15,85 @@ from dnd_rules_engine import BaseGameEntity, Creature, ModifiableValue, MeleeWea
 from compendium_manager import CompendiumManager
 from spatial_engine import spatial_service
 from registry import clear_registry, get_all_entities
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage
+from prompts import VISION_MAP_INGESTION_PROMPT
+import base64
+import json
 
+async def auto_ingest_maps_from_vault(vault_path: str):
+    """
+    Scans the vault for images that look like battlemaps. 
+    If a .json sidecar doesn't exist, it uses the Vision API to extract geometry.
+    """
+    print("Scanning vault for un-processed battlemaps...")
+    vision_llm = None
+    
+    search_pattern = os.path.join(vault_path, "**", "*")
+    for filepath in glob.glob(search_pattern, recursive=True):
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in [".png", ".jpg", ".jpeg"] and "map" in os.path.basename(filepath).lower():
+            json_sidecar = f"{filepath}.json"
+            
+            if not os.path.exists(json_sidecar):
+                print(f"[Vision AI] Processing new map: {os.path.basename(filepath)}...")
+                if not vision_llm:
+                    vision_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
+                
+                try:
+                    with open(filepath, "rb") as image_file:
+                        image_data = base64.b64encode(image_file.read()).decode("utf-8")
+                        
+                    message = HumanMessage(
+                        content=[
+                            {"type": "text", "text": VISION_MAP_INGESTION_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/{ext[1:]};base64,{image_data}"},
+                            },
+                        ]
+                    )
+                    
+                    response = await vision_llm.ainvoke([message])
+                    
+                    # Clean markdown formatting from JSON output
+                    clean_json = response.content.strip()
+                    if clean_json.startswith("```json"): clean_json = clean_json[7:]
+                    elif clean_json.startswith("```"): clean_json = clean_json[3:]
+                    if clean_json.endswith("```"): clean_json = clean_json[:-3]
+                    
+                    map_dict = json.loads(clean_json.strip())
+                    
+                    # Attach the image paths
+                    map_dict["map_name"] = os.path.basename(filepath)
+                    if "player" in filepath.lower():
+                        map_dict["player_map_image_path"] = filepath
+                    else:
+                        map_dict["dm_map_image_path"] = filepath
+                        
+                    with open(json_sidecar, "w", encoding="utf-8") as f:
+                        json.dump(map_dict, f, indent=4)
+                        
+                    print(f"   -> Successfully extracted geometry to {os.path.basename(json_sidecar)}")
+                except Exception as e:
+                    print(f"   -> Failed to process {os.path.basename(filepath)}: {e}")
+                    
+            # Auto-load the first map we find into the active engine just for initialization
+            if not spatial_service.map_data.walls and os.path.exists(json_sidecar):
+                try:
+                    from spatial_engine import MapData
+                    with open(json_sidecar, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    spatial_service.load_map(MapData(**data))
+                    print(f"Loaded {os.path.basename(filepath)} into active spatial memory.")
+                except Exception: pass
 
 async def initialize_engine_from_vault(vault_path: str):
     """Reads characters and monsters from the vault into the Deterministic Engine."""
+    
+    # 1. Process Maps
+    await auto_ingest_maps_from_vault(vault_path)
+    
     print("Loading entities into Deterministic Engine...")
     clear_registry() # Reset memory for the new turn
     
@@ -38,6 +113,7 @@ async def initialize_engine_from_vault(vault_path: str):
                     x=float(yaml_data.get("x", 0.0)),
                     y=float(yaml_data.get("y", 0.0)),
                     z=float(yaml_data.get("z", 0.0)),
+                    icon_url=yaml_data.get("icon_url", ""),
                     height=float(yaml_data.get("height", yaml_data.get("size", 5.0))),
                     max_hp=int(yaml_data.get("max_hp", yaml_data.get("hp", 10))),
                     hp=ModifiableValue(base_value=yaml_data.get("hp", 10)),
@@ -58,7 +134,8 @@ async def initialize_engine_from_vault(vault_path: str):
                     legendary_actions_max=int(yaml_data.get("legendary_actions_max", yaml_data.get("legendary_actions", 0))),
                     legendary_actions_current=int(yaml_data.get("legendary_actions_current", yaml_data.get("legendary_actions", 0))),
                     speed=int(yaml_data.get("speed", 30)),
-                    movement_remaining=int(yaml_data.get("movement_remaining", yaml_data.get("speed", 30)))
+                    movement_remaining=int(yaml_data.get("movement_remaining", yaml_data.get("speed", 30))),
+                    tags=yaml_data.get("tags", [])
                 )
                 
                 # Bridge: Initialize and Equip the Object-Oriented Weapon
@@ -120,6 +197,8 @@ async def sync_engine_to_vault():
                 yaml_data["y"] = entity.y
                 yaml_data["z"] = entity.z
                 yaml_data["height"] = entity.height
+                if entity.icon_url:
+                    yaml_data["icon_url"] = entity.icon_url
                 if entity.resources:
                     yaml_data["resources"] = entity.resources
                 if entity.active_conditions:
