@@ -201,6 +201,11 @@ async def test_tool_modify_health_respects_resistances(mock_entities):
 @pytest.mark.asyncio
 async def test_tool_opportunity_attack_integration(mock_entities):
     """Tests that moving out of reach triggers an OA alert and execute_melee_attack resolves it as an async task."""
+    from main import app
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+
     vault_path, char_name, target_name = mock_entities
     await initialize_engine_from_vault(vault_path)
     config = {"configurable": {"thread_id": vault_path}}
@@ -215,12 +220,17 @@ async def test_tool_opportunity_attack_integration(mock_entities):
     spatial_service.sync_entity(goblin)
     
     # 1. Goblin moves away (triggers OA)
-    move_result = await move_entity.ainvoke({
-        "entity_name": target_name, "target_x": 15.0, "target_y": 0.0, "movement_type": "walk"
-    }, config=config)
+    request_data = {
+        "entity_name": target_name,
+        "waypoints": [[5.0, 0.0], [15.0, 0.0]],
+        "vault_path": vault_path
+    }
+    response = client.post("/propose_move", json=request_data)
+    assert response.status_code == 200
+    data = response.json()
     
-    assert "Opportunity Attacks from" in move_result
-    assert char_name in move_result
+    assert data["is_valid"] is True
+    assert char_name in data["opportunity_attacks"]
     
     # 2. Execute the Opportunity Attack
     with patch('random.randint', side_effect=[18, 18, 4]): # Attack roll 18, Damage roll 4

@@ -21,6 +21,7 @@ from langgraph.prebuilt import tools_condition
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 
+from shapely.geometry import LineString
 from state import DMState, QAResult
 from prompts import MASTER_PROMPT
 from vault_io import write_audit_log, upsert_journal_section, initialize_engine_from_vault, sync_engine_to_vault
@@ -41,7 +42,8 @@ MASTER_TOOLS_LIST = [
     use_ability_or_spell, encode_new_compendium_entry, drop_concentration,
     ready_action, clear_readied_action, move_entity, use_dash_action, manage_light_sources, 
     toggle_condition, execute_grapple_or_shove, manage_map_geometry, trigger_environmental_hazard,
-    interact_with_object, manage_map_trap, manage_skill_challenge, generate_random_loot, ingest_battlemap_json
+    interact_with_object, manage_map_trap, manage_skill_challenge, generate_random_loot, ingest_battlemap_json,
+    discover_trap
 ]
 
 # 1. INITIALIZE THE APP FIRST
@@ -375,6 +377,17 @@ class OOCMoveRequest(BaseModel):
     y: float
     vault_path: str
 
+class ProposeMoveRequest(BaseModel):
+    entity_name: str
+    waypoints: list[tuple[float, float]]
+    vault_path: str
+
+class ProposeMoveResponse(BaseModel):
+    is_valid: bool
+    opportunity_attacks: list[str] = Field(default_factory=list)
+    traps_triggered: list[str] = Field(default_factory=list)
+    alternative_path: list[tuple[float, float]] = Field(default_factory=list)
+
 @app.post("/ooc_move_entity")
 async def ooc_move_entity_endpoint(request: OOCMoveRequest):
     """OOC wrapper for the DM to drag and drop tokens without triggering combat rules."""
@@ -403,6 +416,67 @@ async def ooc_move_entity_endpoint(request: OOCMoveRequest):
                         c["x"], c["y"] = entity.x, entity.y
         except Exception: pass
     return {"status": "success", "x": entity.x, "y": entity.y}
+
+@app.post("/propose_move", response_model=ProposeMoveResponse)
+async def propose_move_endpoint(request: ProposeMoveRequest):
+    """Analyzes a proposed movement path for collisions, opportunity attacks, and traps."""
+    from registry import get_entity_by_name, get_all_entities
+
+    entity = get_entity_by_name(request.entity_name)
+    if not entity:
+        raise HTTPException(status_code=404, detail="Entity not found")
+
+    is_valid = True
+    opportunity_attacks = []
+    traps_triggered = []
+    alternative_path = []
+    
+    pixels_per_foot = spatial_service.map_data.pixels_per_foot or 15
+    foot_waypoints = [(p[0] / pixels_per_foot, p[1] / pixels_per_foot) for p in request.waypoints]
+
+    # 1. Check for path collisions
+    for i in range(len(foot_waypoints) - 1):
+        start = foot_waypoints[i]
+        end = foot_waypoints[i+1]
+        collision = spatial_service.check_path_collision(start[0], start[1], entity.z, end[0], end[1], entity.z)
+        if collision:
+            is_valid = False
+            # Basic alternative path: just go around the wall
+            # A* pathfinding would be a better long-term solution here
+            alternative_path = [start, (collision.start[0] - 5, collision.start[1] - 5), end]
+            break
+
+    # 2. Check for opportunity attacks
+    if is_valid:
+        all_entities = get_all_entities()
+        for other_entity in all_entities.values():
+            if other_entity.entity_uuid != entity.entity_uuid and hasattr(other_entity, 'hp') and other_entity.hp.base_value > 0:
+                for i in range(len(foot_waypoints) - 1):
+                    start = foot_waypoints[i]
+                    end = foot_waypoints[i+1]
+                    dist = spatial_service.calculate_distance(start[0], start[1], 0, other_entity.x, other_entity.y, 0)
+                    if dist <= 5: # 5 feet for opportunity attack
+                        opportunity_attacks.append(other_entity.name)
+                        break
+    
+    # 3. Check for known traps
+    # This would require a way to know which traps are "known" to the player.
+    for wall in spatial_service.map_data.active_walls:
+        if wall.trap and wall.trap.known_by_players:
+            for i in range(len(foot_waypoints) - 1):
+                start = foot_waypoints[i]
+                end = foot_waypoints[i+1]
+                path = LineString([start, end])
+                if path.intersects(wall.line):
+                    traps_triggered.append(wall.trap.hazard_name)
+                    break
+
+    return ProposeMoveResponse(
+        is_valid=is_valid,
+        opportunity_attacks=list(set(opportunity_attacks)),
+        traps_triggered=list(set(traps_triggered)),
+        alternative_path=alternative_path,
+    )
 
 @app.post("/characters")
 async def list_characters_endpoint(request: VaultRequest):
@@ -488,8 +562,27 @@ async def map_state_endpoint(request: VaultRequest):
                 "is_pc": is_pc, "hp": ent.hp.base_value if hasattr(ent, 'hp') else 0,
                 "icon_url": icon_path
             })
+
+    known_traps = []
+    for wall in md.active_walls:
+        if wall.trap and wall.trap.known_by_players:
+            known_traps.append({
+                "x": (wall.start[0] + wall.end[0]) / 2,
+                "y": (wall.start[1] + wall.end[1]) / 2,
+                "name": wall.trap.hazard_name,
+            })
+
+    for terrain in md.active_terrain:
+        if terrain.trap and terrain.trap.known_by_players:
+            x = sum(p[0] for p in terrain.points) / len(terrain.points)
+            y = sum(p[1] for p in terrain.points) / len(terrain.points)
+            known_traps.append({
+                "x": x,
+                "y": y,
+                "name": terrain.trap.hazard_name,
+            })
             
-    return {"map_data": md.model_dump(), "entities": entities}
+    return {"map_data": md.model_dump(), "entities": entities, "known_traps": known_traps}
 
 @app.post("/heartbeat")
 async def heartbeat_endpoint(request: HeartbeatRequest):

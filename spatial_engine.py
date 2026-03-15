@@ -33,6 +33,7 @@ class TrapDefinition(BaseModel):
     trigger_on_move: bool = False
     radius: float = 0.0
     is_active: bool = True
+    known_by_players: bool = False
 
 class Wall(BaseModel):
     wall_id: uuid.UUID = Field(default_factory=uuid.uuid4)
@@ -95,6 +96,7 @@ class MapData(BaseModel):
     temporary_lights: List[LightSource] = Field(default_factory=list)
     
     grid_scale: float = 5.0 # 1 square = 5ft
+    pixels_per_foot: float = 15.0 # 15 pixels = 1ft
     distance_metric: str = "chebyshev" # "chebyshev" or "euclidean"
 
     @property

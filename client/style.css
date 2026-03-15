@@ -99,3 +99,28 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 /* Default Perspective Styles - Controlled Dynamically by JS */
 .perspective { display: none; margin: 10px 0; padding: 10px; border-left: 3px solid #7289da; background: rgba(114, 137, 218, 0.1); border-radius: 4px; }
 .perspective[data-target="ALL"] { display: block; border-left: none; background: transparent; padding: 0; }
+
+.move-confirmation-dialog {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 20px;
+    z-index: 1000;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+}
+
+.move-confirmation-dialog h3 {
+    margin-top: 0;
+}
+
+.move-confirmation-dialog p {
+    margin-bottom: 10px;
+}
+
+.move-confirmation-dialog button {
+    margin-right: 10px;
+}

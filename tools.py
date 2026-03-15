@@ -1828,6 +1828,26 @@ async def manage_map_trap(target_label: str, hazard_name: str, trigger_on_intera
     return f"MECHANICAL TRUTH: Successfully trapped '{target.label}' with '{hazard_name}'."
 
 @tool
+async def discover_trap(target_label: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """Marks a trap as 'known_by_players' after it has been successfully detected."""
+    target = None
+    for w in spatial_service.map_data.active_walls:
+        if target_label.lower() in w.label.lower():
+            target = w
+            break
+    if not target:
+        for t in spatial_service.map_data.active_terrain:
+            if target_label.lower() in t.label.lower():
+                target = t
+                break
+                
+    if not target or not target.trap:
+        return f"SYSTEM ERROR: No trap found on object '{target_label}'."
+        
+    target.trap.known_by_players = True
+    return f"MECHANICAL TRUTH: The trap on '{target.label}' is now known to the players."
+
+@tool
 async def toggle_condition(character_name: str, condition_name: str, is_active: bool, source_character_name: str = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Applies or removes a condition (e.g. 'Hidden', 'Prone', 'Poisoned') from an entity's sheet."""
     vault_path = config["configurable"].get("thread_id")

@@ -91,7 +91,7 @@ Your task is to analyze the provided battlemap image (e.g., .png) and extract de
 COORDINATE SYSTEM:
 1. Origin (0,0) is the TOP-LEFT corner of the map.
 2. X-axis extends to the right. Y-axis extends downward.
-3. Grid Scale: Determine the pixels-per-grid-square ratio. You MUST convert all final coordinates from pixels into feet. Assume 1 square = 5ft.
+3. Grid Scale: First, scan the entire map image for a written scale legend (e.g., "1 square = 10 feet", "1 inch = 50 miles"). This is your primary source of truth. If no written scale is found, then determine the pixels-per-grid-square ratio from any visible grid. If there is no grid, assume 1 square = 5ft for tactical maps. You MUST convert all final coordinates from pixels into feet.
 
 EXTRACTION RULES:
 1. Extract Walls & Doors: Output line segments (start_x, start_y, end_x, end_y) in feet.
@@ -105,6 +105,7 @@ EXTRACTION RULES:
 OUTPUT FORMAT (Strict JSON):
 {
   "grid_scale": 5.0,
+  "pixels_per_foot": 15.0,
   "walls": [ {"label": "stone wall", "start": [0.0, 0.0], "end": [0.0, 20.0], "z": 0.0, "height": 20.0, "is_solid": true, "is_visible": true, "is_locked": false, "interact_dc": null} ],
   "terrain": [ {"label": "mud", "points": [[10.0,10.0], [20.0,10.0], [20.0,20.0], [10.0,20.0]], "z": 0.0, "height": 0.0, "is_difficult": true} ],
   "lights": [ {"label": "torch", "x": 15.0, "y": 15.0, "z": 5.0, "bright_radius": 20.0, "dim_radius": 40.0} ]
