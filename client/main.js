@@ -249,6 +249,9 @@ async onOpen() {
                 const data = await response.json();
                 this.updateRadioUI(data.locked_characters || []);
                 this.setConnectionStatus(true);
+                
+                this.fetchCharacterSheet();
+                this.fetchMaps();
             } else {
                 this.setConnectionStatus(false);
             }
@@ -267,6 +270,247 @@ async onOpen() {
             this.statusIndicator.textContent = "🔴 Disconnected";
             this.statusIndicator.style.color = "var(--text-error, #dc3545)";
         }
+    }
+
+    async fetchCharacterSheet() {
+        try {
+            const res = await fetch(`${this.serverUrl}/character_sheet`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ vault_path: this.app.vault.adapter.getBasePath(), character: this.activeCharacter })
+            });
+            if (res.ok) {
+                const data = await res.json();
+                this.renderCharacterSheet(data);
+            }
+        } catch(e) {}
+    }
+    
+    async fetchMaps() {
+        if (this.isMapDragging) return; // Don't interrupt a drag with a background refresh
+        try {
+            const res = await fetch(`${this.serverUrl}/map_state`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ vault_path: this.app.vault.adapter.getBasePath() })
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (!this.isMapDragging) this.renderMaps(data);
+            }
+        } catch(e) {}
+    }
+
+    renderCharacterSheet(data) {
+        if (!data || data.error) {
+            this.viewSheet.innerHTML = `<div style="color:var(--text-error);">${data ? data.error : "Failed to load sheet."}</div>`;
+            return;
+        }
+        const s = data.sheet;
+        const hp = s.hp !== undefined ? s.hp : "?";
+        const maxHp = s.max_hp !== undefined ? s.max_hp : "?";
+        const conds = s.active_conditions ? s.active_conditions.map(c => c.name).join(", ") : "None";
+        const equip = s.equipment ? Object.entries(s.equipment).map(([k,v]) => `<li><b>${k.replace('_',' ')}</b>: ${v}</li>`).join("") : "None";
+        const res = s.resources ? Object.entries(s.resources).map(([k,v]) => `<li><b>${k}</b>: ${v}</li>`).join("") : "None";
+        
+        this.viewSheet.innerHTML = `
+            <h2 style="margin-top:0;">${s.name}</h2>
+            <div style="display:flex; gap:10px; margin-bottom:15px;">
+                <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; text-align:center;"><b>HP</b><br><span style="font-size:1.5em; color:var(--text-success);">${hp} / ${maxHp}</span></div>
+                <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; text-align:center;"><b>AC</b><br><span style="font-size:1.5em;">${s.ac || 10}</span></div>
+            </div>
+            <p><b>Conditions:</b> <span style="color:var(--text-error);">${conds}</span></p>
+            <p><b>Spell Slots:</b> ${s.spell_slots || "N/A"}</p>
+            <p><b>Attunement:</b> ${s.attunement_slots || "0/3"}</p>
+            <h4 style="margin-bottom:5px;">Resources</h4><ul style="margin-top:0;">${res}</ul>
+            <h4 style="margin-bottom:5px;">Equipment</h4><ul style="margin-top:0;">${equip}</ul>
+        `;
+    }
+
+    renderMaps(data) {
+        this.viewMaps.empty();
+        if (!data || !data.map_data || (!data.map_data.walls.length && !data.map_data.dm_map_image_path)) {
+            this.viewMaps.createEl("p", { text: "No active maps loaded in engine.", style: "color:var(--text-muted);" });
+            return;
+        }
+        
+        const mapData = data.map_data;
+        const entities = data.entities || [];
+
+        let imagePath = null;
+        if (this.activeCharacter === "Human DM") {
+            imagePath = mapData.dm_map_image_path || mapData.player_map_image_path;
+        } else {
+            imagePath = mapData.player_map_image_path || mapData.dm_map_image_path;
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = 1600; // Arbitrary bounds, can be scrolled within the tab
+        canvas.height = 1600;
+        canvas.style.backgroundColor = "var(--background-modifier-form-field)";
+        canvas.style.borderRadius = "4px";
+        this.viewMaps.appendChild(canvas);
+
+        const ctx = canvas.getContext('2d');
+        const SCALE = 15; // 15 pixels per foot. A 5ft square = 75px.
+
+        let bgImageRef = null;
+        const drawScene = (bgImg) => {
+            bgImageRef = bgImg || bgImageRef;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            if (bgImageRef) ctx.drawImage(bgImageRef, 0, 0);
+
+            // Draw Grid
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+            ctx.lineWidth = 1;
+            for (let i = 0; i < canvas.width; i += SCALE * mapData.grid_scale) {
+                ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, canvas.height); ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(canvas.width, i); ctx.stroke();
+            }
+
+            // Draw Fog of War Mask
+            if (this.activeCharacter !== "Human DM") {
+                ctx.fillStyle = "rgba(0, 0, 0, 0.98)"; // Players see solid black
+            } else {
+                ctx.fillStyle = "rgba(0, 0, 50, 0.4)"; // DM sees a faint blue tint for unexplored areas
+            }
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            ctx.globalCompositeOperation = 'destination-out';
+            (mapData.explored_areas || []).forEach(area => {
+                const [x, y, radius] = area;
+                ctx.beginPath();
+                ctx.arc(x * SCALE, y * SCALE, radius * SCALE, 0, Math.PI * 2);
+                ctx.fill(); // Punch a transparent hole through the Fog of War!
+            });
+            ctx.globalCompositeOperation = 'source-over';
+
+            // Draw Walls
+            const activeWalls = [...(mapData.walls || []), ...(mapData.temporary_walls || [])];
+            activeWalls.forEach(wall => {
+                ctx.beginPath();
+                ctx.moveTo(wall.start[0] * SCALE, wall.start[1] * SCALE);
+                ctx.lineTo(wall.end[0] * SCALE, wall.end[1] * SCALE);
+                
+                if (!wall.is_solid && wall.is_visible) {
+                    ctx.strokeStyle = "rgba(40, 167, 69, 0.6)"; // Open door (Green)
+                    ctx.lineWidth = 4;
+                } else if (!wall.is_visible) {
+                    ctx.strokeStyle = "rgba(0, 150, 255, 0.4)"; // Window/Glass (Blue)
+                    ctx.lineWidth = 2;
+                } else {
+                    ctx.strokeStyle = "rgba(220, 53, 69, 0.8)"; // Solid wall (Red)
+                    ctx.lineWidth = 3;
+                }
+                ctx.stroke();
+            });
+
+            // Draw Entities
+            entities.forEach(ent => {
+                if (ent.hp <= 0) return;
+
+                const px = ent.x * SCALE;
+                const py = ent.y * SCALE;
+                const pRadius = (ent.size / 2) * SCALE;
+
+                // Enforce FoW visibility for players looking at NPCs
+                if (this.activeCharacter !== "Human DM" && !ent.is_pc) {
+                    let isRevealed = false;
+                    for (const area of mapData.explored_areas || []) {
+                        if (Math.hypot(ent.x - area[0], ent.y - area[1]) <= area[2]) { isRevealed = true; break; }
+                    }
+                    if (!isRevealed) return; // Do not draw hidden monsters!
+                }
+
+                ctx.beginPath();
+                ctx.arc(px, py, pRadius, 0, Math.PI * 2);
+                
+                if (ent.icon_url) {
+                    if (this.loadedImages[ent.icon_url]) {
+                        ctx.save();
+                        ctx.clip(); // Mask the image inside the circle
+                        ctx.drawImage(this.loadedImages[ent.icon_url], px - pRadius, py - pRadius, pRadius * 2, pRadius * 2);
+                        ctx.restore();
+                    } else {
+                        const img = new Image();
+                        img.onload = () => { this.loadedImages[ent.icon_url] = img; drawScene(bgImageRef); };
+                        img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(ent.icon_url)}`;
+                        ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; ctx.fill(); // Fallback color while loading
+                    }
+                } else {
+                    ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; // Blue for PCs, Red for Monsters
+                    ctx.fill();
+                }
+                
+                ctx.strokeStyle = "#ffffff";
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                ctx.fillStyle = "white";
+                ctx.font = "bold 12px sans-serif";
+                ctx.textAlign = "center";
+                ctx.fillText(ent.name, px, py - pRadius - 5);
+            });
+        };
+
+        if (imagePath) {
+            if (this.loadedImages[imagePath]) {
+                drawScene(this.loadedImages[imagePath]);
+            } else {
+                const img = new Image();
+                img.onload = () => {
+                    this.loadedImages[imagePath] = img;
+                    drawScene(img);
+                };
+                img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(imagePath)}`;
+            }
+        } else {
+            drawScene(null);
+        }
+
+        // --- DRAG AND DROP LOGIC ---
+        canvas.addEventListener('mousedown', (e) => {
+            if (this.activeCharacter !== "Human DM") return;
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
+            const mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+            // Check collision backwards (top-most drawn entity selected first)
+            for (let i = entities.length - 1; i >= 0; i--) {
+                const ent = entities[i];
+                if (ent.hp <= 0) continue;
+                if (Math.hypot(mouseX - (ent.x * SCALE), mouseY - (ent.y * SCALE)) <= (ent.size / 2) * SCALE) {
+                    this.isMapDragging = true;
+                    canvas.draggedEntity = ent;
+                    break;
+                }
+            }
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (this.isMapDragging && canvas.draggedEntity) {
+                const rect = canvas.getBoundingClientRect();
+                canvas.draggedEntity.x = ((e.clientX - rect.left) * (canvas.width / rect.width)) / SCALE;
+                canvas.draggedEntity.y = ((e.clientY - rect.top) * (canvas.height / rect.height)) / SCALE;
+                drawScene(bgImageRef); // Live re-render
+            }
+        });
+
+        const stopDrag = async () => {
+            if (this.isMapDragging && canvas.draggedEntity) {
+                const ent = canvas.draggedEntity;
+                this.isMapDragging = false;
+                canvas.draggedEntity = null;
+                try {
+                    await fetch(`${this.serverUrl}/ooc_move_entity`, {
+                        method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ vault_path: this.app.vault.adapter.getBasePath(), entity_name: ent.name, x: ent.x, y: ent.y })
+                    });
+                } catch(err) { console.error("Failed to move entity", err); }
+            }
+        };
+
+        canvas.addEventListener('mouseup', stopDrag);
+        canvas.addEventListener('mouseout', stopDrag);
     }
 
     updateRadioUI(lockedCharacters) {

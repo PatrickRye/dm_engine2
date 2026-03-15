@@ -7,6 +7,7 @@ let listenController = null;
 let pollInterval = null;
 let availableCharacters = new Set(["Human DM"]);
 const loadedImages = {}; // Cache for map background images
+let isMapDragging = false;
 
 const rollAutomations = {
     hidden_rolls: true,
@@ -167,6 +168,7 @@ async function fetchCharacterSheet() {
 }
 
 async function fetchMaps() {
+    if (isMapDragging) return;
     try {
         const res = await fetch(`${serverUrl}/map_state`, {
             method: "POST", headers: { "Content-Type": "application/json" },
@@ -174,7 +176,7 @@ async function fetchMaps() {
         });
         if (res.ok) {
             const data = await res.json();
-            renderMaps(data);
+            if (!isMapDragging) renderMaps(data);
         }
     } catch(e) {}
 }
@@ -232,9 +234,11 @@ function renderMaps(data) {
     const ctx = canvas.getContext('2d');
     const SCALE = 15; 
 
+    let bgImageRef = null;
     const drawScene = (bgImg) => {
+        bgImageRef = bgImg || bgImageRef;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        if (bgImg) ctx.drawImage(bgImg, 0, 0);
+        if (bgImageRef) ctx.drawImage(bgImageRef, 0, 0);
 
         ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
         ctx.lineWidth = 1;
@@ -294,7 +298,7 @@ function renderMaps(data) {
                     ctx.restore();
                 } else {
                     const img = new Image();
-                    img.onload = () => { loadedImages[ent.icon_url] = img; drawScene(bgImg); };
+                    img.onload = () => { loadedImages[ent.icon_url] = img; drawScene(bgImageRef); };
                     img.src = `${SERVER_URL}/vault_media?filepath=${encodeURIComponent(ent.icon_url)}`;
                     ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; ctx.fill();
                 }
@@ -318,6 +322,49 @@ function renderMaps(data) {
     } else {
         drawScene(null);
     }
+
+    // --- DRAG AND DROP LOGIC ---
+    canvas.addEventListener('mousedown', (e) => {
+        if (activeCharacter !== "Human DM") return;
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
+        const mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+        for (let i = entities.length - 1; i >= 0; i--) {
+            const ent = entities[i];
+            if (ent.hp <= 0) continue;
+            if (Math.hypot(mouseX - (ent.x * SCALE), mouseY - (ent.y * SCALE)) <= (ent.size / 2) * SCALE) {
+                isMapDragging = true;
+                canvas.draggedEntity = ent;
+                break;
+            }
+        }
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+        if (isMapDragging && canvas.draggedEntity) {
+            const rect = canvas.getBoundingClientRect();
+            canvas.draggedEntity.x = ((e.clientX - rect.left) * (canvas.width / rect.width)) / SCALE;
+            canvas.draggedEntity.y = ((e.clientY - rect.top) * (canvas.height / rect.height)) / SCALE;
+            drawScene(bgImageRef);
+        }
+    });
+
+    const stopDrag = async () => {
+        if (isMapDragging && canvas.draggedEntity) {
+            const ent = canvas.draggedEntity;
+            isMapDragging = false;
+            canvas.draggedEntity = null;
+            try {
+                await fetch(`${serverUrl}/ooc_move_entity`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ vault_path: vaultPath, entity_name: ent.name, x: ent.x, y: ent.y })
+                });
+            } catch(err) {}
+        }
+    };
+    canvas.addEventListener('mouseup', stopDrag);
+    canvas.addEventListener('mouseout', stopDrag);
 }
 
 function renderCharacterRadios(lockedCharacters) {

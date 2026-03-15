@@ -369,6 +369,41 @@ class HeartbeatRequest(BaseModel):
 class VaultRequest(BaseModel):
     vault_path: str
 
+class OOCMoveRequest(BaseModel):
+    entity_name: str
+    x: float
+    y: float
+    vault_path: str
+
+@app.post("/ooc_move_entity")
+async def ooc_move_entity_endpoint(request: OOCMoveRequest):
+    """OOC wrapper for the DM to drag and drop tokens without triggering combat rules."""
+    from tools import _get_entity_by_name
+    from vault_io import get_journals_dir, edit_markdown_entity
+    
+    entity = _get_entity_by_name(request.entity_name)
+    if not entity: raise HTTPException(status_code=404, detail="Entity not found")
+    
+    entity.x, entity.y = round(request.x, 1), round(request.y, 1)
+    spatial_service.sync_entity(entity)
+    
+    file_path = os.path.join(get_journals_dir(request.vault_path), f"{entity.name}.md")
+    if os.path.exists(file_path):
+        try:
+            async with edit_markdown_entity(file_path) as state:
+                state["yaml_data"]["x"], state["yaml_data"]["y"] = entity.x, entity.y
+        except Exception: pass
+
+    combat_file = os.path.join(get_journals_dir(request.vault_path), "ACTIVE_COMBAT.md")
+    if os.path.exists(combat_file):
+        try:
+            async with edit_markdown_entity(combat_file) as state:
+                for c in state["yaml_data"].get("combatants", []):
+                    if c.get("name", "").lower() == entity.name.lower():
+                        c["x"], c["y"] = entity.x, entity.y
+        except Exception: pass
+    return {"status": "success", "x": entity.x, "y": entity.y}
+
 @app.post("/characters")
 async def list_characters_endpoint(request: VaultRequest):
     """Allows external Web UIs to fetch the list of active player characters in the vault."""
