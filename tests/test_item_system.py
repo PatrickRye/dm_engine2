@@ -9,12 +9,10 @@ from tools import equip_item, attune_item, use_ability_or_spell, execute_melee_a
 from vault_io import get_journals_dir
 
 @pytest.fixture(autouse=True)
-def setup_engine_and_vault(tmp_path):
+def setup_engine_and_vault(mock_obsidian_vault):
     """Clears registries and provides an isolated temporary vault for testing."""
     clear_registry()
-    vault_path = str(tmp_path)
-    j_dir = get_journals_dir(vault_path)
-    os.makedirs(j_dir, exist_ok=True)
+    vault_path = mock_obsidian_vault
     yield vault_path
     clear_registry()
 

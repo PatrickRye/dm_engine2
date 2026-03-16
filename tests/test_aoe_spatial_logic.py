@@ -447,8 +447,10 @@ def test_aoe_elemental_terrain_lightning_water():
     assert any("electrified" in res for res in event.payload["results"])
     
 def test_aoe_elemental_terrain_fire_thorns():
-    """Test that fire burns away flammable difficult terrain."""
+    """Test that fire ignites flammable difficult terrain, dealing immediate damage and creating a trap."""
     caster = create_test_creature("Mage", 0, 0)
+    target_in_web = create_test_creature("Goblin", 10, 20)
+    
     thorns = TerrainZone(label="Spike Growth", points=[(-5, 10), (20, 10), (20, 30), (-5, 30)], is_difficult=True, tags=["flammable", "thorns"])
     spatial_service.add_terrain(thorns)
     
@@ -456,12 +458,22 @@ def test_aoe_elemental_terrain_fire_thorns():
     assert thorns.zone_id in terrains
     
     mechanics = {"damage_dice": "8d6", "damage_type": "fire"}
-    event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={"ability_name": "Fireball", "mechanics": mechanics, "target_uuids": hits, "target_terrain_ids": terrains})
-    EventBus.dispatch(event)
+    
+    # Mock the 2d4 burn damage to be exactly 5, and the Fireball to be exactly 5 (Total 10 damage)
+    with patch('event_handlers.roll_dice', return_value=5):
+        event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={"ability_name": "Fireball", "mechanics": mechanics, "target_uuids": hits, "target_terrain_ids": terrains})
+        EventBus.dispatch(event)
     
     assert "flammable" not in thorns.tags
+    assert "burning" in thorns.tags
     assert thorns.is_difficult is False
-    assert "Burned Away" in thorns.label
+    assert "Burning" in thorns.label
+    assert thorns.duration_seconds == 6
+    assert thorns.trap is not None
+    assert thorns.trap.damage_type == "fire"
+    
+    # Goblin took 5 fire damage from the immediate Web burning + 5 damage from the fireball
+    assert target_in_web.hp.base_value == 0
     
 def test_aoe_elemental_terrain_cold_water_freezes():
     """Test that cold damage freezes a wet puddle."""
@@ -477,3 +489,70 @@ def test_aoe_elemental_terrain_cold_water_freezes():
     assert "wet" not in puddle.tags
     assert "frozen" in puddle.tags
     assert puddle.is_difficult is True
+
+def test_aoe_elemental_terrain_wind_cloud():
+    """Test that a wind spell physically moves a gaseous terrain zone."""
+    caster = create_test_creature("Mage", 0, 0)
+    cloud = TerrainZone(label="Toxic Cloud", points=[(0.0, 10.0), (10.0, 10.0), (10.0, 20.0), (0.0, 20.0)], tags=["gaseous"])
+    spatial_service.add_terrain(cloud)
+    
+    # Gust of Wind cast straight north (along +Y)
+    hits, walls, terrains = spatial_service.get_aoe_targets("line", 60.0, 0.0, 0.0, target_x=0.0, target_y=10.0)
+    
+    mechanics = {"damage_dice": "", "damage_type": "wind"}
+    event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={
+        "ability_name": "Gust of Wind", 
+        "mechanics": mechanics, 
+        "target_uuids": hits, 
+        "target_terrain_ids": [cloud.zone_id], # Mocking the intersection hit
+        "origin_x": 0.0, "origin_y": 0.0,
+        "target_x": 0.0, "target_y": 10.0
+    })
+    EventBus.dispatch(event)
+    
+    # Vector is (0, 1) * 20ft distance
+    assert cloud.points[0] == (0.0, 30.0)
+    assert cloud.points[1] == (10.0, 30.0)
+    assert cloud.points[2] == (10.0, 40.0)
+    assert cloud.points[3] == (0.0, 40.0)
+
+def test_terrain_duration_and_concentration():
+    """Test that dropping concentration completely removes tied terrain effects."""
+    caster = create_test_creature("Mage", 0, 0)
+    
+    mechanics = {"requires_concentration": True, "terrain_effect": {"label": "Web", "duration": "1 hour", "is_difficult": True, "tags": ["flammable"]}}
+    event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={
+        "ability_name": "Web",
+        "mechanics": mechanics,
+        "origin_x": 10.0, "origin_y": 10.0,
+        "target_x": 10.0, "target_y": 10.0,
+        "aoe_shape": "cube", "aoe_size": 20.0
+    })
+    EventBus.dispatch(event)
+    
+    assert caster.concentrating_on == "Web"
+    assert len(spatial_service.map_data.temporary_terrain) == 1
+    
+    EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=caster.entity_uuid))
+    assert caster.concentrating_on == ""
+    assert len(spatial_service.map_data.temporary_terrain) == 0
+
+def test_terrain_duration_expiration():
+    """Test that advancing time naturally expires temporary terrain."""
+    caster = create_test_creature("Mage", 0, 0)
+    mechanics = {"terrain_effect": {"label": "Grease", "duration": "1 minute", "is_difficult": True}}
+    event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={
+        "ability_name": "Grease", "mechanics": mechanics,
+        "origin_x": 10.0, "origin_y": 10.0, "target_x": 10.0, "target_y": 10.0, "aoe_shape": "cube", "aoe_size": 10.0
+    })
+    EventBus.dispatch(event)
+    
+    assert len(spatial_service.map_data.temporary_terrain) == 1
+    
+    # Advance 30 seconds (half duration) -> Still alive
+    EventBus.dispatch(GameEvent(event_type="AdvanceTime", source_uuid=caster.entity_uuid, payload={"seconds_advanced": 30}))
+    assert len(spatial_service.map_data.temporary_terrain) == 1
+    
+    # Advance remaining 30 seconds -> Dispels correctly
+    EventBus.dispatch(GameEvent(event_type="AdvanceTime", source_uuid=caster.entity_uuid, payload={"seconds_advanced": 30}))
+    assert len(spatial_service.map_data.temporary_terrain) == 0

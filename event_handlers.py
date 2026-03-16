@@ -8,7 +8,7 @@ from dnd_rules_engine import (
     ModifiableValue, NumericalModifier, ModifierPriority, ActiveCondition,
     roll_dice, parse_duration_to_seconds
 )
-from spatial_engine import spatial_service, HAS_GIS
+from spatial_engine import spatial_service, HAS_GIS, TrapDefinition, TerrainZone
 from registry import get_entity, get_all_entities
 from spell_system import SpellMechanics
 from pydantic import ValidationError
@@ -59,10 +59,30 @@ def resolve_spell_cast_handler(event: GameEvent):
             # Fire vs Flammable Thorns/Webs
             if damage_type == "fire" and "flammable" in tz.tags:
                 tz.tags.remove("flammable")
+                tz.tags.append("burning")
                 tz.is_difficult = False
                 old_lbl = tz.label
-                tz.label += " (Burned Away)"
-                results.append(f"[Environment] The {old_lbl} caught fire and burned away!")
+                tz.label += " (Burning)"
+                tz.duration_seconds = 6 # Burns away completely in 1 round
+                tz.trap = TrapDefinition(
+                    hazard_name=f"Burning {old_lbl}",
+                    save_required="dexterity",
+                    save_dc=13,
+                    damage_dice="2d4",
+                    damage_type="fire",
+                    trigger_on_move=True
+                )
+                results.append(f"[Environment] The {old_lbl} caught fire and will burn for 1 round!")
+                
+                # Deal immediate damage to entities currently caught inside the flammable area
+                if tz.polygon:
+                    for uid, ent in get_all_entities().items():
+                        if getattr(ent, 'hp', None) and ent.hp.base_value > 0:
+                            ent_poly = spatial_service._get_entity_bbox(ent)
+                            if ent_poly and tz.polygon.intersects(ent_poly):
+                                dmg = roll_dice("2d4")
+                                ent.hp.base_value -= dmg
+                                results.append(f"[Environment] {ent.name} took {dmg} fire damage from the burning {old_lbl}!")
                 
             # Fire vs Frozen Ice
             elif damage_type == "fire" and "frozen" in tz.tags:
@@ -90,6 +110,19 @@ def resolve_spell_cast_handler(event: GameEvent):
                             if ent_poly and tz.polygon.intersects(ent_poly):
                                 target_uuids.append(uid)
                                 results.append(f"[Environment] {ent.name} was pulled into the area of effect via electrified water!")
+                                
+            # Wind vs Gaseous Cloud (e.g. Gust of Wind pushing fog)
+            elif (damage_type == "wind" or event.payload.get("ability_name") == "Gust of Wind") and "gaseous" in tz.tags:
+                ox, oy = event.payload.get("origin_x", 0.0), event.payload.get("origin_y", 0.0)
+                tx, ty = event.payload.get("target_x", 0.0), event.payload.get("target_y", 0.0)
+                
+                dx, dy = tx - ox, ty - oy
+                dist = math.hypot(dx, dy)
+                if dist > 0:
+                    vx, vy = (dx/dist) * 20.0, (dy/dist) * 20.0
+                    tz.points = [(p[0] + vx, p[1] + vy) for p in tz.points]
+                    spatial_service.invalidate_cache()
+                    results.append(f"[Environment] The {tz.label} was blown 20 feet away by the wind!")
 
     for t_uuid in target_uuids:
         target: Creature = get_entity(t_uuid)
@@ -239,6 +272,35 @@ def resolve_spell_cast_handler(event: GameEvent):
                         results.append(f"[Geometry] The {old_label} was hit for {w_dmg} {damage_type} damage and was DESTROYED!")
                     else:
                         results.append(f"[Geometry] The {wall.label} took {w_dmg} {damage_type} damage ({wall.hp}/{wall.max_hp} HP remaining).")
+
+    # 6. Apply Environmental/Terrain Modifications
+    terrain_def = getattr(mechanics, "terrain_effect", None)
+    if terrain_def and HAS_GIS:
+        aoe_shape = event.payload.get("aoe_shape")
+        if aoe_shape:
+            ox, oy = event.payload.get("origin_x", 0), event.payload.get("origin_y", 0)
+            tx, ty = event.payload.get("target_x"), event.payload.get("target_y")
+            size = event.payload.get("aoe_size", 0)
+            
+            points = spatial_service.get_shape_points(aoe_shape, size, ox, oy, tx, ty)
+            if points:
+                trap = TrapDefinition(**terrain_def.trap_hazard) if terrain_def.trap_hazard else None
+                dur_secs = parse_duration_to_seconds(terrain_def.duration)
+                
+                tz = TerrainZone(
+                    label=terrain_def.label,
+                    points=points,
+                    z=event.payload.get("origin_z") or 0.0,
+                    is_difficult=terrain_def.is_difficult,
+                    tags=terrain_def.tags,
+                    trap=trap,
+                    source_name=event.payload.get("ability_name", "Unknown"),
+                    source_uuid=caster.entity_uuid,
+                    duration_seconds=dur_secs,
+                    applied_initiative=current_init
+                )
+                spatial_service.add_terrain(tz, is_temporary=True)
+                results.append(f"[Environment] A {terrain_def.label} effect was created in the area (Duration: {terrain_def.duration}).")
 
     event.payload["results"] = results
 
@@ -522,6 +584,18 @@ def handle_advance_time_event(event: GameEvent):
                 entity.active_conditions.remove(cond)
                 print(f"[Engine] {entity.name} is no longer {cond.name}.")
 
+    # Expire temporary terrain
+    expired_terrains = []
+    for tz in spatial_service.map_data.temporary_terrain:
+        if getattr(tz, "duration_seconds", -1) > 0:
+            if target_init is None or getattr(tz, "applied_initiative", 0) == target_init:
+                tz.duration_seconds -= seconds_advanced
+                if tz.duration_seconds <= 0:
+                    expired_terrains.append(tz)
+    for tz in expired_terrains:
+        spatial_service.remove_terrain(tz.zone_id)
+        print(f"[Engine] Temporary terrain '{tz.label}' has expired and faded away.")
+
 def shield_spell_reaction_handler(event: GameEvent):
     """Intercepts an attack BEFORE it resolves and magically raises AC."""
     if event.status != EventStatus.PRE_EVENT: return
@@ -578,6 +652,12 @@ def handle_drop_concentration_event(event: GameEvent):
                 entity.active_conditions.remove(cond)
                 print(f"[Engine] {entity.name} is no longer {cond.name} from {spell_name}.")
                 
+    # Remove terrain tied to this caster's concentration spell
+    expired_terrains = [tz for tz in spatial_service.map_data.temporary_terrain if getattr(tz, "source_uuid", None) == caster.entity_uuid and getattr(tz, "source_name", "") == spell_name]
+    for tz in expired_terrains:
+        spatial_service.remove_terrain(tz.zone_id)
+        print(f"[Engine] Temporary terrain '{tz.label}' dissipated as {caster.name} dropped concentration.")
+
     caster.concentrating_on = ""
 
 def validate_movement_handler(event: GameEvent):

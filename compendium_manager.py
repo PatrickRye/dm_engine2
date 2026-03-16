@@ -17,6 +17,7 @@ class MechanicEffect(BaseModel):
     modifiers: List[Dict[str, Any]] = Field(default_factory=list) # e.g., [{"target": "self", "stat": "ac", "value": 5, "duration": "1 round"}]
     granted_tags: List[str] = Field(default_factory=list) # e.g., ["ignore_difficult_terrain", "ignore_ranged_melee_disadvantage"]
     requires_concentration: bool = False
+    terrain_effect: Optional[Dict[str, Any]] = None
 
 class CompendiumEntry(BaseModel):
     """A single JSON file representing a spell, feat, or feature."""

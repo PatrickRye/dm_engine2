@@ -529,7 +529,7 @@ async def fetch_entity_context(entity_names: list[str], full_read: bool = False,
     
     for name in entity_names:
         file_path = os.path.join(j_dir, f"{name}.md")
-        if not await aios.path.exists(file_path):
+        if not os.path.exists(file_path):
             context_blocks.append(f"[{name}]: Entity not found in archives.")
             continue
             
@@ -601,7 +601,6 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
                 state["save"] = False
                 return f"Error: Invalid equipment slot '{item_slot}'. Valid slots are: {', '.join(valid_slots)} or 'ring'."
     
-            equipment[final_slot] = item_name
             old_item_name = equipment.get(final_slot, "None")
             equipment[final_slot] = item_name if not item else item.name
             
@@ -670,8 +669,8 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
         if new_ac_value is not None:
             engine_creature.ac.base_value = new_ac_value
             
-        if old_item and (not old_item.requires_attunement or old_item.name in attuned_items):
-            for mod in old_item.modifiers:
+        if old_item and (not getattr(old_item, "requires_attunement", False) or old_item.name in attuned_items):
+            for mod in getattr(old_item, "modifiers", []):
                 if hasattr(engine_creature, mod.stat):
                     stat_obj = getattr(engine_creature, mod.stat)
                     if isinstance(stat_obj, ModifiableValue):
@@ -681,8 +680,8 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
                             engine_creature.active_mechanics.remove(old_item.name)
                             
         if item:
-            if not item.requires_attunement or attune or item.name in attuned_items:
-                for mod in item.modifiers:
+            if not getattr(item, "requires_attunement", False) or attune or item.name in attuned_items:
+                for mod in getattr(item, "modifiers", []):
                     if hasattr(engine_creature, mod.stat):
                         stat_obj = getattr(engine_creature, mod.stat)
                         if isinstance(stat_obj, ModifiableValue):
@@ -755,7 +754,7 @@ async def attune_item(character_name: str, item_name: str, action: str = "attune
         
     engine_creature = _get_entity_by_name(character_name)
     if engine_creature and isinstance(engine_creature, Creature):
-        for mod in item.modifiers:
+        for mod in getattr(item, "modifiers", []):
             if hasattr(engine_creature, mod.stat):
                 stat_obj = getattr(engine_creature, mod.stat)
                 if isinstance(stat_obj, ModifiableValue):
@@ -840,7 +839,7 @@ async def level_up_character(character_name: str, class_name: str, hp_increase: 
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
     
-    if not await aios.path.exists(file_path): 
+    if not os.path.exists(file_path): 
         return f"Error: Could not locate '{character_name}.md'."
         
     try:
@@ -1179,7 +1178,7 @@ async def search_vault_by_tag(target_tag: str, *, config: Annotated[RunnableConf
     vault_path = config["configurable"].get("thread_id")
     matching_files, j_dir = [], get_journals_dir(vault_path)
     
-    if not await aios.path.exists(j_dir): return "Error: Journal directory not found."
+    if not os.path.exists(j_dir): return "Error: Journal directory not found."
     
     for filename in os.listdir(j_dir):
         if not filename.endswith(".md"): continue
@@ -1668,12 +1667,12 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
     ignore_walls = "ignore_walls" in granted_tags
     penetrates = "penetrates_destructible" in granted_tags
     
+    ox, oy, oz, tx, ty, tz = None, None, None, None, None, None
     if aoe_shape and aoe_size and target_x is not None and target_y is not None:
         shape = aoe_shape.lower()
-        oz = 0.0
         tz = target_z
         if shape in ["circle", "sphere", "cylinder", "cube"]:
-            ox, oy, tx, ty = target_x, target_y, None, None
+            ox, oy, tx, ty = target_x, target_y, target_x, target_y
             oz = target_z if target_z is not None else 0.0
         else: # cone, line originate from the caster
             ox, oy, tx, ty = caster.x, caster.y, target_x, target_y
@@ -1723,7 +1722,15 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
             "current_initiative": current_init,
             "manual_attack_roll": manual_attack_roll,
             "is_critical": is_critical,
-            "manual_saves": manual_saves
+            "manual_saves": manual_saves,
+            "aoe_shape": aoe_shape,
+            "aoe_size": aoe_size,
+            "origin_x": ox,
+            "origin_y": oy,
+            "origin_z": oz,
+            "target_x": tx,
+            "target_y": ty,
+            "target_z": tz
         }
     )
     

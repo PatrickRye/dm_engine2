@@ -71,6 +71,11 @@ class TerrainZone(BaseModel):
     trap: Optional[TrapDefinition] = None
     tags: List[str] = Field(default_factory=list)
     
+    source_name: str = ""
+    source_uuid: Optional[uuid.UUID] = None
+    duration_seconds: int = -1
+    applied_initiative: int = 0
+    
     @property
     def polygon(self):
         if not HAS_GIS or len(self.points) < 3: return None
@@ -670,6 +675,49 @@ class SpatialQueryService:
                 return True # At least one corner has unbroken LoS!
         self._cache_set(cache_key, False)
         return False
+        
+    def get_shape_points(self, shape: str, size: float, origin_x: float, origin_y: float, target_x: float = None, target_y: float = None) -> List[Tuple[float, float]]:
+        """Returns the boundary coordinates of an AoE shape for precise TerrainZone generation."""
+        if not HAS_GIS: return []
+        shape = shape.lower()
+        aoe_poly = None
+        
+        if shape in ["circle", "sphere", "cylinder"]:
+            aoe_poly = Point(origin_x, origin_y).buffer(size)
+        elif shape == "cube":
+            aoe_poly = box(origin_x - size/2, origin_y - size/2, origin_x + size/2, origin_y + size/2)
+        elif shape in ["cone", "line"]:
+            if target_x is None or target_y is None: return []
+            dx, dy = target_x - origin_x, target_y - origin_y
+            dist_2d = math.hypot(dx, dy)
+            vx, vy = (dx/dist_2d, dy/dist_2d) if dist_2d > 0 else (1.0, 0.0)
+            
+            if shape == "cone":
+                if vx == 0 and vy == 0:
+                    aoe_poly = Point(origin_x, origin_y).buffer(size * 0.5)
+                else:
+                    angle_deg = 53.1
+                    angle_xy = math.atan2(vy, vx)
+                    start_angle = angle_xy - math.radians(angle_deg / 2)
+                    end_angle = angle_xy + math.radians(angle_deg / 2)
+                    
+                    points = [(origin_x, origin_y)]
+                    num_segments = max(4, int(angle_deg / 15))
+                    for i in range(num_segments + 1):
+                        theta = start_angle + i * (end_angle - start_angle) / num_segments
+                        points.append((origin_x + size * math.cos(theta), origin_y + size * math.sin(theta)))
+                    aoe_poly = Polygon(points)
+            else: # Line
+                ex, ey = origin_x + vx * size, origin_y + vy * size
+                if origin_x == ex and origin_y == ey:
+                    aoe_poly = Point(origin_x, origin_y).buffer(2.5)
+                else:
+                    aoe_poly = LineString([(origin_x, origin_y), (ex, ey)]).buffer(2.5)
+        
+        if aoe_poly:
+            if aoe_poly.geom_type == 'Polygon': return list(aoe_poly.exterior.coords)
+            elif aoe_poly.geom_type == 'MultiPolygon': return list(aoe_poly.geoms[0].exterior.coords)
+        return []
 
     def render_ascii_map(self, width: int = 40, height: int = 20) -> str:
         """Generates a simple 2D ASCII graphical representation for the UI or debugging."""

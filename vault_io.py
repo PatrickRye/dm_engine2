@@ -230,7 +230,7 @@ def get_journals_dir(vault_path: str):
 
 async def read_markdown_entity_no_lock(file_path: str) -> tuple[dict, str]:
     """Reads a markdown file, safely parses YAML. Must be called within an AsyncSoftFileLock."""
-    if not await aios.path.exists(file_path):
+    if not os.path.exists(file_path):
         raise FileNotFoundError(f"Error: Could not locate '{os.path.basename(file_path)}'.")
     
     async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
@@ -285,7 +285,7 @@ async def write_audit_log(vault_path: str, agent_name: str, action: str, details
     log_path = os.path.join(vault_path, "Journals", "AUDIT_LOG.md")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     
-    if not await aios.path.exists(log_path):
+    if not os.path.exists(log_path):
         async with aiofiles.open(log_path, 'w', encoding='utf-8') as f: 
             await f.write("---\ntags: [system, audit]\n---\n# AI DM Audit Trail\n\n")
             
@@ -298,7 +298,7 @@ async def upsert_journal_section(entity_name: str, section_header: str, content:
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{entity_name}.md")
     
-    if not await aios.path.exists(file_path):
+    if not os.path.exists(file_path):
         return f"Error: Could not locate '{entity_name}.md'. Ensure the entity exists."
         
     lock = AsyncSoftFileLock(f"{file_path}.lock")

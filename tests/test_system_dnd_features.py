@@ -595,3 +595,49 @@ async def test_system_trap_movement_trigger():
         
     assert "TRAP TRIGGERED during movement" in res
     assert fighter.hp.base_value == 20 # 30 - 10
+
+def test_system_concentration_buff_and_debuff_expiration():
+    """Tests that dropping concentration removes stats and conditions across multiple entities."""
+    caster = Creature(name="Cleric", hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    ally1 = Creature(name="Fighter", hp=ModifiableValue(base_value=30), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=4), dexterity_mod=ModifiableValue(base_value=0))
+    ally2 = Creature(name="Rogue", hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=14), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=4))
+    enemy1 = Creature(name="Goblin", hp=ModifiableValue(base_value=15), ac=ModifiableValue(base_value=12), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=2))
+    
+    spatial_service.sync_entity(caster)
+    spatial_service.sync_entity(ally1)
+    spatial_service.sync_entity(ally2)
+    spatial_service.sync_entity(enemy1)
+    
+    # 1. Cast Bless on Allies (+4 strength for testing buff logic)
+    bless_mechanics = {
+        "requires_concentration": True,
+        "modifiers": [{"stat": "strength_mod", "value": 4, "duration": "1 minute"}],
+        "conditions_applied": [{"condition": "Blessed", "duration": "1 minute"}]
+    }
+    event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={"ability_name": "Bless", "mechanics": bless_mechanics, "target_uuids": [ally1.entity_uuid, ally2.entity_uuid]})
+    EventBus.dispatch(event)
+    
+    assert caster.concentrating_on == "Bless"
+    assert ally1.strength_mod.total == 8 # 4 + 4
+    assert ally2.strength_mod.total == 4 # 0 + 4
+    assert any(c.name == "Blessed" for c in ally1.active_conditions)
+    
+    # 2. Cast Bane on Enemy -> This automatically drops Bless!
+    bane_mechanics = {
+        "requires_concentration": True,
+        "modifiers": [{"stat": "dexterity_mod", "value": -2, "duration": "1 minute"}],
+        "conditions_applied": [{"condition": "Baned", "duration": "1 minute"}]
+    }
+    event2 = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={"ability_name": "Bane", "mechanics": bane_mechanics, "target_uuids": [enemy1.entity_uuid]})
+    EventBus.dispatch(event2)
+    
+    assert caster.concentrating_on == "Bane"
+    assert ally1.strength_mod.total == 4 # Back to base
+    assert not any(c.name == "Blessed" for c in ally1.active_conditions)
+    assert enemy1.dexterity_mod.total == 0 # 2 - 2
+    
+    # 3. Manual drop concentration
+    EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=caster.entity_uuid))
+    assert caster.concentrating_on == ""
+    assert enemy1.dexterity_mod.total == 2 # Back to base
+    assert not any(c.name == "Baned" for c in enemy1.active_conditions)

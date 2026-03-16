@@ -14,6 +14,13 @@ class StatModifier(BaseModel):
     value: int
     duration: str = "-1"
 
+class TerrainEffectDefinition(BaseModel):
+    label: str
+    is_difficult: bool = False
+    tags: List[str] = Field(default_factory=list)
+    duration: str = "-1"
+    trap_hazard: Optional[dict] = None # Maps to TrapDefinition
+
 class SpellMechanics(BaseModel):
     requires_attack_roll: bool = False
     save_required: str = ""
@@ -24,6 +31,7 @@ class SpellMechanics(BaseModel):
     granted_tags: List[str] = Field(default_factory=list)
     conditions_applied: List[AppliedCondition] = Field(default_factory=list)
     modifiers: List[StatModifier] = Field(default_factory=list)
+    terrain_effect: Optional[TerrainEffectDefinition] = None
 
 class SpellDefinition(BaseModel):
     name: str
