@@ -80,6 +80,9 @@ class PCDetails(CharacterDetails):
 class NPCDetails(CharacterDetails):
     """Specific details for Non-Player Characters."""
     stat_block: str = Field(default="", description="Standard 5e stat block. MUST GENERATE if not provided.")
+    legendary_actions_max: int = Field(default=0, description="Max legendary actions per round.")
+    legendary_actions: List[str] = Field(default_factory=list, description="List of legendary actions.")
+    lair_actions: List[str] = Field(default_factory=list, description="List of lair actions.")
 
 class LocationDetails(Social):
     """Details for geographical locations."""

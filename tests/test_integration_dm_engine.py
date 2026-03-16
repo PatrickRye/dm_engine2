@@ -6,10 +6,11 @@ from unittest.mock import patch
 
 from dnd_rules_engine import BaseGameEntity, Creature, MeleeWeapon, EventBus
 from vault_io import initialize_engine_from_vault
-from tools import equip_item, execute_melee_attack, modify_health, perform_ability_check_or_save, level_up_character, move_entity, manage_skill_challenge
+from tools import equip_item, execute_melee_attack, modify_health, perform_ability_check_or_save, level_up_character, move_entity, manage_skill_challenge, create_new_entity
 from spatial_engine import spatial_service
 from event_handlers import resolve_attack_handler, apply_damage_handler
 from registry import clear_registry, get_all_entities, get_entity
+from state import NPCDetails
 
 @pytest.fixture(autouse=True)
 def setup_engine_state():
@@ -259,3 +260,36 @@ async def test_tool_manage_skill_challenge(mock_entities):
     
     with open(os.path.join(vault_path, "Journals", "CAMPAIGN_MASTER.md"), "r", encoding="utf-8") as f:
         assert "The party escaped safely." in f.read()
+
+@pytest.mark.asyncio
+async def test_tool_create_entity_legendary_actions_load(mock_obsidian_vault):
+    """Tests that creating an NPC with legendary actions properly saves to YAML and loads into the engine."""
+    vault_path = mock_obsidian_vault
+    config = {"configurable": {"thread_id": vault_path}}
+    
+    # 1. Create the NPC with Legendary Actions via the tool
+    details = NPCDetails(
+        stat_block="Armor Class 18\nHit Points 150",
+        legendary_actions_max=3,
+        legendary_actions=["Tail Swipe: 1 Action", "Wing Attack: 2 Actions"]
+    )
+    
+    res = await create_new_entity.ainvoke({
+        "entity_name": "Ancient_Dragon",
+        "entity_type": "NPC",
+        "background_context": "A terrifying beast.",
+        "details": details.model_dump()
+    }, config=config)
+    
+    assert "Success" in res
+    
+    # 2. Initialize the engine from the vault
+    await initialize_engine_from_vault(vault_path)
+    
+    # 3. Retrieve from memory and verify
+    entities = [e for e in get_all_entities().values() if e.name == "Ancient_Dragon"]
+    assert len(entities) == 1
+    dragon: Creature = entities[0]
+    
+    assert dragon.legendary_actions_max == 3
+    assert dragon.legendary_actions_current == 3

@@ -80,7 +80,20 @@ def _build_npc_template(title: str, context: str, details: dict, x: float = 0.0,
     code_switch = details.get("code_switching", "Unknown.")
     icon_url = details.get("icon_url", "")
 
-    return (f"---\ntags: [npc]\nstatus: active\norigin: Unknown\ncurrent_location: Unknown\nx: {x}\ny: {y}\nz: {z}\nicon_url: \"{icon_url}\"\n---\n"
+    legendary_max = details.get("legendary_actions_max", 0)
+    legendary_actions = details.get("legendary_actions", [])
+    lair_actions = details.get("lair_actions", [])
+    
+    extra_actions_text = ""
+    if legendary_max > 0 or legendary_actions:
+        extra_actions_text += f"\n### Legendary Actions ({legendary_max}/Round)\n" + "\n".join(f"- {a}" for a in legendary_actions) + "\n"
+    if lair_actions:
+        extra_actions_text += f"\n### Lair Actions (Initiative 20)\n" + "\n".join(f"- {a}" for a in lair_actions) + "\n"
+
+    return (f"---\ntags: [npc]\nstatus: active\norigin: Unknown\ncurrent_location: Unknown\n"
+            f"x: {x}\ny: {y}\nz: {z}\nicon_url: \"{icon_url}\"\n"
+            f"legendary_actions_max: {legendary_max}\n"
+            f"legendary_actions_current: {legendary_max}\n---\n"
             f"# {title}\n\n## Summary - Current State\n- {ctx[:150]}...\n\n"
             f"## Background & Motives\n- {ctx}\n- **Long-Term Goals**: {long_term_goals}\n- **Aliases & Titles**: {aliases}\n\n"
             f"## Appearance\n- **Base Appearance**: {appearance}\n\n"
@@ -88,7 +101,7 @@ def _build_npc_template(title: str, context: str, details: dict, x: float = 0.0,
             f"## Connections\n- {connections}\n\n"
             f"## Attitude Tracker\n- **Base Attitude**: {base_attitude}\n| Entity | Disposition | Notes |\n|---|---|---|\n| Party | Neutral | Initial encounter. |\n\n"
             f"## Active Logs\n- **Current Appearance**: {current_appearance}\n- **Immediate Goals**: {immediate_goals}\n\n"
-            f"## Key Knowledge\n- \n\n## Voice & Quotes\n- \n\n## Combat & Stat Block\n{stats}\n\n"
+            f"## Key Knowledge\n- \n\n## Voice & Quotes\n- \n\n## Combat & Stat Block\n{stats}\n{extra_actions_text}\n"
             f"## Additional Lore & Jazz\n{misc}\n")
 
 def _build_location_template(title: str, context: str, details: dict) -> str:
@@ -1569,8 +1582,11 @@ def _search_markdown_for_keywords(target_dirs: list[str], query: str, top_n: int
     return result
 
 @tool
-def query_bestiary(creature_name: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
-    """Retrieves exact stat blocks, abilities, tactics, and lore for a specific creature."""
+def query_bestiary(creature_name: str, specific_section: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Retrieves exact stat blocks, abilities, tactics, and lore for a specific creature.
+    Optional `specific_section` (e.g., 'Legendary Actions', 'Lair Actions') focuses the output on that specific block.
+    """
     vault_path = config["configurable"].get("thread_id")
     target_dirs = _get_config_dirs(vault_path, "bestiary")
     if not target_dirs: return "Error: Bestiary directory not configured in DM_CONFIG.md."
@@ -1590,14 +1606,37 @@ def query_bestiary(creature_name: str, *, config: Annotated[RunnableConfig, Inje
                 if match:
                     header_level = len(match.group(1))
                     tail = content[match.start():]
-                    next_header_pattern = re.compile(rf"^#{{1,{header_level}}}\s+", re.MULTILINE | re.IGNORECASE)
+                    
+                    # Negative lookahead ensures we don't truncate early if Lair/Legendary actions are sibling headers
+                    next_header_pattern = re.compile(rf"^#{{1,{header_level}}}\s+(?!.*(?:Lair|Legendary|Mythic|Reactions)).*$", re.MULTILINE | re.IGNORECASE)
                     next_match = next_header_pattern.search(tail, pos=len(match.group(0)))
                     
                     if next_match: body = tail[:next_match.start()].strip()
                     else: body = tail.strip()
-                    return f"--- BESTIARY ENTRY FROM {file} ---\n{body}"[:4000]
+                    
+                    if specific_section:
+                        section_pattern = rf"^(#+)\s+.*?{re.escape(specific_section)}.*?$"
+                        sec_match = re.search(section_pattern, body, re.IGNORECASE | re.MULTILINE)
+                        if not sec_match:
+                            sec_match = re.search(section_pattern, content, re.IGNORECASE | re.MULTILINE)
+                            if sec_match:
+                                body = content
+                        
+                        if sec_match:
+                            sec_level = len(sec_match.group(1))
+                            sec_tail = body[sec_match.start():]
+                            next_sec_pattern = re.compile(rf"^#{{1,{sec_level}}}\s+", re.MULTILINE)
+                            next_sec_match = next_sec_pattern.search(sec_tail, pos=len(sec_match.group(0)))
+                            if next_sec_match:
+                                return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{sec_tail[:next_sec_match.start()].strip()}"[:4000]
+                            else:
+                                return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{sec_tail.strip()}"[:4000]
+                        else:
+                            return f"Cache Miss: '{specific_section}' not found for {creature_name}."
 
-    return _search_markdown_for_keywords(target_dirs, creature_name, top_n=1)
+                    return f"--- BESTIARY ENTRY FROM {file} ---\n{body}"[:6000]
+
+    return _search_markdown_for_keywords(target_dirs, f"{creature_name} {specific_section}".strip(), top_n=1)
 
 @tool
 def query_rulebook(topic: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:

@@ -323,9 +323,11 @@ def parse_duration_to_seconds(duration_str: str) -> int:
         elif unit == "day": return val * 86400
     return -1
 
+DICE_REGEX = re.compile(r"(\d+)d(\d+)(?:\s*([+-])\s*(\d+))?")
+
 def roll_dice(notation: str) -> int:
     """Parses and rolls generic D&D dice formulas (e.g., '1d8', '2d6+3')."""
-    match = re.match(r"(\d+)d(\d+)(?:\s*([+-])\s*(\d+))?", notation.strip().lower())
+    match = DICE_REGEX.match(notation.strip().lower())
     if not match:
         return 0
         
