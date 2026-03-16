@@ -36,7 +36,12 @@ async def test_unequip_item_removes_override(setup_engine_and_vault):
         name="TestChar", x=0, y=0,
         hp=ModifiableValue(base_value=10),
         ac=ModifiableValue(base_value=10),
-        strength_mod=ModifiableValue(base_value=0) # Starts at 0
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        constitution_mod=ModifiableValue(base_value=0),
+        intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0),
+        charisma_mod=ModifiableValue(base_value=0)
     )
     register_entity(c)
 
@@ -74,7 +79,16 @@ async def test_unattune_item_removes_override(setup_engine_and_vault):
     with open(char_md, "w", encoding="utf-8") as f:
         f.write("---\nequipment:\n  ring1: None\nattuned_items: []\n---")
         
-    c = Creature(name="TestChar", x=0, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0))
+    c = Creature(
+        name="TestChar", x=0, y=0, 
+        hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), 
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        constitution_mod=ModifiableValue(base_value=0),
+        intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0),
+        charisma_mod=ModifiableValue(base_value=0)
+    )
     register_entity(c)
 
     item = WondrousItem(name="Ring of Override", requires_attunement=True, modifiers=[StatModifier(stat="ac", value=20)])
@@ -99,8 +113,26 @@ async def test_wondrous_item_casts_spell(setup_engine_and_vault):
     """
     vault_path = setup_engine_and_vault
     
-    caster = Creature(name="Mage", x=0, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0))
-    target = Creature(name="Goblin", x=10, y=0, hp=ModifiableValue(base_value=30), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0))
+    caster = Creature(
+        name="Mage", x=0, y=0, 
+        hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), 
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        constitution_mod=ModifiableValue(base_value=0),
+        intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0),
+        charisma_mod=ModifiableValue(base_value=0)
+    )
+    target = Creature(
+        name="Goblin", x=10, y=0, 
+        hp=ModifiableValue(base_value=30), ac=ModifiableValue(base_value=10), 
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        constitution_mod=ModifiableValue(base_value=0),
+        intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0),
+        charisma_mod=ModifiableValue(base_value=0)
+    )
     
     register_entity(caster)
     register_entity(target)
@@ -145,8 +177,24 @@ async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault):
     with open(char_md, "w", encoding="utf-8") as f:
         f.write("---\nequipment:\n  main_hand: None\n---")
         
-    fighter = Creature(name="Fighter", x=0, y=0, hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
-    target = Creature(name="Goblin", x=5, y=0, hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=12), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    fighter = Creature(
+        name="Fighter", x=0, y=0, 
+        hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=15), 
+        strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0),
+        constitution_mod=ModifiableValue(base_value=0),
+        intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0),
+        charisma_mod=ModifiableValue(base_value=0)
+    )
+    target = Creature(
+        name="Goblin", x=5, y=0, 
+        hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=12), 
+        strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0),
+        constitution_mod=ModifiableValue(base_value=0),
+        intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0),
+        charisma_mod=ModifiableValue(base_value=0)
+    )
     
     register_entity(fighter)
     register_entity(target)
@@ -161,7 +209,8 @@ async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault):
     
     config = {"configurable": {"thread_id": vault_path}}
     
-    await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Longsword +2", "item_slot": "main_hand"}, config=config)
+    res = await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Longsword +2", "item_slot": "main_hand"}, config=config)
+    assert "Success" in res, f"Equip tool failed: {res}"
     
     # Verify the weapon entity was created with the right magic bonus
     weapon_uuid = fighter.equipped_weapon_uuid
@@ -197,7 +246,16 @@ async def test_armor_item_restrictions(setup_engine_and_vault):
         # High dex, low str rogue
         f.write("---\nspecies: Elf\nalignment: chaotic neutral\nclasses: [{class_name: Rogue, level: 3}]\ndexterity: 18\nstrength: 8\nequipment:\n  armor: None\nattuned_items: []\n---")
         
-    rogue = Creature(name="Rogue", x=0, y=0, hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=14), strength_mod=ModifiableValue(base_value=-1), dexterity_mod=ModifiableValue(base_value=4), tags=["pc"])
+    rogue = Creature(
+        name="Rogue", x=0, y=0, 
+        hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=14), 
+        strength_mod=ModifiableValue(base_value=-1), dexterity_mod=ModifiableValue(base_value=4),
+        constitution_mod=ModifiableValue(base_value=0),
+        intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0),
+        charisma_mod=ModifiableValue(base_value=0),
+        tags=["pc"]
+    )
     register_entity(rogue)
     
     # 1. Medium Armor (Half Plate) -> Max Dex +2. Base AC 15 + 2 = 17 (instead of 15 + 4 = 19)
@@ -205,7 +263,8 @@ async def test_armor_item_restrictions(setup_engine_and_vault):
     await ItemCompendium.save_item(vault_path, half_plate)
     
     config = {"configurable": {"thread_id": vault_path}}
-    await equip_item.ainvoke({"character_name": "Rogue", "item_name": "Half Plate", "item_slot": "armor"}, config=config)
+    res = await equip_item.ainvoke({"character_name": "Rogue", "item_name": "Half Plate", "item_slot": "armor"}, config=config)
+    assert "Success" in res, f"Equip tool failed: {res}"
     
     # Verify Engine and file are 17 AC
     assert rogue.ac.base_value == 17

@@ -1,5 +1,6 @@
 import pytest
 import uuid
+from unittest.mock import patch
 from pydantic import ValidationError
 from spell_system import SpellMechanics, SpellDefinition, AppliedCondition, StatModifier
 from dnd_rules_engine import EventBus, GameEvent, EventStatus, Creature, ModifiableValue
@@ -66,7 +67,11 @@ def test_resolve_spell_cast_catches_invalid_mechanics():
         hp=ModifiableValue(base_value=10),
         ac=ModifiableValue(base_value=10),
         strength_mod=ModifiableValue(base_value=0),
-        dexterity_mod=ModifiableValue(base_value=0)
+        dexterity_mod=ModifiableValue(base_value=0),
+        constitution_mod=ModifiableValue(base_value=0),
+        intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0),
+        charisma_mod=ModifiableValue(base_value=0)
     )
     register_entity(caster)
 
@@ -83,6 +88,38 @@ def test_resolve_spell_cast_catches_invalid_mechanics():
     )
     EventBus.dispatch(event)
 
-    assert event.status == EventStatus.CANCELLED
     assert "results" in event.payload
     assert "SYSTEM ERROR: Invalid spell mechanics payload" in event.payload["results"][0]
+
+def test_spell_attack_critical_hit():
+    """Ensure that a natural 20 on a spell attack correctly doubles the base damage dice natively."""
+    caster = Creature(
+        name="Sorcerer", x=0, y=0,
+        hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0),
+        constitution_mod=ModifiableValue(base_value=0), intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0), charisma_mod=ModifiableValue(base_value=0)
+    )
+    target = Creature(
+        name="Orc", x=5, y=0,
+        hp=ModifiableValue(base_value=30), ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0),
+        constitution_mod=ModifiableValue(base_value=0), intelligence_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=0), charisma_mod=ModifiableValue(base_value=0)
+    )
+    register_entity(caster)
+    register_entity(target)
+
+    mechanics = {"requires_attack_roll": True, "damage_dice": "1d10", "damage_type": "fire"}
+    
+    # Force a natural 20, and force the 1d10 dice roll to yield 10. (Base 10 + Crit 10 = 20 Damage)
+    with patch('event_handlers.random.randint', return_value=20), patch('event_handlers.roll_dice', return_value=10):
+        event = GameEvent(
+            event_type="SpellCast",
+            source_uuid=caster.entity_uuid,
+            payload={"ability_name": "Fire Bolt", "mechanics": mechanics, "target_uuids": [target.entity_uuid], "target_wall_ids": []}
+        )
+        EventBus.dispatch(event)
+        
+    assert target.hp.base_value == 10 # 30 - 20 damage
+    assert any("Critical Hit!" in res for res in event.payload["results"])

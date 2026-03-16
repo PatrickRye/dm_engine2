@@ -39,6 +39,22 @@ class DMEngineClientCore {
         }
     }
 
+    animatePings() {
+        if (!this.activePings) return;
+        const now = Date.now();
+        this.activePings = this.activePings.filter(p => now - p.time < 3000);
+        
+        if (this.drawSceneRef) {
+            this.drawSceneRef();
+        }
+
+        if (this.activePings.length > 0) {
+            this.pingAnimationId = requestAnimationFrame(() => this.animatePings());
+        } else {
+            this.pingAnimationId = null;
+        }
+    }
+
     updatePerspectiveStyles() {
         const styleEl = document.getElementById('dm-perspective-styles');
         if (!styleEl) return;
@@ -180,6 +196,7 @@ class DMEngineClientCore {
     }
 
     renderMaps(data) {
+        try {
         if(!this.view.viewMaps) return;
         this.view.viewMaps.innerHTML = "";
         if (!data || !data.map_data || (!data.map_data.walls.length && !data.map_data.dm_map_image_path)) {
@@ -215,6 +232,8 @@ class DMEngineClientCore {
         mapToolbar.createSpan({text: "Size (ft):"});
         const sizeInput = mapToolbar.createEl("input", {type: "number", value: this.aoeSize.toString()});
         sizeInput.style.width = "60px";
+        
+        mapToolbar.createSpan({text: "(Shift+Click map to Ping)", style: "font-size: 0.85em; color: var(--text-muted); margin-left: auto;"});
 
         const canvasContainer = this.view.viewMaps.createDiv();
         canvasContainer.style.flex = "1 1 auto";
@@ -251,6 +270,7 @@ class DMEngineClientCore {
         });
         
         const drawScene = (bgImg) => {
+            this.drawSceneRef = drawScene;
             bgImageRef = bgImg || bgImageRef;
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             
@@ -325,15 +345,19 @@ class DMEngineClientCore {
                 ctx.arc(px, py, pRadius, 0, Math.PI * 2);
                 
                 if (ent.icon_url) {
-                    if (this.loadedImages[ent.icon_url]) {
+                    if (this.loadedImages[ent.icon_url] instanceof Image) {
                         ctx.save();
                         ctx.clip(); // Mask the image inside the circle
                         ctx.drawImage(this.loadedImages[ent.icon_url], px - pRadius, py - pRadius, pRadius * 2, pRadius * 2);
                         ctx.restore();
                     } else {
-                        const img = new Image();
-                        img.onload = () => { this.loadedImages[ent.icon_url] = img; drawScene(bgImageRef); };
-                        img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(ent.icon_url)}`;
+                        if (this.loadedImages[ent.icon_url] === undefined) {
+                            this.loadedImages[ent.icon_url] = "loading";
+                            const img = new Image();
+                            img.onload = () => { this.loadedImages[ent.icon_url] = img; drawScene(bgImageRef); };
+                            img.onerror = () => { this.loadedImages[ent.icon_url] = "failed"; drawScene(bgImageRef); };
+                            img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(ent.icon_url)}`;
+                        }
                         ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; ctx.fill(); // Fallback color while loading
                     }
                 } else {
@@ -427,6 +451,40 @@ class DMEngineClientCore {
                 const mx = this.mouseX * SCALE;
                 const my = this.mouseY * SCALE;
 
+                const activeEnt = entities.find(e => e.name === this.activeCharacter);
+                
+                if (activeEnt) {
+                    const ex = activeEnt.x * SCALE;
+                    const ey = activeEnt.y * SCALE;
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(ex, ey);
+                    ctx.lineTo(mx, my);
+                    ctx.strokeStyle = "rgba(255, 255, 255, 0.6)";
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([4, 4]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    
+                    const distFt = Math.max(Math.abs(this.mouseX - activeEnt.x), Math.abs(this.mouseY - activeEnt.y));
+                    const text = `${Math.round(distFt)} ft`;
+                    const midX = (ex + mx) / 2;
+                    const midY = (ey + my) / 2 - 10;
+                    
+                    ctx.font = "bold 14px sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.lineWidth = 3;
+                    ctx.strokeStyle = "black";
+                    ctx.strokeText(text, midX, midY);
+                    ctx.fillStyle = "white";
+                    ctx.fillText(text, midX, midY);
+                    
+                    // Reset fill/stroke for the AoE shape
+                    ctx.fillStyle = "rgba(255, 100, 0, 0.3)";
+                    ctx.strokeStyle = "rgba(255, 100, 0, 0.8)";
+                    ctx.lineWidth = 2;
+                }
+
                 if (this.aoeMode === "circle") {
                     ctx.beginPath();
                     ctx.arc(mx, my, sizePx, 0, Math.PI * 2);
@@ -435,7 +493,6 @@ class DMEngineClientCore {
                     ctx.fillRect(mx - sizePx/2, my - sizePx/2, sizePx, sizePx);
                     ctx.strokeRect(mx - sizePx/2, my - sizePx/2, sizePx, sizePx);
                 } else if (this.aoeMode === "cone" || this.aoeMode === "line") {
-                    const activeEnt = entities.find(e => e.name === this.activeCharacter);
                     if (activeEnt) {
                         const ex = activeEnt.x * SCALE;
                         const ey = activeEnt.y * SCALE;
@@ -469,18 +526,54 @@ class DMEngineClientCore {
                     }
                 }
             }
+            
+            // --- DRAW PINGS ---
+            if (this.activePings) {
+                const now = Date.now();
+                this.activePings.forEach(p => {
+                    const age = now - p.time;
+                    if (age > 3000) return;
+                    
+                    const maxRadius = 45; 
+                    const progress = age / 1000; 
+                    const pulse = progress % 1; 
+                    const radius = pulse * maxRadius;
+                    const alpha = 1 - pulse;
+                    
+                    const px = p.x * SCALE;
+                    const py = p.y * SCALE;
+
+                    ctx.beginPath(); ctx.arc(px, py, Math.max(0.1, radius), 0, Math.PI * 2);
+                    ctx.strokeStyle = `rgba(220, 53, 69, ${alpha})`; ctx.lineWidth = 3; ctx.stroke();
+                    ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2);
+                    ctx.fillStyle = `rgba(220, 53, 69, ${Math.max(0, 1 - age/3000)})`; ctx.fill();
+                    ctx.fillStyle = `rgba(255, 255, 255, ${Math.max(0, 1 - age/3000)})`;
+                    ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+                    ctx.fillText(p.character, px, py - 20);
+                });
+            }
         };
 
         if (imagePath) {
-            if (this.loadedImages[imagePath]) {
+            if (this.loadedImages[imagePath] instanceof Image) {
                 drawScene(this.loadedImages[imagePath]);
-            } else {
+            } else if (this.loadedImages[imagePath] === "failed") {
+                drawScene(null);
+            } else if (this.loadedImages[imagePath] === undefined) {
+                this.loadedImages[imagePath] = "loading";
                 const img = new Image();
                 img.onload = () => {
                     this.loadedImages[imagePath] = img;
                     drawScene(img);
                 };
+                img.onerror = () => {
+                    console.error("Failed to load map image:", imagePath);
+                    this.loadedImages[imagePath] = "failed";
+                    drawScene(null);
+                };
                 img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(imagePath)}`;
+            } else {
+                drawScene(null); // Waiting for load
             }
         } else {
             drawScene(null);
@@ -488,6 +581,31 @@ class DMEngineClientCore {
 
         // --- DRAG AND DROP LOGIC ---
         canvas.addEventListener('mousedown', (e) => {
+            if (e.shiftKey) {
+                const rect = canvas.getBoundingClientRect();
+                let newX = ((e.clientX - rect.left) * (canvas.width / rect.width)) / SCALE;
+                let newY = ((e.clientY - rect.top) * (canvas.height / rect.width)) / SCALE;
+
+                if (this.snapToGrid && this.currentMapData) {
+                    const gridSize = this.currentMapData.grid_scale;
+                    newX = Math.round(newX / gridSize) * gridSize;
+                    newY = Math.round(newY / gridSize) * gridSize;
+                }
+
+                fetch(`${this.serverUrl}/ping`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        client_id: this.clientId,
+                        character: this.activeCharacter,
+                        vault_path: this.vaultPath,
+                        x: Math.round(newX * 10) / 10,
+                        y: Math.round(newY * 10) / 10
+                    })
+                }).catch(err => console.error("Ping error:", err));
+                return;
+            }
+
             if (this.aoeMode) {
                 let text = "";
                 const size = this.aoeSize;
@@ -678,6 +796,10 @@ class DMEngineClientCore {
 
         canvas.addEventListener('mouseup', stopDrag);
         canvas.addEventListener('mouseout', stopDrag);
+        } catch (error) {
+            console.error("Engine Render Error:", error);
+            if(this.view.viewMaps) this.view.viewMaps.innerHTML = `<p style='color:var(--text-error);'>Error rendering map: ${error.message}</p>`;
+        }
     }
     
     async startListening() {
@@ -713,19 +835,28 @@ class DMEngineClientCore {
                     if (part.startsWith("data: ")) {
                         try {
                             const data = JSON.parse(part.substring(6));
+                            
+                            if (data.type === "ping") {
+                                this.activePings = this.activePings || [];
+                                this.activePings.push({ x: data.x, y: data.y, character: data.character, time: Date.now() });
+                                if (!this.pingAnimationId) this.animatePings();
+                            }
+                            
                             if (data.status === "streaming" || data.status === "error") {
-                                if (!msgDiv) {
-                                    msgDiv = this.view.ui.chatHistory.createDiv({ cls: "dm-message" });
-                                    msgDiv.style.marginBottom = "15px";
-                                    msgDiv.style.lineHeight = "1.5";
-                                    const senderSpan = msgDiv.createSpan({ text: `DM (Broadcast): ` });
-                                    senderSpan.style.fontWeight = "bold";
-                                    senderSpan.style.color = "var(--text-muted)";
-                                    contentDiv = msgDiv.createDiv({ cls: "dm-message-content" });
-                                    contentDiv.style.marginTop = "5px";
+                                if (data.reply) {
+                                    if (!msgDiv) {
+                                        msgDiv = this.view.ui.chatHistory.createDiv({ cls: "dm-message" });
+                                        msgDiv.style.marginBottom = "15px";
+                                        msgDiv.style.lineHeight = "1.5";
+                                        const senderSpan = msgDiv.createSpan({ text: `DM (Broadcast): ` });
+                                        senderSpan.style.fontWeight = "bold";
+                                        senderSpan.style.color = "var(--text-muted)";
+                                        contentDiv = msgDiv.createDiv({ cls: "dm-message-content" });
+                                        contentDiv.style.marginTop = "5px";
+                                    }
+                                    accumulatedText += data.reply;
+                                    needsRender = true;
                                 }
-                                accumulatedText += data.reply;
-                                needsRender = true;
                             } else if (data.status === "done") {
                                 msgDiv = null;
                                 contentDiv = null;
@@ -1160,6 +1291,64 @@ class DMChatView extends ItemView {
             localStorage.setItem("dm_snap_to_grid", e.target.checked);
         });
         snapGridLabel.appendChild(document.createTextNode("Snap to 5ft Grid"));
+
+        // Tab Bar
+        const tabBar = container.createDiv({ cls: "dm-tab-bar" });
+        tabBar.style.display = "flex";
+        tabBar.style.flex = "0 0 auto";
+        tabBar.style.borderBottom = "1px solid var(--background-modifier-border)";
+        tabBar.style.backgroundColor = "var(--background-secondary)";
+
+        const btnChat = tabBar.createEl("button", { text: "💬 Chat" });
+        const btnSheet = tabBar.createEl("button", { text: "📜 Sheet" });
+        const btnMaps = tabBar.createEl("button", { text: "🗺️ Maps" });
+
+        [btnChat, btnSheet, btnMaps].forEach(btn => {
+            btn.style.flex = "1";
+            btn.style.borderRadius = "0";
+            btn.style.background = "transparent";
+            btn.style.boxShadow = "none";
+            btn.style.border = "none";
+            btn.style.borderBottom = "2px solid transparent";
+            btn.style.cursor = "pointer";
+        });
+        btnChat.style.borderBottom = "2px solid var(--interactive-accent)";
+
+        // Views Container
+        const viewsContainer = container.createDiv();
+        viewsContainer.style.flex = "1 1 auto";
+        viewsContainer.style.display = "flex";
+        viewsContainer.style.flexDirection = "column";
+        viewsContainer.style.overflow = "hidden";
+
+        this.viewChat = viewsContainer.createDiv();
+        this.viewChat.style.display = "flex";
+        this.viewChat.style.flexDirection = "column";
+        this.viewChat.style.height = "100%";
+
+        this.viewSheet = viewsContainer.createDiv();
+        this.viewSheet.style.display = "none";
+        this.viewSheet.style.flexDirection = "column";
+        this.viewSheet.style.height = "100%";
+        this.viewSheet.style.overflowY = "auto";
+        this.viewSheet.style.padding = "15px";
+
+        this.viewMaps = viewsContainer.createDiv();
+        this.viewMaps.style.display = "none";
+        this.viewMaps.style.flexDirection = "column";
+        this.viewMaps.style.height = "100%";
+        this.viewMaps.style.overflow = "hidden";
+        this.viewMaps.style.padding = "15px";
+
+        const switchTab = (activeBtn, activeView) => {
+            [btnChat, btnSheet, btnMaps].forEach(b => b.style.borderBottom = "2px solid transparent");
+            [this.viewChat, this.viewSheet, this.viewMaps].forEach(v => v.style.display = "none");
+            activeBtn.style.borderBottom = "2px solid var(--interactive-accent)";
+            activeView.style.display = "flex";
+        };
+        btnChat.addEventListener("click", () => switchTab(btnChat, this.viewChat));
+        btnSheet.addEventListener("click", () => switchTab(btnSheet, this.viewSheet));
+        btnMaps.addEventListener("click", () => switchTab(btnMaps, this.viewMaps));
 
         // Setup Dynamic Perspective Styles
         const styleEl = document.createElement('style');

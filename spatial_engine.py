@@ -69,6 +69,7 @@ class TerrainZone(BaseModel):
     height: float = 0.0
     is_difficult: bool = True
     trap: Optional[TrapDefinition] = None
+    tags: List[str] = Field(default_factory=list)
     
     @property
     def polygon(self):
@@ -158,6 +159,11 @@ class SpatialQueryService:
         for w in self.map_data.active_walls:
             if w.wall_id == wall_id: return w
         return None
+        
+    def get_terrain_by_id(self, zone_id: uuid.UUID) -> Optional[TerrainZone]:
+        for tz in self.map_data.active_terrain:
+            if tz.zone_id == zone_id: return tz
+        return None
             
     def reveal_fog_of_war(self, x: float, y: float, radius: float):
         """Adds a circular area to the explored regions of the current map."""
@@ -192,6 +198,18 @@ class SpatialQueryService:
         if len(self.map_data.walls) + len(self.map_data.temporary_walls) < initial_count:
             self.invalidate_cache()
             
+    def add_terrain(self, terrain: TerrainZone, is_temporary: bool = False):
+        if is_temporary: self.map_data.temporary_terrain.append(terrain)
+        else: self.map_data.terrain.append(terrain)
+        self.invalidate_cache()
+        
+    def remove_terrain(self, zone_id: uuid.UUID):
+        initial_count = len(self.map_data.terrain) + len(self.map_data.temporary_terrain)
+        self.map_data.terrain = [t for t in self.map_data.terrain if t.zone_id != zone_id]
+        self.map_data.temporary_terrain = [t for t in self.map_data.temporary_terrain if t.zone_id != zone_id]
+        if len(self.map_data.terrain) + len(self.map_data.temporary_terrain) < initial_count:
+            self.invalidate_cache()
+
     def modify_wall(self, wall_id: uuid.UUID, is_solid: Optional[bool] = None, is_visible: Optional[bool] = None, is_locked: Optional[bool] = None):
         """Dynamically updates a wall's state (e.g., opening a door or destroying a wall)."""
         for wall in self.map_data.active_walls:
@@ -336,13 +354,14 @@ class SpatialQueryService:
                     
         return hit_uuids
         
-    def get_aoe_targets(self, shape: str, size: float, origin_x: float, origin_y: float, target_x: float = None, target_y: float = None, origin_z: float = 0.0, target_z: float = None, aoe_height: float = None, ignore_walls: bool = False, penetrates_destructible: bool = False) -> Tuple[List[uuid.UUID], List[uuid.UUID]]:
-        """Returns all valid Entities and Walls hit by an AoE, rigorously enforcing Line of Effect in 3D."""
-        if not HAS_GIS: return [], []
+    def get_aoe_targets(self, shape: str, size: float, origin_x: float, origin_y: float, target_x: float = None, target_y: float = None, origin_z: float = 0.0, target_z: float = None, aoe_height: float = None, ignore_walls: bool = False, penetrates_destructible: bool = False) -> Tuple[List[uuid.UUID], List[uuid.UUID], List[uuid.UUID]]:
+        """Returns all valid Entities, Walls, and Terrain hit by an AoE, enforcing Line of Effect."""
+        if not HAS_GIS: return [], [], []
         if target_z is None: target_z = origin_z
         
         hit_entities = []
         hit_walls = []
+        hit_terrains = []
         shape = shape.lower()
         aoe_poly = None
         vx, vy, vz = 0.0, 0.0, 0.0
@@ -469,7 +488,12 @@ class SpatialQueryService:
             if wall.line and aoe_poly.intersects(wall.line):
                 hit_walls.append(wall.wall_id)
                 
-        return hit_entities, hit_walls
+        # 4. Extract Hit Terrain (e.g., freezing a puddle)
+        for tz in self.map_data.active_terrain:
+            if tz.polygon and aoe_poly.intersects(tz.polygon):
+                hit_terrains.append(tz.zone_id)
+                
+        return hit_entities, hit_walls, hit_terrains
 
     def get_distance_and_cover(self, source_uuid: uuid.UUID, target_uuid: uuid.UUID) -> Tuple[float, str]:
         """Calculates distance and determines cover (None, Half, Three-Quarters, Total)."""

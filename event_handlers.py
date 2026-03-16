@@ -30,6 +30,7 @@ def resolve_spell_cast_handler(event: GameEvent):
         
     target_uuids = event.payload.get("target_uuids", [])
     target_wall_ids = event.payload.get("target_wall_ids", [])
+    target_terrain_ids = event.payload.get("target_terrain_ids", [])
     
     # Roll base damage/healing once for all targets
     base_damage = roll_dice(mechanics.damage_dice) if mechanics.damage_dice else 0
@@ -49,6 +50,47 @@ def resolve_spell_cast_handler(event: GameEvent):
     
     results = []
     
+    # 0. Apply Elemental Interactions to Environment BEFORE resolving entities!
+    if target_terrain_ids:
+        for tz_id in target_terrain_ids:
+            tz = spatial_service.get_terrain_by_id(tz_id)
+            if not tz: continue
+            
+            # Fire vs Flammable Thorns/Webs
+            if damage_type == "fire" and "flammable" in tz.tags:
+                tz.tags.remove("flammable")
+                tz.is_difficult = False
+                old_lbl = tz.label
+                tz.label += " (Burned Away)"
+                results.append(f"[Environment] The {old_lbl} caught fire and burned away!")
+                
+            # Fire vs Frozen Ice
+            elif damage_type == "fire" and "frozen" in tz.tags:
+                tz.tags.remove("frozen")
+                if "wet" not in tz.tags: tz.tags.append("wet")
+                tz.is_difficult = False
+                tz.label = tz.label.replace("Frozen", "Wet").replace("Ice", "Water")
+                results.append(f"[Environment] The frozen terrain melted into a wet puddle!")
+                
+            # Cold vs Wet Water
+            elif damage_type == "cold" and "wet" in tz.tags:
+                tz.tags.remove("wet")
+                if "frozen" not in tz.tags: tz.tags.append("frozen")
+                tz.is_difficult = True
+                tz.label = tz.label.replace("Wet", "Frozen").replace("Water", "Ice")
+                results.append(f"[Environment] The wet terrain froze solid!")
+                
+            # Lightning vs Wet Water -> Amplifies AoE!
+            elif damage_type == "lightning" and "wet" in tz.tags:
+                results.append(f"[Environment] The {tz.label} was electrified by lightning!")
+                if tz.polygon:
+                    for uid, ent in get_all_entities().items():
+                        if uid not in target_uuids and getattr(ent, 'hp', None) and ent.hp.base_value > 0:
+                            ent_poly = spatial_service._get_entity_bbox(ent)
+                            if ent_poly and tz.polygon.intersects(ent_poly):
+                                target_uuids.append(uid)
+                                results.append(f"[Environment] {ent.name} was pulled into the area of effect via electrified water!")
+
     for t_uuid in target_uuids:
         target: Creature = get_entity(t_uuid)
         if not target: continue

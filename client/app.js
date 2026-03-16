@@ -11,6 +11,7 @@ const ui = {
   autoSaves: document.getElementById("auto-saves"),
   autoSkills: document.getElementById("auto-skills"),
   autoAttacks: document.getElementById("auto-attacks"),
+  snapGrid: document.getElementById("snap-grid"),
   serverUrlInput: document.getElementById("server-url-input"),
   viewSheet: document.getElementById("view-sheet"),
   viewMaps: document.getElementById("view-maps"),
@@ -54,6 +55,14 @@ ui.listenCheck.addEventListener("change", (e) => {
     clientCore.syncState();
   });
 });
+
+if (ui.snapGrid) {
+  ui.snapGrid.checked = clientCore.snapToGrid;
+  ui.snapGrid.addEventListener("change", (e) => {
+    clientCore.snapToGrid = e.target.checked;
+    localStorage.setItem("dm_snap_to_grid", e.target.checked);
+  });
+}
 
 ui.sendBtn.addEventListener("click", () => clientCore.submitMessage());
 ui.chatInput.addEventListener("keydown", (e) => {

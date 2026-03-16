@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import patch
 
 from dnd_rules_engine import Creature, ModifiableValue, GameEvent, EventBus
-from spatial_engine import spatial_service, Wall
+from spatial_engine import spatial_service, Wall, TerrainZone
 from registry import clear_registry, register_entity
 
 @pytest.fixture(autouse=True)
@@ -42,7 +42,7 @@ def test_fireball_inner_corner():
     c_out_diag = create_test_creature("Diagonal Outside", -10, -10)
 
     # Fireball aimed just inside the corner
-    hits, hit_walls = spatial_service.get_aoe_targets("sphere", 20.0, 0.1, 0.1)
+    hits, hit_walls, _ = spatial_service.get_aoe_targets("sphere", 20.0, 0.1, 0.1)
 
     assert c_inside.entity_uuid in hits, "Target inside the wedge should be hit."
     assert c_out_x.entity_uuid not in hits, "Wall should block blast along the X axis."
@@ -66,7 +66,7 @@ def test_fireball_convex_corner():
     c_exposed3 = create_test_creature("Bottom-Right Exposed", 10, -10)
 
     # Fireball aimed just outside the corner
-    hits, hit_walls = spatial_service.get_aoe_targets("sphere", 20.0, 0.1, 0.1)
+    hits, hit_walls, _ = spatial_service.get_aoe_targets("sphere", 20.0, 0.1, 0.1)
 
     assert c_exposed1.entity_uuid in hits
     assert c_exposed2.entity_uuid in hits
@@ -87,7 +87,7 @@ def test_cone_of_cold_column():
     c_exposed = create_test_creature("Exposed", 5, 15)
 
     # 60ft Cone cast from origin (0,0) facing North towards (0, 20)
-    hits, hit_walls = spatial_service.get_aoe_targets("cone", 60.0, 0.0, 0.0, target_x=0.0, target_y=20.0)
+    hits, hit_walls, _ = spatial_service.get_aoe_targets("cone", 60.0, 0.0, 0.0, target_x=0.0, target_y=20.0)
 
     assert c_hiding.entity_uuid not in hits, "Enemy behind the column should not be hit."
     assert c_exposed.entity_uuid in hits, "Enemy beside the column should be hit."
@@ -114,7 +114,7 @@ def test_fireball_destructible_wall():
 
     # We use radius 19.9 to cleanly avoid Shapely reporting intersecting edge boundaries (e.g. exactly at x=-20).
     # This accurately maps to a D&D grid: a 20ft radius hits 4 interior 5ft squares, but misses the 5th outer square.
-    hits, hit_walls = spatial_service.get_aoe_targets("sphere", 19.9, 0.0, 0.0)
+    hits, hit_walls, _ = spatial_service.get_aoe_targets("sphere", 19.9, 0.0, 0.0)
 
     # We must fire a SpellCast event so the engine's resolve_spell_cast_handler natively applies the geometric damage
     mechanics = {"damage_dice": "8d6", "damage_type": "fire", "save_required": "dexterity"}
@@ -136,6 +136,24 @@ def test_fireball_destructible_wall():
         assert active_walls[wall_ids[i]].hp <= 0
         assert active_walls[wall_ids[i]].max_hp == 10
 
+def test_fireball_destructible_chest():
+    """Test an AoE completely shattering an item sitting on the ground."""
+    # Create a 5x5 box mimicking a chest
+    chest = Wall(label="Wooden Chest", start=(0, 0), end=(5, 0), is_solid=True, hp=15, vulnerabilities=["fire"])
+    spatial_service.add_wall(chest)
+    caster = create_test_creature("Mage", 0, 50)
+
+    hits, hit_walls, _ = spatial_service.get_aoe_targets("sphere", 20.0, 0.0, 0.0)
+    assert chest.wall_id in hit_walls
+
+    mechanics = {"damage_dice": "8d6", "damage_type": "fire", "save_required": "dexterity"}
+    with patch('event_handlers.roll_dice', return_value=28): # 28 * 2 = 56
+        event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={"ability_name": "Fireball", "mechanics": mechanics, "target_uuids": hits, "target_wall_ids": hit_walls})
+        EventBus.dispatch(event)
+
+    active_walls = {w.wall_id: w for w in spatial_service.map_data.active_walls}
+    assert active_walls[chest.wall_id].is_solid is False, "The chest should be blown wide open."
+    assert active_walls[chest.wall_id].hp <= 0
 
 def test_fireball_evasion_mechanics():
     """
@@ -154,7 +172,7 @@ def test_fireball_evasion_mechanics():
     rogue.tags.append("evasion")
     rogue.dexterity_mod.base_value = 5
 
-    hits, _ = spatial_service.get_aoe_targets("sphere", 20.0, 0.0, 0.0)
+    hits, _, _ = spatial_service.get_aoe_targets("sphere", 20.0, 0.0, 0.0)
 
     mechanics = {
         "damage_dice": "8d6", 
@@ -207,7 +225,7 @@ def test_aoe_z_axis_sphere():
     c_flying_diag.z = 15.0
     spatial_service.sync_entity(c_flying_diag)
 
-    hits, _ = spatial_service.get_aoe_targets("sphere", 20.0, 0.0, 0.0, origin_z=0.0)
+    hits, _, _ = spatial_service.get_aoe_targets("sphere", 20.0, 0.0, 0.0, origin_z=0.0)
 
     assert c_ground.entity_uuid in hits
     assert c_flying_low.entity_uuid in hits
@@ -231,7 +249,7 @@ def test_aoe_z_axis_cylinder():
     c_flying_high.z = 45.0 # Bounding box: 45 to 50.
     spatial_service.sync_entity(c_flying_high)
 
-    hits, _ = spatial_service.get_aoe_targets("cylinder", 20.0, 0.0, 0.0, origin_z=0.0, aoe_height=40.0)
+    hits, _, _ = spatial_service.get_aoe_targets("cylinder", 20.0, 0.0, 0.0, origin_z=0.0, aoe_height=40.0)
 
     assert c_ground.entity_uuid in hits
     assert c_flying_mid.entity_uuid in hits, "Target within cylinder height should be hit."
@@ -254,7 +272,7 @@ def test_aoe_z_axis_cube():
     c_above.z = 25.0 # BB: 25 to 30. Misses cube [0, 20]
     spatial_service.sync_entity(c_above)
 
-    hits, _ = spatial_service.get_aoe_targets("cube", 20.0, 0.0, 0.0, origin_z=10.0)
+    hits, _, _ = spatial_service.get_aoe_targets("cube", 20.0, 0.0, 0.0, origin_z=10.0)
 
     assert c_ground.entity_uuid in hits, "Ground target intersects bottom of cube."
     assert c_below.entity_uuid not in hits, "Target below cube should be safe."
@@ -286,7 +304,7 @@ def test_aoe_z_axis_line_lightning_bolt():
     spatial_service.sync_entity(c_flying_out_of_range)
 
     # 100ft line from (0,0,0) aimed at (0,30,30) 
-    hits, _ = spatial_service.get_aoe_targets("line", 100.0, 0.0, 0.0, target_x=0.0, target_y=30.0, origin_z=0.0, target_z=30.0)
+    hits, _, _ = spatial_service.get_aoe_targets("line", 100.0, 0.0, 0.0, target_x=0.0, target_y=30.0, origin_z=0.0, target_z=30.0)
 
     assert c_ground.entity_uuid not in hits, "Ground enemy under the beam should be safe."
     assert c_flying_path.entity_uuid in hits, "Flying enemy directly in the beam should be hit."
@@ -318,7 +336,7 @@ def test_aoe_z_axis_cone_upward():
     spatial_service.sync_entity(c_flying_far)
 
     # 60ft cone aimed diagonally upward
-    hits, _ = spatial_service.get_aoe_targets("cone", 60.0, 0.0, 0.0, target_x=0.0, target_y=30.0, origin_z=0.0, target_z=30.0)
+    hits, _, _ = spatial_service.get_aoe_targets("cone", 60.0, 0.0, 0.0, target_x=0.0, target_y=30.0, origin_z=0.0, target_z=30.0)
 
     assert c_ground.entity_uuid not in hits, "Ground enemy under the cone should be safe."
     assert c_flying_path.entity_uuid in hits, "Flying enemy inside the cone path should be hit."
@@ -343,7 +361,7 @@ def test_aoe_line_beside_beam():
     spatial_service.sync_entity(c_above)
 
     # 100ft line from (0,0,0) aimed flatly North at (0,30,0)
-    hits, _ = spatial_service.get_aoe_targets("line", 100.0, 0.0, 0.0, target_x=0.0, target_y=30.0, origin_z=0.0, target_z=0.0)
+    hits, _, _ = spatial_service.get_aoe_targets("line", 100.0, 0.0, 0.0, target_x=0.0, target_y=30.0, origin_z=0.0, target_z=0.0)
 
     assert c_ground.entity_uuid in hits, "Enemy directly in the beam should be hit."
     assert c_beside.entity_uuid not in hits, "Enemy 10ft beside the 5ft wide beam should be safe."
@@ -360,11 +378,11 @@ def test_aoe_ignore_walls_darkness():
     c_behind = create_test_creature("Hiding Target", 10, 0)
 
     # Standard sphere is blocked
-    hits_blocked, _ = spatial_service.get_aoe_targets("sphere", 20.0, -5.0, 0.0)
+    hits_blocked, _, _ = spatial_service.get_aoe_targets("sphere", 20.0, -5.0, 0.0)
     assert c_behind.entity_uuid not in hits_blocked
 
     # Darkness/Silence ignores walls for its AoE spread
-    hits_penetrate, _ = spatial_service.get_aoe_targets("sphere", 20.0, -5.0, 0.0, ignore_walls=True)
+    hits_penetrate, _, _ = spatial_service.get_aoe_targets("sphere", 20.0, -5.0, 0.0, ignore_walls=True)
     assert c_behind.entity_uuid in hits_penetrate
 
 def test_aoe_lightning_bolt_destructible_door():
@@ -381,11 +399,11 @@ def test_aoe_lightning_bolt_destructible_door():
     c_behind_door = create_test_creature("Behind Door", 10, 0)
     c_behind_iron = create_test_creature("Behind Iron Wall", 10, 20)
 
-    hits_door, hit_walls_door = spatial_service.get_aoe_targets("line", 100.0, -10.0, 0.0, target_x=20.0, target_y=0.0, penetrates_destructible=True)
+    hits_door, hit_walls_door, _ = spatial_service.get_aoe_targets("line", 100.0, -10.0, 0.0, target_x=20.0, target_y=0.0, penetrates_destructible=True)
     assert door.wall_id in hit_walls_door
     assert c_behind_door.entity_uuid in hits_door, "Target behind destructible door should be hit."
 
-    hits_iron, hit_walls_iron = spatial_service.get_aoe_targets("line", 100.0, -10.0, 20.0, target_x=20.0, target_y=20.0, penetrates_destructible=True)
+    hits_iron, hit_walls_iron, _ = spatial_service.get_aoe_targets("line", 100.0, -10.0, 20.0, target_x=20.0, target_y=20.0, penetrates_destructible=True)
     assert iron_wall.wall_id in hit_walls_iron
     assert c_behind_iron.entity_uuid not in hits_iron, "Target behind indestructible wall should be safe."
     
@@ -400,3 +418,62 @@ def test_aoe_lightning_bolt_destructible_door():
     assert active_walls[door.wall_id].is_solid is False
     assert active_walls[door.wall_id].hp <= 0
     assert c_behind_door.hp.base_value < 10
+
+def test_aoe_elemental_terrain_lightning_water():
+    """Test that lightning extends through a wet terrain zone, hitting targets outside the direct ray."""
+    caster = create_test_creature("Mage", 0, 0)
+    t_direct = create_test_creature("Direct Target", 0, 20)
+    t_water = create_test_creature("Water Target", 15, 20) # 15ft away from the beam!
+
+    puddle = TerrainZone(label="Giant Puddle", points=[(-5, 10), (20, 10), (20, 30), (-5, 30)], tags=["wet"])
+    spatial_service.add_terrain(puddle)
+
+    # Lightning bolt straight up the Y axis (5ft wide)
+    hits, walls, terrains = spatial_service.get_aoe_targets("line", 100.0, 0.0, 0.0, target_x=0.0, target_y=30.0)
+    
+    assert t_direct.entity_uuid in hits
+    assert t_water.entity_uuid not in hits # Ensure math correctly bypassed the water target directly
+    assert puddle.zone_id in terrains
+
+    mechanics = {"damage_dice": "8d6", "damage_type": "lightning"}
+    
+    with patch('event_handlers.roll_dice', return_value=30):
+        event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={"ability_name": "Lightning", "mechanics": mechanics, "target_uuids": hits, "target_terrain_ids": terrains})
+        EventBus.dispatch(event)
+
+    # Because of the elemental extension, t_water should take the 30 damage anyway!
+    assert t_direct.hp.base_value == -20
+    assert t_water.hp.base_value == -20
+    assert any("electrified" in res for res in event.payload["results"])
+    
+def test_aoe_elemental_terrain_fire_thorns():
+    """Test that fire burns away flammable difficult terrain."""
+    caster = create_test_creature("Mage", 0, 0)
+    thorns = TerrainZone(label="Spike Growth", points=[(-5, 10), (20, 10), (20, 30), (-5, 30)], is_difficult=True, tags=["flammable", "thorns"])
+    spatial_service.add_terrain(thorns)
+    
+    hits, walls, terrains = spatial_service.get_aoe_targets("sphere", 20.0, 5.0, 15.0)
+    assert thorns.zone_id in terrains
+    
+    mechanics = {"damage_dice": "8d6", "damage_type": "fire"}
+    event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={"ability_name": "Fireball", "mechanics": mechanics, "target_uuids": hits, "target_terrain_ids": terrains})
+    EventBus.dispatch(event)
+    
+    assert "flammable" not in thorns.tags
+    assert thorns.is_difficult is False
+    assert "Burned Away" in thorns.label
+    
+def test_aoe_elemental_terrain_cold_water_freezes():
+    """Test that cold damage freezes a wet puddle."""
+    caster = create_test_creature("Mage", 0, 0)
+    puddle = TerrainZone(label="Puddle", points=[(-5, 10), (20, 10), (20, 30), (-5, 30)], is_difficult=False, tags=["wet"])
+    spatial_service.add_terrain(puddle)
+    
+    hits, walls, terrains = spatial_service.get_aoe_targets("sphere", 20.0, 5.0, 15.0)
+    mechanics = {"damage_dice": "8d6", "damage_type": "cold"}
+    event = GameEvent(event_type="SpellCast", source_uuid=caster.entity_uuid, payload={"ability_name": "Cone of Cold", "mechanics": mechanics, "target_uuids": hits, "target_terrain_ids": terrains})
+    EventBus.dispatch(event)
+    
+    assert "wet" not in puddle.tags
+    assert "frozen" in puddle.tags
+    assert puddle.is_difficult is True

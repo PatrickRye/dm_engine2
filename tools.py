@@ -22,7 +22,7 @@ import event_handlers
 from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
 from item_system import WeaponItem, ArmorItem, WondrousItem, ItemCompendium
 
-from registry import get_all_entities
+from registry import get_all_entities, register_entity
 
 _CHARACTER_AUTOMATIONS = {}
 
@@ -665,6 +665,7 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
                 dmg_dice = "1d4" if "Unarmed" in item_name else "1d8"
                 dmg_type = "bludgeoning" if "Unarmed" in item_name else "slashing"
                 new_weapon = MeleeWeapon(name=item_name, damage_dice=dmg_dice, damage_type=dmg_type)
+            register_entity(new_weapon)
             engine_creature.equipped_weapon_uuid = new_weapon.entity_uuid
         if new_ac_value is not None:
             engine_creature.ac.base_value = new_ac_value
@@ -1662,6 +1663,7 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
     
     target_uuids = []
     target_wall_ids = []
+    target_terrain_ids = []
     
     ignore_walls = "ignore_walls" in granted_tags
     penetrates = "penetrates_destructible" in granted_tags
@@ -1678,9 +1680,10 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
             oz = caster.z
             if tz is None: tz = caster.z
             
-        hits, walls = spatial_service.get_aoe_targets(shape, aoe_size, ox, oy, tx, ty, origin_z=oz, target_z=tz, ignore_walls=ignore_walls, penetrates_destructible=penetrates)
+        hits, walls, terrains = spatial_service.get_aoe_targets(shape, aoe_size, ox, oy, tx, ty, origin_z=oz, target_z=tz, ignore_walls=ignore_walls, penetrates_destructible=penetrates)
         target_uuids.extend(hits)
         target_wall_ids.extend(walls)
+        target_terrain_ids.extend(terrains)
         target_string = f"{aoe_size}ft {shape} at coordinates ({target_x}, {target_y})"
     else:
         for name in (target_names or []):
@@ -1716,6 +1719,7 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
             "mechanics": mechanics_dump,
             "target_uuids": target_uuids,
             "target_wall_ids": target_wall_ids,
+            "target_terrain_ids": target_terrain_ids,
             "current_initiative": current_init,
             "manual_attack_roll": manual_attack_roll,
             "is_critical": is_critical,
@@ -2112,6 +2116,31 @@ async def manage_map_geometry(action: str, label: str = "", start_x: float = 0.0
             return f"MECHANICAL TRUTH: Modified wall/obstacle '{target.label}'. Solid: {is_solid}, Visible: {is_visible}."
             
     return "SYSTEM ERROR: Invalid action. Use 'add_wall', 'remove_wall', or 'modify_wall'."
+
+@tool
+async def manage_map_terrain(action: str, label: str = "", center_x: float = 0.0, center_y: float = 0.0, radius: float = 5.0, is_difficult: bool = True, tags: list[str] = None, is_temporary: bool = True, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """
+    Dynamically adds or removes terrain zones (e.g., Grease, Ice, Webs, Water).
+    - action: 'add' or 'remove'.
+    - tags: Pass elemental descriptors like 'wet', 'frozen', or 'flammable'.
+    """
+    from spatial_engine import TerrainZone
+    if action.lower() == "add":
+        tags = tags or []
+        points = []
+        for i in range(6):
+            angle = 2 * math.pi * i / 6
+            points.append((center_x + radius * math.cos(angle), center_y + radius * math.sin(angle)))
+            
+        tz = TerrainZone(label=label, points=points, is_difficult=is_difficult, tags=tags)
+        spatial_service.add_terrain(tz, is_temporary=is_temporary)
+        return f"MECHANICAL TRUTH: Added terrain '{label}' at ({center_x}, {center_y}) with radius {radius}ft. Tags: {tags}."
+    elif action.lower() == "remove":
+        target_zones = [t for t in spatial_service.map_data.active_terrain if label.lower() in t.label.lower()]
+        if not target_zones: return f"SYSTEM ERROR: Terrain '{label}' not found."
+        spatial_service.remove_terrain(target_zones[0].zone_id)
+        return f"MECHANICAL TRUTH: Removed terrain '{target_zones[0].label}'."
+    return "SYSTEM ERROR: Invalid action."
 
 @tool
 async def manage_map_trap(target_label: str, hazard_name: str, trigger_on_interact_fail: bool = False, trigger_on_move: bool = False, requires_attack_roll: bool = False, attack_bonus: int = 5, save_required: str = "", save_dc: int = 15, damage_dice: str = "", damage_type: str = "", condition_applied: str = "", radius: float = 0.0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
