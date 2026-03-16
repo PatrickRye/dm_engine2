@@ -18,7 +18,10 @@ class QAResult(BaseModel):
     feedback: str = Field(description="If approved, write 'APPROVED'. If false, give exact fix instructions.")
     requires_clarification: bool = Field(
         default=False,
-        description="True if the player's input is confusing or if a tool was executed incorrectly and the engine needs to ask the player to clarify.",
+        description=(
+            "True if the player's input is confusing or if a tool was executed "
+            "incorrectly and the engine needs to ask the player to clarify."
+        ),
     )
     clarification_message: str = Field(
         default="",
@@ -33,7 +36,9 @@ class Describable(BaseModel):
     current_appearance: str = Field(default="", description="Current situational appearance. IMPROVISE.")
     icon_url: str = Field(
         default="",
-        description="Relative vault path to the top-down token/avatar image for the VTT map (e.g., 'Assets/tokens/goblin.png').",
+        description=(
+            "Relative vault path to the top-down token/avatar image for the VTT map " "(e.g., 'Assets/tokens/goblin.png')."
+        ),
     )
     misc_notes: str = Field(default="", description="Catch-all for extra lore, rumors, dark secrets, or 'Jazz'.")
 
@@ -123,7 +128,10 @@ class LocationDetails(Social):
     establishments: str = Field(default="", description="Taverns, shops, and points of interest. IMPROVISE.")
     diversity: str = Field(
         default="",
-        description="The specific types of folk, races, or factions players might encounter here. Is it a homogeneous or diverse melting pot? IMPROVISE.",
+        description=(
+            "The specific types of folk, races, or factions players might encounter "
+            "here. Is it a homogeneous or diverse melting pot? IMPROVISE."
+        ),
     )
 
 

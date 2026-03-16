@@ -34,12 +34,15 @@ def mock_entities(mock_obsidian_vault):
 
     with open(os.path.join(journals_dir, f"{char_name}.md"), "w", encoding="utf-8") as f:
         f.write(
-            f"---\nname: {char_name}\ntags: [pc]\nhp: 25\nmax_hp: 25\nac: 16\nstrength_mod: 3\ndexterity_mod: 1\nequipment: {{main_hand: Unarmed}}\nclasses: [{{class_name: Fighter, level: 2, subclass_name: Champion}}]\n---\n"
+            f"---\nname: {char_name}\ntags: [pc]\nhp: 25\nmax_hp: 25\nac: 16\nstrength_mod: 3\n"
+            f"dexterity_mod: 1\nequipment: {{main_hand: Unarmed}}\n"
+            f"classes: [{{class_name: Fighter, level: 2, subclass_name: Champion}}]\n---\n"
         )
 
     with open(os.path.join(journals_dir, f"{target_name}.md"), "w", encoding="utf-8") as f:
         f.write(
-            f"---\nname: {target_name}\ntags: [monster]\nhp: 7\nac: 15\nstrength_mod: -1\ndexterity_mod: 2\nequipment: {{main_hand: Dagger}}\n---\n"
+            f"---\nname: {target_name}\ntags: [monster]\nhp: 7\nac: 15\nstrength_mod: -1\n"
+            f"dexterity_mod: 2\nequipment: {{main_hand: Dagger}}\n---\n"
         )
 
     with open(os.path.join(journals_dir, "CAMPAIGN_MASTER.md"), "w", encoding="utf-8") as f:

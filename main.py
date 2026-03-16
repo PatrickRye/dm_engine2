@@ -261,7 +261,6 @@ def build_graph():
 
 
 async def qa_node(state: DMState, config: RunnableConfig):
-    global qa_llm
     vault, draft, revisions = state["vault_path"], state["draft_response"], state.get("revision_count", 0)
 
     # --- ESCAPE CLAUSE 1: Allow DM to ask questions without being audited ---
@@ -328,7 +327,8 @@ async def qa_node(state: DMState, config: RunnableConfig):
         "11. PARADIGMS: Did the DM force movement limits out of combat? (If yes, REJECT).\n"
         + tone_check
         + "\nIf ANY rule is broken, set 'approved' to False and explain exactly what to rewrite. "
-        "If the DM applied a mechanic incorrectly, do not just tell them it is wrong. You MUST provide the details of the game rules needed to fix it."
+        "If the DM applied a mechanic incorrectly, do not just tell them it is wrong. "
+        "You MUST provide the details of the game rules needed to fix it."
     )
 
     # We use structured output to enforce the QAResult schema
@@ -381,6 +381,7 @@ async def lifespan(app: FastAPI):
     try:
         # Upgraded to Pro for deeper reasoning, and Temp 0.6 to encourage "Jazz"
         draft_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.6)
+        qa_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
 
         # Build and compile the multi-agent graph ONCE when the server boots
         dm_engine_app = build_graph()
@@ -584,7 +585,7 @@ async def ping_endpoint(request: PingRequest):
 
 
 @app.post("/propose_move", response_model=ProposeMoveResponse)
-async def propose_move_endpoint(request: ProposeMoveRequest):
+async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
     """Analyzes a proposed movement path for collisions, opportunity attacks, and traps."""
 
     entity = await _get_entity_by_name(request.entity_name, request.vault_path)
@@ -995,8 +996,7 @@ async def listen_endpoint(client_id: str, request: Request):
 
 
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest):  # <--- Added async
-    global dm_engine_app
+async def chat_endpoint(request: ChatRequest):  # noqa: C901
     if not dm_engine_app:
         raise HTTPException(status_code=500, detail="DM Engine not initialized.")
 
@@ -1004,7 +1004,7 @@ async def chat_endpoint(request: ChatRequest):  # <--- Added async
     if request.character in CHARACTER_LOCKS and CHARACTER_LOCKS[request.character] != request.client_id:
         raise HTTPException(
             status_code=403,
-            detail=f"Agency Error: '{request.character}' is currently being controlled by another player's connection.",
+            detail=(f"Agency Error: '{request.character}' is currently " "being controlled by another player's connection."),
         )
     CHARACTER_LOCKS[request.character] = request.client_id
 

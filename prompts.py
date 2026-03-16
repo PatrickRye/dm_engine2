@@ -1,3 +1,4 @@
+# flake8: noqa: E501, W291
 # Master prompts and system instructions
 
 MASTER_PROMPT = """

@@ -152,7 +152,9 @@ def test_multi_turn_expiration_and_premature_checks():
     # Mod should NOT decrement its duration because it only ticks on Init 15.
     EventBus.dispatch(
         GameEvent(
-            event_type="AdvanceTime", source_uuid=pc.entity_uuid, payload={"seconds_advanced": 6, "target_initiative": 10}
+            event_type="AdvanceTime",
+            source_uuid=pc.entity_uuid,
+            payload={"seconds_advanced": 6, "target_initiative": 10},
         )
     )
     assert pc.strength_mod.modifiers[0].duration_seconds == 18  # Still full duration!
@@ -162,7 +164,9 @@ def test_multi_turn_expiration_and_premature_checks():
     # Should decrement 6 seconds. 12 seconds remaining.
     EventBus.dispatch(
         GameEvent(
-            event_type="AdvanceTime", source_uuid=pc.entity_uuid, payload={"seconds_advanced": 6, "target_initiative": 15}
+            event_type="AdvanceTime",
+            source_uuid=pc.entity_uuid,
+            payload={"seconds_advanced": 6, "target_initiative": 15},
         )
     )
     assert pc.strength_mod.modifiers[0].duration_seconds == 12
@@ -190,7 +194,7 @@ def test_multi_turn_expiration_and_premature_checks():
 
 
 def test_prone_movement_cost():
-    """Tests that a character with the 'Prone' condition is charged half their movement to stand up when attempting a normal walk."""
+    """Tests that a character with the 'Prone' condition is charged half their movement to stand up when attempting a normal walk."""  # noqa: E501
     pc = Creature(
         name="Fighter",
         hp=ModifiableValue(base_value=10),
@@ -397,7 +401,7 @@ def test_opportunity_attack_bypass():
 
 
 def test_evasion_and_concentration_check_prompt():
-    """Tests a Rogue failing a DEX save taking half damage (Evasion) and triggering a Concentration check prompt, without losing concentration automatically."""
+    """Tests a Rogue failing a DEX save taking half damage (Evasion) and triggering a Concentration check prompt, without losing concentration automatically."""  # noqa: E501
     caster = Creature(
         name="Wizard",
         hp=ModifiableValue(base_value=10),

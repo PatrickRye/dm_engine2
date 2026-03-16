@@ -137,9 +137,7 @@ async def test_5_round_combat_execution(mock_5_round_vault):
 
         # --- ROUND 2 ---
         res = await execute_melee_attack.ainvoke({"attacker_name": "Troll", "target_name": "Fighter"}, config=config)
-        await move_entity.ainvoke(
-            {"entity_name": "Orc1", "target_x": 5, "target_y": 0, "movement_type": "walk"}, config=config
-        )
+        await move_entity.ainvoke({"entity_name": "Orc1", "target_x": 5, "target_y": 0, "movement_type": "walk"}, config=config)
 
         # Orc1 attacks Wizard -> Wizard casts Shield reaction
         res = await execute_melee_attack.ainvoke({"attacker_name": "Orc1", "target_name": "Wizard"}, config=config)
@@ -158,9 +156,7 @@ async def test_5_round_combat_execution(mock_5_round_vault):
         await move_entity.ainvoke(
             {"entity_name": "Thief", "target_x": 25, "target_y": -5, "movement_type": "walk"}, config=config
         )
-        await perform_ability_check_or_save.ainvoke(
-            {"character_name": "Thief", "skill_or_stat_name": "stealth"}, config=config
-        )
+        await perform_ability_check_or_save.ainvoke({"character_name": "Thief", "skill_or_stat_name": "stealth"}, config=config)
         await execute_melee_attack.ainvoke({"attacker_name": "Thief", "target_name": "Orc2", "advantage": True}, config=config)
         await update_combat_state.ainvoke({"next_turn": True}, config=config)
 

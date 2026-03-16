@@ -190,7 +190,7 @@ class SpatialQueryService:
                 self._raycast_cache[vault_path] = {}
         return self._map_data[vault_path]
 
-    def clear(self, vault_path: str = None):
+    def clear(self, vault_path: str = None):  # noqa: C901
         """Completely resets the spatial engine and Rtree index for testing."""
         if vault_path:
             if vault_path in self._map_data:
@@ -513,7 +513,7 @@ class SpatialQueryService:
 
         return hit_uuids
 
-    def get_aoe_targets(
+    def get_aoe_targets(  # noqa: C901
         self,
         shape: str,
         size: float,

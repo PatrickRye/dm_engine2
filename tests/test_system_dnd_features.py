@@ -218,17 +218,28 @@ def test_system_long_rest_recharge_and_expiration():
 
     # Add a 1-hour buff and an 8-hour condition
     wizard.strength_mod.add_modifier(
-        NumericalModifier(priority=ModifierPriority.ADDITIVE, value=2, source_name="Bull's Strength", duration_seconds=3600)
+        NumericalModifier(
+            priority=ModifierPriority.ADDITIVE,
+            value=2,
+            source_name="Bull's Strength",
+            duration_seconds=3600,
+        )
     )
     wizard.active_conditions.append(ActiveCondition(name="Poisoned", duration_seconds=28800))
 
     # Simulate `take_rest` tool dispatching AdvanceTime for 8 hours
-    time_event = GameEvent(event_type="AdvanceTime", source_uuid=wizard.entity_uuid, payload={"seconds_advanced": 28800})
+    time_event = GameEvent(
+        event_type="AdvanceTime",
+        source_uuid=wizard.entity_uuid,
+        payload={"seconds_advanced": 28800},
+    )
     EventBus.dispatch(time_event)
 
     # Simulate `take_rest` tool dispatching the Rest event
     rest_event = GameEvent(
-        event_type="Rest", source_uuid=wizard.entity_uuid, payload={"rest_type": "long", "target_uuids": [wizard.entity_uuid]}
+        event_type="Rest",
+        source_uuid=wizard.entity_uuid,
+        payload={"rest_type": "long", "target_uuids": [wizard.entity_uuid]},
     )
     EventBus.dispatch(rest_event)
 
@@ -292,7 +303,7 @@ async def test_system_dynamic_lighting_and_combat():
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
-    # Target has darkvision so they can see the human perfectly, meaning the Human doesn't get Unseen Attacker Advantage to cancel out their Disadvantage.
+    # Target has darkvision so they can see the human perfectly, meaning the Human doesn't get Unseen Attacker Advantage to cancel out their Disadvantage.  # noqa: E501
     target = Creature(
         name="Goblin",
         tags=["darkvision"],
@@ -1107,7 +1118,11 @@ def test_system_concentration_buff_and_debuff_expiration():
     event2 = GameEvent(
         event_type="SpellCast",
         source_uuid=caster.entity_uuid,
-        payload={"ability_name": "Bane", "mechanics": bane_mechanics, "target_uuids": [enemy1.entity_uuid]},
+        payload={
+            "ability_name": "Bane",
+            "mechanics": bane_mechanics,
+            "target_uuids": [enemy1.entity_uuid],
+        },
     )
     EventBus.dispatch(event2)
 

@@ -24,7 +24,7 @@ from spell_system import SpellMechanics
 from pydantic import ValidationError
 
 
-def resolve_spell_cast_handler(event: GameEvent):
+def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
     """Calculates spell hits, saving throws, and damage across multiple targets."""
     if event.status != EventStatus.EXECUTION:
         return
@@ -363,7 +363,7 @@ def resolve_spell_cast_handler(event: GameEvent):
     event.payload["results"] = results
 
 
-def resolve_attack_handler(event: GameEvent):
+def resolve_attack_handler(event: GameEvent):  # noqa: C901
     """Calculates if an attack hits and its base damage. Listens to EXECUTION phase."""
     if event.status != EventStatus.EXECUTION:
         return
@@ -666,7 +666,7 @@ def handle_rest_event(event: GameEvent):
             print(f"[Engine] {target.name} finished a Long Rest. HP and resources fully restored.")
 
 
-def handle_advance_time_event(event: GameEvent):
+def handle_advance_time_event(event: GameEvent):  # noqa: C901
     """Deterministically expires temporary modifiers when time advances."""
     if event.status != EventStatus.EXECUTION:
         return
@@ -694,9 +694,7 @@ def handle_advance_time_event(event: GameEvent):
                         stat_val.remove_modifier(mod.mod_uuid)
                         if mod.source_name in entity.active_mechanics:
                             entity.active_mechanics.remove(mod.source_name)
-                        print(
-                            f"[Engine] {entity.name}'s temporary mechanic '{mod.source_name}' on '{field_name}' has expired."
-                        )
+                        print(f"[Engine] {entity.name}'s temporary mechanic '{mod.source_name}' on '{field_name}' has expired.")
 
             # Clean up active conditions
             expired_conditions = []
@@ -871,7 +869,7 @@ def validate_movement_handler(event: GameEvent):
     event.payload["cost"] = total_cost
 
 
-def resolve_movement_handler(event: GameEvent):
+def resolve_movement_handler(event: GameEvent):  # noqa: C901
     """Evaluates movement to see if it provokes opportunity attacks."""
     if event.status != EventStatus.EXECUTION:
         return

@@ -379,7 +379,7 @@ async def write_audit_log(vault_path: str, agent_name: str, action: str, details
 
 
 @tool
-async def upsert_journal_section(
+async def upsert_journal_section(  # noqa: C901
     entity_name: str,
     section_header: str,
     content: str,
