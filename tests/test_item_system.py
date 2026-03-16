@@ -352,6 +352,7 @@ async def test_armor_item_restrictions(setup_engine_and_vault):
     plate = ArmorItem(name="Plate Armor", armor_category="Heavy", base_ac=18, strength_requirement=15)
     await ItemCompendium.save_item(vault_path, plate)
     
+    await equip_item.ainvoke({"character_name": "Rogue", "item_name": "None", "item_slot": "armor"}, config=config)
     await equip_item.ainvoke({"character_name": "Rogue", "item_name": "Plate Armor", "item_slot": "armor"}, config=config)
     assert rogue.ac.base_value == 18 # Dex is ignored
     
@@ -363,3 +364,112 @@ async def test_armor_item_restrictions(setup_engine_and_vault):
     res = await attune_item.ainvoke({"character_name": "Rogue", "item_name": "Dwarven Plate", "action": "attune"}, config=config)
     assert "SYSTEM ERROR" in res
     assert "dwarf" in res
+
+@pytest.mark.asyncio
+async def test_attune_item_enforces_restrictions(setup_engine_and_vault):
+    """
+    Test that the attune_item tool enforces class, species, and alignment restrictions.
+    """
+    vault_path = setup_engine_and_vault
+    j_dir = get_journals_dir(vault_path)
+    
+    char_md = os.path.join(j_dir, "Paladin.md")
+    with open(char_md, "w", encoding="utf-8") as f:
+        f.write("---\nspecies: Human\nalignment: lawful good\nclasses: [{class_name: Paladin, level: 5}]\nequipment:\n  main_hand: None\nattuned_items: []\n---")
+        
+    paladin = Creature(
+        name="Paladin", vault_path=vault_path, x=0, y=0, 
+        hp=ModifiableValue(base_value=40), ac=ModifiableValue(base_value=18), 
+        strength_mod=ModifiableValue(base_value=4), dexterity_mod=ModifiableValue(base_value=0),
+        tags=["pc"]
+    )
+    register_entity(paladin)
+    
+    config = {"configurable": {"thread_id": vault_path}}
+
+    # 1. Class Restriction (Requires Paladin)
+    holy_avenger = WeaponItem(name="Holy Avenger", damage_dice="1d8", damage_type="slashing", requires_attunement=True, tags=["requires_attunement_by_paladin"])
+    await ItemCompendium.save_item(vault_path, holy_avenger)
+    
+    # Paladin attunes -> Success
+    res1 = await attune_item.ainvoke({"character_name": "Paladin", "item_name": "Holy Avenger", "action": "attune"}, config=config)
+    assert "Success" in res1
+    
+    # Unattune to free slot
+    await attune_item.ainvoke({"character_name": "Paladin", "item_name": "Holy Avenger", "action": "unattune"}, config=config)
+
+    # 2. Species Restriction (Requires Elf)
+    elven_chain = ArmorItem(name="Elven Chain", armor_category="Medium", requires_attunement=True, tags=["requires_attunement_by_elf"])
+    await ItemCompendium.save_item(vault_path, elven_chain)
+    
+    # Paladin (Human) tries to attune -> Fails
+    res2 = await attune_item.ainvoke({"character_name": "Paladin", "item_name": "Elven Chain", "action": "attune"}, config=config)
+    assert "SYSTEM ERROR" in res2
+    assert "elf" in res2
+    
+    # 3. Alignment Restriction (Requires Evil)
+    evil_sword = WeaponItem(name="Sword of Evil", damage_dice="1d8", damage_type="slashing", requires_attunement=True, tags=["requires_attunement_by_evil"])
+    await ItemCompendium.save_item(vault_path, evil_sword)
+    
+    # Paladin (Good) tries to attune -> Fails
+    res3 = await attune_item.ainvoke({"character_name": "Paladin", "item_name": "Sword of Evil", "action": "attune"}, config=config)
+    assert "SYSTEM ERROR" in res3
+    assert "evil" in res3
+
+@pytest.mark.asyncio
+async def test_equip_item_slot_management(setup_engine_and_vault):
+    """
+    Test that the equip_item tool accurately blocks equipping into occupied slots
+    (e.g., all ring slots full, boots, armor, and aliases like helmet/necklace/bracers),
+    and that it allows for more than one (like rings) when appropriate.
+    """
+    vault_path = setup_engine_and_vault
+    j_dir = get_journals_dir(vault_path)
+    
+    char_md = os.path.join(j_dir, "Fighter.md")
+    with open(char_md, "w", encoding="utf-8") as f:
+        f.write("---\nequipment:\n  armor: Chainmail\n  shield: None\n  head: Leather Cap\n  cloak: None\n  gloves: None\n  boots: Leather Boots\n  ring1: None\n  ring2: None\n  amulet: None\n  main_hand: None\n  off_hand: None\n---")
+        
+    fighter = Creature(
+        name="Fighter", vault_path=vault_path, x=0, y=0, 
+        hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=15), 
+        strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0),
+        tags=["pc"]
+    )
+    register_entity(fighter)
+    
+    config = {"configurable": {"thread_id": vault_path}}
+
+    # 1. Allow for more than one (like rings) when appropriate
+    res1 = await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Ring of Protection", "item_slot": "ring"}, config=config)
+    assert "Success" in res1
+    assert "ring1" in res1
+    
+    res2 = await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Ring of Fire Resistance", "item_slot": "ring"}, config=config)
+    assert "Success" in res2
+    assert "ring2" in res2
+    
+    # 2. Block equipping when all ring slots are full
+    res3 = await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Ring of Water Walking", "item_slot": "ring"}, config=config)
+    assert "Error" in res3
+    assert "Both ring slots are already occupied" in res3
+
+    # 3. Block equipping into occupied standard slots (and test aliases!)
+    res_boots = await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Boots of Speed", "item_slot": "boots"}, config=config)
+    assert "Error" in res_boots
+    assert "already occupied by 'Leather Boots'" in res_boots
+    
+    res_armor = await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Plate Armor", "item_slot": "armor"}, config=config)
+    assert "Error" in res_armor
+    assert "already occupied by 'Chainmail'" in res_armor
+
+    res_helmet = await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Iron Helmet", "item_slot": "helmet"}, config=config)
+    assert "Error" in res_helmet
+    assert "already occupied by 'Leather Cap'" in res_helmet
+
+    # 4. Equip into empty slots using aliases
+    res_amulet = await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Magic Necklace", "item_slot": "necklace"}, config=config)
+    assert "Success" in res_amulet
+    
+    res_bracers = await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Leather Bracers", "item_slot": "bracers"}, config=config)
+    assert "Success" in res_bracers

@@ -4,8 +4,6 @@ import yaml
 import random
 import math
 import aiofiles
-import aiofiles.os as aios
-from filelock.asyncio import AsyncSoftFileLock
 from langchain_core.tools import tool, InjectedToolArg
 from langchain_core.runnables import RunnableConfig
 from pydantic import Field
@@ -13,29 +11,47 @@ from typing import Optional, Annotated, Union
 import uuid
 
 # === DETERMINISTIC ENGINE INTEGRATION ===
-from dnd_rules_engine import EventBus, GameEvent, EventStatus, BaseGameEntity, Creature, MeleeWeapon, roll_dice as roll_generic_dice, ActiveCondition, ModifiableValue, NumericalModifier, ModifierPriority
-from state import PCDetails, NPCDetails, LocationDetails, FactionDetails, ClassLevel
-from vault_io import get_journals_dir, write_audit_log, read_markdown_entity_no_lock, write_markdown_entity_no_lock, upsert_journal_section, read_markdown_entity, edit_markdown_entity
+from dnd_rules_engine import (
+    EventBus,
+    GameEvent,
+    EventStatus,
+    BaseGameEntity,
+    Creature,
+    MeleeWeapon,
+    ActiveCondition,
+    ModifiableValue,
+    NumericalModifier,
+    ModifierPriority,
+)
+from state import PCDetails, NPCDetails, LocationDetails, FactionDetails
+from vault_io import (
+    get_journals_dir,
+    write_audit_log,
+    upsert_journal_section,
+    read_markdown_entity,
+    edit_markdown_entity,
+)
 from compendium_manager import CompendiumManager, CompendiumEntry, MechanicEffect
 from spatial_engine import spatial_service, LightSource, Wall
-import event_handlers
 from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
 from item_system import WeaponItem, ArmorItem, WondrousItem, ItemCompendium
 
 from registry import get_all_entities, register_entity, get_entity
 
+
 class VaultCache:
     def __init__(self):
-        self.bestiary_cache = {} # vault_path -> [ (filename, content) ]
-        self.chunk_cache = {} # vault_path -> category -> [ (filename, chunk) ]
+        self.bestiary_cache = {}  # vault_path -> [ (filename, content) ]
+        self.chunk_cache = {}  # vault_path -> category -> [ (filename, chunk) ]
         self.indexed_vaults = set()
-        
+
     def build_index(self, vault_path: str):
-        if vault_path in self.indexed_vaults: return
-        
+        if vault_path in self.indexed_vaults:
+            return
+
         self.bestiary_cache[vault_path] = []
         self.chunk_cache[vault_path] = {"rules": [], "modules": [], "bestiary": []}
-        
+
         for cat in ["bestiary", "rules", "modules"]:
             dirs = _get_config_dirs(vault_path, cat)
             for d in dirs:
@@ -43,92 +59,103 @@ class VaultCache:
                     for file in files:
                         if file.endswith(".md"):
                             try:
-                                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                                    content = f.read().replace('\r\n', '\n')
+                                with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+                                    content = f.read().replace("\r\n", "\n")
                                     if cat == "bestiary":
                                         self.bestiary_cache[vault_path].append((file, content))
-                                    
+
                                     # Pre-chunk for keyword search
                                     body = content
                                     if body.startswith("---"):
                                         parts = body.split("---", 2)
-                                        if len(parts) >= 3: body = parts[2]
-                                        
-                                    chunks = re.split(r'\n(?=#+ )', body)
+                                        if len(parts) >= 3:
+                                            body = parts[2]
+
+                                    chunks = re.split(r"\n(?=#+ )", body)
                                     for chunk in chunks:
                                         if chunk.strip():
                                             self.chunk_cache[vault_path][cat].append((file, chunk.strip()))
-                                            
-                            except Exception: pass
+
+                            except Exception:
+                                pass
         self.indexed_vaults.add(vault_path)
+
 
 _VAULT_CACHE = VaultCache()
 
 _CHARACTER_AUTOMATIONS = {}
 
+
 def update_roll_automations(character_name: str, automations: dict):
     _CHARACTER_AUTOMATIONS[character_name] = automations
 
+
 def get_roll_automations(character_name: str) -> dict:
-    return _CHARACTER_AUTOMATIONS.get(character_name, {"hidden_rolls": True, "saving_throws": True, "skill_checks": True, "attack_rolls": True})
+    defaults = {"hidden_rolls": True, "saving_throws": True, "skill_checks": True, "attack_rolls": True}
+    return _CHARACTER_AUTOMATIONS.get(character_name, defaults)
+
 
 async def _get_entity_by_name(name: str, vault_path: str) -> Optional[BaseGameEntity]:
     """Helper to find an active entity in the engine's memory by name, with JIT lazy loading."""
     from registry import _NAME_INDEX
     from vault_io import load_entity_into_engine, get_journals_dir
-    
+
     name_lower = name.lower().strip()
-    
+
     # 1. Check Memory (Fast Path)
     if vault_path in _NAME_INDEX and name_lower in _NAME_INDEX[vault_path]:
         return get_entity(_NAME_INDEX[vault_path][name_lower], vault_path)
-        
+
     for uid, entity in get_all_entities(vault_path).items():
         ent_name_lower = entity.name.lower()
         if name_lower in ent_name_lower or ent_name_lower in name_lower:
             return entity
-            
+
     # 2. Just-In-Time (JIT) Hydration (Lazy Load)
     j_dir = get_journals_dir(vault_path)
     exact_path = os.path.join(j_dir, f"{name}.md")
     if os.path.exists(exact_path):
         ent = await load_entity_into_engine(exact_path, vault_path)
-        if ent: return ent
-        
+        if ent:
+            return ent
+
     if os.path.exists(j_dir):
         for filename in os.listdir(j_dir):
             if filename.endswith(".md"):
                 file_base = filename[:-3].lower()
                 if name_lower in file_base or file_base in name_lower:
                     ent = await load_entity_into_engine(os.path.join(j_dir, filename), vault_path)
-                    if ent: return ent
-                    
+                    if ent:
+                        return ent
+
     return None
+
 
 def _calculate_reach(entity: BaseGameEntity, is_active_turn: bool = False) -> float:
     """Calculates effective melee reach based on weapon and traits."""
-    reach = getattr(entity, 'base_reach', 5.0)
-    tags = [t.lower() for t in getattr(entity, 'tags', [])]
-    
+    reach = getattr(entity, "base_reach", 5.0)
+    tags = [t.lower() for t in getattr(entity, "tags", [])]
+
     # Check equipped weapon if available on sheet
-    if hasattr(entity, 'equipment'):
-        main_hand = str(getattr(entity, 'equipment', {}).get('main_hand', '')).lower()
+    if hasattr(entity, "equipment"):
+        main_hand = str(getattr(entity, "equipment", {}).get("main_hand", "")).lower()
         if any(w in main_hand for w in ["halberd", "glaive", "pike", "whip", "lance", "reach"]):
             reach += 5.0
-            
+
     # Explicit weapon tags
     if any(w in tags for w in ["reach_weapon", "halberd", "glaive", "pike", "whip", "lance"]):
         reach += 5.0
-        
+
     # Class features
     if any(f in tags for f in ["giant_stature", "path_of_the_giant"]):
         reach += 5.0
-        
+
     # Species traits (Bugbear's Long-Limbed only applies on their own turn)
     if is_active_turn and ("bugbear" in tags or "long_limbed" in tags):
         reach += 5.0
-        
+
     return reach
+
 
 def _build_npc_template(title: str, context: str, details: dict, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> str:
     ctx = context.strip() if context else "Newly encountered individual. No prior background established."
@@ -149,26 +176,31 @@ def _build_npc_template(title: str, context: str, details: dict, x: float = 0.0,
     legendary_max = details.get("legendary_actions_max", 0)
     legendary_actions = details.get("legendary_actions", [])
     lair_actions = details.get("lair_actions", [])
-    
+
     extra_actions_text = ""
     if legendary_max > 0 or legendary_actions:
-        extra_actions_text += f"\n### Legendary Actions ({legendary_max}/Round)\n" + "\n".join(f"- {a}" for a in legendary_actions) + "\n"
+        extra_actions_text += (
+            f"\n### Legendary Actions ({legendary_max}/Round)\n" + "\n".join(f"- {a}" for a in legendary_actions) + "\n"
+        )
     if lair_actions:
-        extra_actions_text += f"\n### Lair Actions (Initiative 20)\n" + "\n".join(f"- {a}" for a in lair_actions) + "\n"
+        extra_actions_text += "\n### Lair Actions (Initiative 20)\n" + "\n".join(f"- {a}" for a in lair_actions) + "\n"
 
-    return (f"---\ntags: [npc]\nstatus: active\norigin: Unknown\ncurrent_location: Unknown\n"
-            f"x: {x}\ny: {y}\nz: {z}\nicon_url: \"{icon_url}\"\n"
-            f"legendary_actions_max: {legendary_max}\n"
-            f"legendary_actions_current: {legendary_max}\n---\n"
-            f"# {title}\n\n## Summary - Current State\n- {ctx[:150]}...\n\n"
-            f"## Background & Motives\n- {ctx}\n- **Long-Term Goals**: {long_term_goals}\n- **Aliases & Titles**: {aliases}\n\n"
-            f"## Appearance\n- **Base Appearance**: {appearance}\n\n"
-            f"## Communication Style\n- **Dialect/Accent**: {dialect}\n- **Mannerisms**: {mannerisms}\n- **Code-Switching**: {code_switch}\n\n"
-            f"## Connections\n- {connections}\n\n"
-            f"## Attitude Tracker\n- **Base Attitude**: {base_attitude}\n| Entity | Disposition | Notes |\n|---|---|---|\n| Party | Neutral | Initial encounter. |\n\n"
-            f"## Active Logs\n- **Current Appearance**: {current_appearance}\n- **Immediate Goals**: {immediate_goals}\n\n"
-            f"## Key Knowledge\n- \n\n## Voice & Quotes\n- \n\n## Combat & Stat Block\n{stats}\n{extra_actions_text}\n"
-            f"## Additional Lore & Jazz\n{misc}\n")
+    return (
+        f"---\ntags: [npc]\nstatus: active\norigin: Unknown\ncurrent_location: Unknown\n"
+        f'x: {x}\ny: {y}\nz: {z}\nicon_url: "{icon_url}"\n'
+        f"legendary_actions_max: {legendary_max}\n"
+        f"legendary_actions_current: {legendary_max}\n---\n"
+        f"# {title}\n\n## Summary - Current State\n- {ctx[:150]}...\n\n"
+        f"## Background & Motives\n- {ctx}\n- **Long-Term Goals**: {long_term_goals}\n- **Aliases & Titles**: {aliases}\n\n"
+        f"## Appearance\n- **Base Appearance**: {appearance}\n\n"
+        f"## Communication Style\n- **Dialect/Accent**: {dialect}\n- **Mannerisms**: {mannerisms}\n- **Code-Switching**: {code_switch}\n\n"
+        f"## Connections\n- {connections}\n\n"
+        f"## Attitude Tracker\n- **Base Attitude**: {base_attitude}\n| Entity | Disposition | Notes |\n|---|---|---|\n| Party | Neutral | Initial encounter. |\n\n"
+        f"## Active Logs\n- **Current Appearance**: {current_appearance}\n- **Immediate Goals**: {immediate_goals}\n\n"
+        f"## Key Knowledge\n- \n\n## Voice & Quotes\n- \n\n## Combat & Stat Block\n{stats}\n{extra_actions_text}\n"
+        f"## Additional Lore & Jazz\n{misc}\n"
+    )
+
 
 def _build_location_template(title: str, context: str, details: dict) -> str:
     ctx = context.strip() if context else "Newly discovered area."
@@ -179,15 +211,18 @@ def _build_location_template(title: str, context: str, details: dict) -> str:
     landmarks = details.get("key_features_and_landmarks", "")
     misc = details.get("misc_notes", "")
     diversity = details.get("diversity", "Unknown population makeup.")
-    
-    return (f"---\ntags: [location]\nicon_url: \"{icon_url}\"\n---\n# {title}\n\n## Summary - Current State\n- {ctx}\n\n"
-            f"## Demographics & Culture\n- **Native Dialect(s)**: {demographics}\n- **Diversity**: {diversity}\n\n"
-            f"## Government & Defenses\n- {government}\n\n"
-            f"## Key Features & Landmarks\n- {landmarks}\n\n"
-            f"## Notable Establishments (Shops/Taverns)\n- {establishments}\n\n"
-            f"## Current Rumors & Events\n| Rumor | Source | Notes |\n|---|---|---|\n| | | |\n\n"
-            f"## Condition & State\n- \n\n## Inhabitants\n- \n\n## Event History\n- \n\n## System Tables\n\n"
-            f"## Additional Lore & Jazz\n{misc}\n")
+
+    return (
+        f'---\ntags: [location]\nicon_url: "{icon_url}"\n---\n# {title}\n\n## Summary - Current State\n- {ctx}\n\n'
+        f"## Demographics & Culture\n- **Native Dialect(s)**: {demographics}\n- **Diversity**: {diversity}\n\n"
+        f"## Government & Defenses\n- {government}\n\n"
+        f"## Key Features & Landmarks\n- {landmarks}\n\n"
+        f"## Notable Establishments (Shops/Taverns)\n- {establishments}\n\n"
+        f"## Current Rumors & Events\n| Rumor | Source | Notes |\n|---|---|---|\n| | | |\n\n"
+        f"## Condition & State\n- \n\n## Inhabitants\n- \n\n## Event History\n- \n\n## System Tables\n\n"
+        f"## Additional Lore & Jazz\n{misc}\n"
+    )
+
 
 def _build_faction_template(title: str, context: str, details: dict) -> str:
     ctx = context.strip() if context else "Newly discovered faction."
@@ -196,10 +231,13 @@ def _build_faction_template(title: str, context: str, details: dict) -> str:
     assets = details.get("assets", "")
     key_npcs = details.get("key_npcs", "")
     misc = details.get("misc_notes", "")
-    
-    return (f"---\ntags: [faction]\nstatus: active\nicon_url: \"{icon_url}\"\n---\n# {title}\n\n## Summary - Current State\n- {ctx}\n\n"
-            f"## Goals\n- {goals}\n\n## Assets & Resources\n- {assets}\n\n## Key NPCs\n- {key_npcs}\n\n## Party Disposition\n- Neutral\n\n## Event History\n- \n\n"
-            f"## Additional Lore & Jazz\n{misc}\n")
+
+    return (
+        f'---\ntags: [faction]\nstatus: active\nicon_url: "{icon_url}"\n---\n# {title}\n\n## Summary - Current State\n- {ctx}\n\n'
+        f"## Goals\n- {goals}\n\n## Assets & Resources\n- {assets}\n\n## Key NPCs\n- {key_npcs}\n\n## Party Disposition\n- Neutral\n\n## Event History\n- \n\n"
+        f"## Additional Lore & Jazz\n{misc}\n"
+    )
+
 
 def _build_pc_template(title: str, details: dict, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> str:
     appearance = details.get("appearance", "")
@@ -209,69 +247,74 @@ def _build_pc_template(title: str, details: dict, x: float = 0.0, y: float = 0.0
     immediate_goals = details.get("immediate_goals", "")
     aliases = details.get("aliases_and_titles", "")
     misc = details.get("misc_notes", "")
-    
+
     s_str = details.get("str_score", 10)
     s_dex = details.get("dex_score", 10)
     s_con = details.get("con_score", 10)
     s_int = details.get("int_score", 10)
     s_wis = details.get("wis_score", 10)
     s_cha = details.get("cha_score", 10)
-    
+
     species = details.get("species", "Unknown")
     background = details.get("background", "Unknown")
     classes = details.get("classes", [{"class_name": "Commoner", "level": 1}])
-    spells = details.get("spells", {})
     profs = details.get("proficiencies", "None")
     feats = details.get("feats_and_traits", "None")
-    
-    return (f"---\ntags: [pc, player]\nstatus: active\nx: {x}\ny: {y}\nz: {z}\nicon_url: \"{icon_url}\"\nclasses: {yaml.dump(classes, default_flow_style=True)}\nspecies: {species}\nbackground: {background}\n"
-            f"level: 1\nmax_hp: 10\nac: 10\ngold: 0\ncurrency:\n  cp: 0\n  sp: 0\n  ep: 0\n  gp: 0\n  pp: 0\n"
-            f"str: {s_str}\ndex: {s_dex}\ncon: {s_con}\nint: {s_int}\nwis: {s_wis}\ncha: {s_cha}\n"
-        f"attunement_slots: 0/3\nattuned_items: []\n"
-            f"attunement_slots: 0/3\nattuned_items: []\n"
-            f"equipment:\n"
-            f"  armor: Unarmored\n"
-            f"  shield: None\n"
-            f"  head: None\n"
-            f"  cloak: None\n"
-            f"  gloves: None\n"
-            f"  boots: None\n"
-            f"  ring1: None\n"
-            f"  ring2: None\n"
-            f"  amulet: None\n"
-            f"  main_hand: Unarmed\n"
-            f"  off_hand: None\n"
-            f"spell_save_dc: 10\nspell_atk: \"+2\"\nspell_slots: \"None\"\n"
-            f"resources: {{}}\nactive_mechanics: []\n"
-            f"inventory: []\n"
-            f"spells:\n  cantrips: []\n  level_1: []\n"
-            f"immunities: None\nresistances: None\n---\n"
-            f"# {title}\n\n## Summary - Current State\n- Active party member.\n- **Aliases & Titles**: {aliases}\n\n"
-            f"## Appearance\n- **Base Appearance**: {appearance}\n\n"
-            f"## Goals\n- **Long-Term Goals**: {long_term_goals}\n\n"
-            f"## Status & Conditions\n- Current HP: 10\n- Active Conditions: None\n- Fatigue/Exhaustion: None\n\n"
-            f"## Proficiencies & Feats\n- **Proficiencies**: {profs}\n- **Feats & Traits**: {feats}\n\n"
-            f"## Active Logs\n- **Current Appearance**: {current_appearance}\n- **Immediate Goals**: {immediate_goals}\n\n"
-            f"## Event Log\n- \n\n"
-            f"## Additional Lore & Jazz\n{misc}\n")
+
+    return (
+        f'---\ntags: [pc, player]\nstatus: active\nx: {x}\ny: {y}\nz: {z}\nicon_url: "{icon_url}"\nclasses: {yaml.dump(classes, default_flow_style=True)}\nspecies: {species}\nbackground: {background}\n'
+        "level: 1\nmax_hp: 10\nac: 10\ngold: 0\ncurrency:\n  cp: 0\n  sp: 0\n  ep: 0\n  gp: 0\n  pp: 0\n"
+        f"str: {s_str}\ndex: {s_dex}\ncon: {s_con}\nint: {s_int}\nwis: {s_wis}\ncha: {s_cha}\n"
+        "attunement_slots: 0/3\nattuned_items: []\n"
+        "attunement_slots: 0/3\nattuned_items: []\n"
+        "equipment:\n"
+        "  armor: Unarmored\n"
+        "  shield: None\n"
+        "  head: None\n"
+        "  cloak: None\n"
+        "  gloves: None\n"
+        "  boots: None\n"
+        "  ring1: None\n"
+        "  ring2: None\n"
+        "  amulet: None\n"
+        "  main_hand: Unarmed\n"
+        "  off_hand: None\n"
+        'spell_save_dc: 10\nspell_atk: "+2"\nspell_slots: "None"\n'
+        "resources: {}\nactive_mechanics: []\n"
+        "inventory: []\n"
+        "spells:\n  cantrips: []\n  level_1: []\n"
+        "immunities: None\nresistances: None\n---\n"
+        f"# {title}\n\n## Summary - Current State\n- Active party member.\n- **Aliases & Titles**: {aliases}\n\n"
+        f"## Appearance\n- **Base Appearance**: {appearance}\n\n"
+        f"## Goals\n- **Long-Term Goals**: {long_term_goals}\n\n"
+        "## Status & Conditions\n- Current HP: 10\n- Active Conditions: None\n- Fatigue/Exhaustion: None\n\n"
+        f"## Proficiencies & Feats\n- **Proficiencies**: {profs}\n- **Feats & Traits**: {feats}\n\n"
+        f"## Active Logs\n- **Current Appearance**: {current_appearance}\n- **Immediate Goals**: {immediate_goals}\n\n"
+        "## Event Log\n- \n\n"
+        f"## Additional Lore & Jazz\n{misc}\n"
+    )
+
 
 def _build_party_tracker() -> str:
-    return (f"---\ntags: [system, ui]\n---\n# 🛡️ DM Party Dashboard\n\n"
-            f"```dataviewjs\n"
-            f"const p = dv.pages('#pc or #player or #party_npc');\n"
-            f"if (p.length > 0) {{\n"
-            f"    let tableData = p.map(c => [\n"
-            f"        c.file.link,\n"
-            f"        `${{c.max_hp || '?'}}`,\n"
-            f"        c.ac || 10,\n"
-            f"        `10 + ${{Math.floor(((c.wisdom || c.wis || 10) - 10) / 2)}}`,\n"
-            f"        c.attunement_slots || \"N/A\",\n"
-            f"    ]);\n"
-            f"    dv.table([\"Name\", \"Max HP\", \"AC\", \"Passive Perception\", \"Attunement\"], tableData);\n"
-            f"}} else {{\n"
-            f"    dv.paragraph(\"No active party members found.\");\n"
-            f"}}\n"
-            f"```\n")
+    return (
+        "---\ntags: [system, ui]\n---\n# 🛡️ DM Party Dashboard\n\n"
+        "```dataviewjs\n"
+        "const p = dv.pages('#pc or #player or #party_npc');\n"
+        "if (p.length > 0) {\n"
+        "    let tableData = p.map(c => [\n"
+        "        c.file.link,\n"
+        "        `${c.max_hp || '?'}`,\n"
+        "        c.ac || 10,\n"
+        "        `10 + ${Math.floor(((c.wisdom || c.wis || 10) - 10) / 2)}`,\n"
+        '        c.attunement_slots || "N/A",\n'
+        "    ]);\n"
+        '    dv.table(["Name", "Max HP", "AC", "Passive Perception", "Attunement"], tableData);\n'
+        "} else {\n"
+        '    dv.paragraph("No active party members found.");\n'
+        "}\n"
+        "```\n"
+    )
+
 
 async def _get_current_combat_initiative(vault_path: str) -> int:
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
@@ -282,14 +325,29 @@ async def _get_current_combat_initiative(vault_path: str) -> int:
                 idx = yaml_data.get("current_turn_index", 0)
                 if combatants and idx < len(combatants):
                     return int(combatants[idx].get("init", 0))
-        except Exception: pass
+        except Exception:
+            pass
     return 0
+
 
 # ============================================
 
 
 @tool
-async def execute_melee_attack(attacker_name: str, target_name: str, advantage: bool = False, disadvantage: bool = False, is_reaction: bool = False, is_legendary_action: bool = False, is_opportunity_attack: bool = False, manual_roll_total: int = None, is_critical: bool = False, force_auto_roll: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def execute_melee_attack(
+    attacker_name: str,
+    target_name: str,
+    advantage: bool = False,
+    disadvantage: bool = False,
+    is_reaction: bool = False,
+    is_legendary_action: bool = False,
+    is_opportunity_attack: bool = False,
+    manual_roll_total: int = None,
+    is_critical: bool = False,
+    force_auto_roll: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     STRICT REQUIREMENT: Use this tool to resolve ANY melee attack between two entities.
     Do NOT hallucinate dice rolls or damage. The engine will calculate hit/miss and exact damage.
@@ -298,68 +356,101 @@ async def execute_melee_attack(attacker_name: str, target_name: str, advantage: 
     vault_path = config["configurable"].get("thread_id")
     attacker = await _get_entity_by_name(attacker_name, vault_path)
     target = await _get_entity_by_name(target_name, vault_path)
-    
+
     if not attacker:
         return f"SYSTEM ERROR: Attacker '{attacker_name}' not found in active combat memory."
     if not target:
         return f"SYSTEM ERROR: Target '{target_name}' not found in active combat memory."
-        
+
     # --- NEW RANGE VALIDATION ---
     dist = spatial_service.calculate_distance(attacker.x, attacker.y, attacker.z, target.x, target.y, target.z, vault_path)
     is_active_turn = not (is_reaction or is_opportunity_attack or is_legendary_action)
     base_reach = _calculate_reach(attacker, is_active_turn=is_active_turn)
     eff_reach = base_reach + max(0, (attacker.size - 5.0) / 2.0) + max(0, (target.size - 5.0) / 2.0)
-    
+
     if dist > eff_reach:
-        return f"SYSTEM ERROR: Target '{target.name}' is out of range. Distance is {dist:.1f}ft, but {attacker.name}'s effective reach is {eff_reach:.1f}ft."
-        
+        return (
+            f"SYSTEM ERROR: Target '{target.name}' is out of range. "
+            f"Distance is {dist:.1f}ft, but {attacker.name}'s effective reach is {eff_reach:.1f}ft."
+        )
+
     is_pc = any(t in attacker.tags for t in ["pc", "player"])
     if is_pc and not force_auto_roll and manual_roll_total is None:
         auto_settings = get_roll_automations(attacker.name)
         if not auto_settings.get("attack_rolls", True):
-            return f"SYSTEM ALERT: {attacker.name} has manual attack rolls enabled. Ask the player to roll the attack (including modifiers) and provide the total, OR ask if they want the engine to automate it. Then call this tool again with `manual_roll_total=X` (and `is_critical=True` if they rolled a natural 20) or `force_auto_roll=True`."
+            return (
+                f"SYSTEM ALERT: {attacker.name} has manual attack rolls enabled. Ask the player to roll the attack "
+                f"(including modifiers) and provide the total, OR ask if they want the engine to automate it."
+            )
 
     if is_opportunity_attack:
         is_reaction = True
-        
+
     if is_reaction:
-        if getattr(attacker, "reaction_used", False): return f"SYSTEM ERROR: {attacker.name} has already used their reaction this round."
+        if getattr(attacker, "reaction_used", False):
+            return f"SYSTEM ERROR: {attacker.name} has already used their reaction this round."
         attacker.reaction_used = True
-        
+
     if is_legendary_action:
-        if getattr(attacker, "legendary_actions_current", 0) <= 0: return f"SYSTEM ERROR: {attacker.name} has no Legendary Actions remaining."
+        if getattr(attacker, "legendary_actions_current", 0) <= 0:
+            return f"SYSTEM ERROR: {attacker.name} has no Legendary Actions remaining."
         attacker.legendary_actions_current -= 1
-        
+
     current_init = await _get_current_combat_initiative(config["configurable"].get("thread_id"))
     event = GameEvent(
         event_type="MeleeAttack",
         source_uuid=attacker.entity_uuid,
         target_uuid=target.entity_uuid,
         vault_path=vault_path,
-        payload={"advantage": advantage, "disadvantage": disadvantage, "current_initiative": current_init, "is_opportunity_attack": is_opportunity_attack, "manual_roll_total": manual_roll_total, "is_critical": is_critical}
+        payload={
+            "advantage": advantage,
+            "disadvantage": disadvantage,
+            "current_initiative": current_init,
+            "is_opportunity_attack": is_opportunity_attack,
+            "manual_roll_total": manual_roll_total,
+            "is_critical": is_critical,
+        },
     )
-    
+
     result = EventBus.dispatch(event)
-    
+
     base_msg = ""
     if result.payload.get("hit"):
         dmg = result.payload.get("damage", 0)
-        base_msg = f"MECHANICAL TRUTH: HIT! {attacker.name} dealt {dmg} damage to {target.name}. {target.name} has {target.hp.base_value} HP remaining."
-        
+        base_msg = (
+            f"MECHANICAL TRUTH: HIT! {attacker.name} dealt {dmg} damage to {target.name}. "
+            f"{target.name} has {target.hp.base_value} HP remaining."
+        )
+
         if is_opportunity_attack and "oa_halts_movement" in attacker.tags and isinstance(target, Creature):
             target.movement_remaining = 0
-            base_msg += f"\nSYSTEM ALERT: Because {attacker.name} hit with an Opportunity Attack and has a halting feat (like Sentinel), {target.name}'s speed is reduced to 0! If they were moving, you MUST use `move_entity` to immediately move them back to the square they were in when the attack triggered."
+            base_msg += (
+                f"\nSYSTEM ALERT: Because {attacker.name} hit with an Opportunity Attack and has a halting feat "
+                f"(like Sentinel), {target.name}'s speed is reduced to 0! If they were moving, you MUST use "
+                f"`move_entity` to immediately move them back to the square they were in when the attack triggered."
+            )
     else:
         base_msg = f"MECHANICAL TRUTH: MISS! {attacker.name} rolled too low to beat {target.name}'s Armor Class."
-        
+
     protectors = result.payload.get("protector_alerts", [])
     if protectors:
-        base_msg += f"\nSYSTEM ALERT: This attack provoked a Protector Reaction Attack (e.g. Sentinel) from: {', '.join(protectors)}. Ask the player(s) if they want to use their reaction to attack {attacker.name}!"
-        
+        base_msg += (
+            f"\nSYSTEM ALERT: This attack provoked a Protector Reaction Attack (e.g. Sentinel) from: "
+            f"{', '.join(protectors)}. Ask the player(s) if they want to use their reaction to attack {attacker.name}!"
+        )
+
     return base_msg
 
+
 @tool
-async def modify_health(target_name: str, hp_change: int, reason: str, damage_type: str = "untyped", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def modify_health(
+    target_name: str,
+    hp_change: int,
+    reason: str,
+    damage_type: str = "untyped",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     Use this tool to apply guaranteed damage (traps, falling, auto-hit spells) or healing (potions, healing spells).
     Provide a negative hp_change for damage, positive for healing.
@@ -369,7 +460,7 @@ async def modify_health(target_name: str, hp_change: int, reason: str, damage_ty
     target = await _get_entity_by_name(target_name, vault_path)
     if not target:
         return f"SYSTEM ERROR: Target '{target_name}' not found."
-        
+
     if hp_change < 0:
         # Route damage through engine resistance checks natively
         dmg = abs(hp_change)
@@ -384,33 +475,58 @@ async def modify_health(target_name: str, hp_change: int, reason: str, damage_ty
 
     target.hp.base_value += hp_change
     action = "healed for" if hp_change > 0 else "took"
-    result_msg = f"MECHANICAL TRUTH: {target.name} {action} {abs(hp_change)} {damage_type} HP from {reason}. Current HP: {target.hp.base_value}."
-    
+    result_msg = (
+        f"MECHANICAL TRUTH: {target.name} {action} {abs(hp_change)} {damage_type} HP from {reason}. "
+        f"Current HP: {target.hp.base_value}."
+    )
+
     if hp_change < 0 and target.concentrating_on:
         dc = max(10, abs(hp_change) // 2)
-        result_msg += f"\nSYSTEM ALERT: {target.name} took damage while concentrating on '{target.concentrating_on}'. You MUST prompt a Constitution saving throw (DC {dc}). If they fail, use `drop_concentration`."
-        
+        result_msg += (
+            f"\nSYSTEM ALERT: {target.name} took damage while concentrating on '{target.concentrating_on}'. "
+            f"You MUST prompt a Constitution saving throw (DC {dc}). If they fail, use `drop_concentration`."
+        )
+
     if target.hp.base_value <= 0 and target.concentrating_on:
         EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid))
-        result_msg += f"\nSYSTEM ALERT: {target.name} dropped to 0 HP and lost concentration on '{target.concentrating_on}'."
-        
+        result_msg += (
+            f"\nSYSTEM ALERT: {target.name} dropped to 0 HP and lost concentration " f"on '{target.concentrating_on}'."
+        )
+
     return result_msg
 
 
 @tool
-async def create_new_entity(entity_name: str, entity_type: str, background_context: str = "", details: Union[PCDetails, NPCDetails, LocationDetails, FactionDetails] = None, x: float = 0.0, y: float = 0.0, z: float = 0.0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def create_new_entity(
+    entity_name: str,
+    entity_type: str,
+    background_context: str = "",
+    details: Union[PCDetails, NPCDetails, LocationDetails, FactionDetails] = None,
+    x: float = 0.0,
+    y: float = 0.0,
+    z: float = 0.0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """Generates schema-compliant Markdown files."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{entity_name}.md")
-    
-    if os.path.exists(file_path): return f"Error: '{entity_name}.md' already exists. Use flesh_out_entity to update it instead."
-    display_title = entity_name.replace("NPC_", "").replace("LOC_", "").replace("MIS_", "").replace("PC_", "").replace("_", " ")
+
+    if os.path.exists(file_path):
+        return f"Error: '{entity_name}.md' already exists. Use flesh_out_entity to update it instead."
+    display_title = (
+        entity_name.replace("NPC_", "").replace("LOC_", "").replace("MIS_", "").replace("PC_", "").replace("_", " ")
+    )
 
     if details is None:
         details_dict = {}
     else:
-        details_dict = details.model_dump() if hasattr(details, "model_dump") else (details.dict() if hasattr(details, "dict") else details)
-        
+        details_dict = (
+            details.model_dump()
+            if hasattr(details, "model_dump")
+            else (details.dict() if hasattr(details, "dict") else details)
+        )
+
     e_type = entity_type.upper()
     try:
         if e_type == "NPC":
@@ -420,15 +536,24 @@ async def create_new_entity(entity_name: str, entity_type: str, background_conte
         elif e_type == "FACTION":
             content = _build_faction_template(display_title, background_context, details_dict)
         elif e_type == "MISSION":
-            content = f"---\ntags: [mission]\n---\n# {display_title}\n\n## Plot Summary\n- {background_context or 'Newly acquired objective.'}\n\n## Objectives\n- [ ] \n\n## Involved Entities\n- \n\n## Additional Lore & Jazz\n{details_dict.get('misc_notes', '')}\n"
+            content = (
+                f"---\ntags: [mission]\n---\n# {display_title}\n\n## Plot Summary\n- "
+                f"{background_context or 'Newly acquired objective.'}\n\n## Objectives\n- [ ] \n\n"
+                f"## Involved Entities\n- \n\n## Additional Lore & Jazz\n{details_dict.get('misc_notes', '')}\n"
+            )
         elif e_type == "CAMPAIGN":
-            content = (f"---\ntags: [campaign]\ncampaign_name: {display_title}\ncurrent_date: Day 1\nin_game_time: \"08:00\"\n---\n"
-                       f"# {display_title} - Master Ledger\n\n## The World State\n- (Macro-level events, political climates, or looming threats taking place in the background.)\n\n## Active Plotlines & Missions\n- \n\n"
-                       f"## Alternate Routes & Consequences\n- (Track 'Fail Forward' paths here. If a party fails to find a clue, log the alternate NPC or method generated to keep the plot moving. Log the consequences of past failures.)\n\n## Major Milestones (Event Log)\n- \n\n"
-                       f"## Additional Lore & Jazz\n{details_dict.get('misc_notes', '')}\n")
+            content = (
+                f"---\ntags: [campaign]\ncampaign_name: {display_title}\ncurrent_date: Day 1\n"
+                f'in_game_time: "08:00"\n---\n# {display_title} - Master Ledger\n\n## The World State\n'
+                f"- (Macro-level events, political climates, or looming threats taking place in the background.)\n\n"
+                f"## Active Plotlines & Missions\n- \n\n## Alternate Routes & Consequences\n"
+                f"- (Track 'Fail Forward' paths here. If a party fails to find a clue, log the alternate NPC or "
+                f"method generated to keep the plot moving. Log the consequences of past failures.)\n\n"
+                f"## Major Milestones (Event Log)\n- \n\n## Additional Lore & Jazz\n{details_dict.get('misc_notes', '')}\n"
+            )
         elif e_type in ["PC", "PLAYER"]:
             content = _build_pc_template(display_title, details_dict, x, y, z)
-            async with aiofiles.open(file_path, 'w', encoding='utf-8') as f: 
+            async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                 await f.write(content)
             # AUTOMATED D&D BEYOND DATAVIEW SHEET
             sheet_content = f"""```dataviewjs
@@ -458,7 +583,10 @@ async def create_new_entity(entity_name: str, entity_type: str, background_conte
                     let resourcesHtml = '';
                     if (pc.resources) {{
                         for (let res of Object.keys(pc.resources)) {{
-                            resourcesHtml += `<div class="ddb-vital-box" style="min-width: 80px;"><div class="label">${{res}}</div><div class="value" style="font-size:1.5em; color:#242527;">${{pc.resources[res]}}</div></div>`;
+                            resourcesHtml += `<div class="ddb-vital-box" style="min-width: 80px;">` + 
+                                             `<div class="label">${{res}}</div>` + 
+                                             `<div class="value" style="font-size:1.5em; color:#242527;">` + 
+                                             `${{pc.resources[res]}}</div></div>`;
                         }}
                     }}
 
@@ -537,35 +665,55 @@ async def create_new_entity(entity_name: str, entity_type: str, background_conte
                 ```"""
             sheet_path = os.path.join(get_journals_dir(vault_path), f"{display_title} - Character Sheet.md")
             try:
-                async with aiofiles.open(sheet_path, 'w', encoding='utf-8') as f: 
+                async with aiofiles.open(sheet_path, "w", encoding="utf-8") as f:
                     await f.write(sheet_content)
-            except Exception: pass 
+            except Exception:
+                pass
             return f"Success: Instantiated new log '{entity_name}.md' and UI View."
         elif e_type == "PARTY_TRACKER":
             content = _build_party_tracker()
         else:
-            content = f"---\ntags: [misc]\n---\n# {display_title}\n\n{background_context}\n\n## Additional Lore & Jazz\n{details_dict.get('misc_notes', '')}\n"
+            content = (
+                f"---\ntags: [misc]\n---\n# {display_title}\n\n{background_context}\n\n"
+                f"## Additional Lore & Jazz\n{details_dict.get('misc_notes', '')}\n"
+            )
 
-        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f: 
+        async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
             await f.write(content)
         return f"Success: Created {e_type} '{entity_name}.md' with context."
-        
-    except Exception as e: 
+
+    except Exception as e:
         return f"Error creating file: {str(e)}"
 
 
 @tool
-async def flesh_out_entity(entity_name: str, entity_type: str, background_context: str = "", details: Union[PCDetails, NPCDetails, LocationDetails, FactionDetails] = None, x: float = 0.0, y: float = 0.0, z: float = 0.0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def flesh_out_entity(
+    entity_name: str,
+    entity_type: str,
+    background_context: str = "",
+    details: Union[PCDetails, NPCDetails, LocationDetails, FactionDetails] = None,
+    x: float = 0.0,
+    y: float = 0.0,
+    z: float = 0.0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """Use this tool to completely rewrite and 'Flesh Out' an existing file."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{entity_name}.md")
-    display_title = entity_name.replace("NPC_", "").replace("LOC_", "").replace("MIS_", "").replace("PC_", "").replace("_", " ")
+    display_title = entity_name.replace("NPC_", "").replace("LOC_", "")
+    display_title = display_title.replace("MIS_", "").replace("PC_", "")
+    display_title = display_title.replace("_", " ")
 
     if details is None:
         details_dict = {}
     else:
-        details_dict = details.model_dump() if hasattr(details, "model_dump") else (details.dict() if hasattr(details, "dict") else details)
-        
+        details_dict = (
+            details.model_dump()
+            if hasattr(details, "model_dump")
+            else (details.dict() if hasattr(details, "dict") else details)
+        )
+
     e_type = entity_type.upper()
     try:
         if e_type == "NPC":
@@ -579,71 +727,83 @@ async def flesh_out_entity(entity_name: str, entity_type: str, background_contex
         else:
             return f"Error: Unsupported entity type for flesh_out_entity: {e_type}"
 
-        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f: 
+        async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
             await f.write(content)
         return f"Success: Fleshed out and entirely updated {e_type} '{entity_name}.md' with deep context and jazz."
-        
-    except Exception as e: 
+
+    except Exception as e:
         return f"Error updating file: {str(e)}"
 
 
 @tool
-async def update_yaml_frontmatter(entity_name: str, updates: dict, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def update_yaml_frontmatter(
+    entity_name: str, updates: dict, *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
     """Safely parses a Markdown file, updates specific YAML frontmatter keys, and reconstructs the file."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{entity_name}.md")
-    
+
     try:
         async with edit_markdown_entity(file_path) as state:
-            for key, value in updates.items(): 
+            for key, value in updates.items():
                 state["yaml_data"][key] = value
     except Exception as e:
         return str(e)
-            
+
     return f"Success: Updated stats for {entity_name}."
 
 
 @tool
-async def fetch_entity_context(entity_names: list[str], full_read: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def fetch_entity_context(
+    entity_names: list[str], full_read: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
     """Retrieves the YAML metadata and the 'Summary' section for given entities to gain context."""
     vault_path = config["configurable"].get("thread_id")
     j_dir = get_journals_dir(vault_path)
     context_blocks = []
-    
+
     for name in entity_names:
         file_path = os.path.join(j_dir, f"{name}.md")
         if not os.path.exists(file_path):
             context_blocks.append(f"[{name}]: Entity not found in archives.")
             continue
-            
-        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f: 
+
+        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
             content = await f.read()
-            
+
         if full_read:
             context_blocks.append(f"=== {name} (FULL) ===\n{content}")
             continue
-            
+
         yaml_data, body_text = "", content
         if content.startswith("---"):
             parts = content.split("---", 2)
             if len(parts) >= 3:
                 yaml_data, body_text = parts[1].strip(), parts[2].strip()
-                
-        summary_match = re.search(r'(## Summary - Current State\n.*?)(?=\n## |\Z)', body_text, re.DOTALL)
+
+        summary_match = re.search(r"(## Summary - Current State\n.*?)(?=\n## |\Z)", body_text, re.DOTALL)
         summary_text = summary_match.group(1).strip() if summary_match else "No summary available."
         context_blocks.append(f"=== {name} (CACHED STATE) ===\nMetadata:\n{yaml_data}\n\n{summary_text}\n")
-        
+
     return "\n\n".join(context_blocks)
 
 
 @tool
-async def equip_item(character_name: str, item_name: str, item_slot: str, attune: bool = False, new_ac_value: int = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def equip_item(
+    character_name: str,
+    item_name: str,
+    item_slot: str,
+    attune: bool = False,
+    new_ac_value: int = None,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     Equips an item to a specific slot for a character, updating their YAML file.
-    This will overwrite any item currently in the specified slot.
+    If a slot is already occupied, it will return an error. You must un-equip the old item first by equipping 'None'.
     If 'attune' is True, it will also consume an attunement slot and apply magical modifiers natively.
     The AI is responsible for moving the old item back to inventory using 'manage_inventory' if needed.
-    
+
     Valid item_slot values:
     - 'armor', 'shield', 'head', 'cloak', 'gloves', 'boots', 'amulet', 'main_hand', 'off_hand'
     - 'ring': Automatically finds an available ring slot (ring1 or ring2).
@@ -653,9 +813,17 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
 
     # Map general types to specific slots
-    slot_map = { "weapon": "main_hand" }
-    target_slot = slot_map.get(item_slot, item_slot)
-    
+    slot_map = {
+        "weapon": "main_hand",
+        "helmet": "head",
+        "hat": "head",
+        "hood": "head",
+        "tiara": "head",
+        "necklace": "amulet",
+        "bracers": "gloves",
+    }
+    target_slot = slot_map.get(item_slot.lower(), item_slot)
+
     item = await ItemCompendium.load_item(vault_path, item_name)
     old_item = None
     old_item_name = None
@@ -667,7 +835,7 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
             if not isinstance(equipment, dict):
                 state["save"] = False
                 return f"Error: '{character_name}.md' does not have a valid 'equipment' block."
-    
+
             final_slot = None
             if target_slot == "ring":
                 if str(equipment.get("ring1", "None")) in ["None", ""]:
@@ -676,30 +844,48 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
                     final_slot = "ring2"
                 else:
                     state["save"] = False
-                    return f"Error: Both ring slots are already occupied. You must specify 'ring1' or 'ring2' to overwrite one."
+                    return (
+                        f"Error: Both ring slots are already occupied. You must specify 'ring1' or 'ring2' to overwrite one."
+                    )
             elif target_slot in equipment:
                 final_slot = target_slot
             else:
                 valid_slots = list(equipment.keys())
                 state["save"] = False
-                return f"Error: Invalid equipment slot '{item_slot}'. Valid slots are: {', '.join(valid_slots)} or 'ring'."
-    
+                return f"Error: Invalid equipment slot '{item_slot}'. " f"Valid slots are: {', '.join(valid_slots)} or 'ring'."
+
             old_item_name = equipment.get(final_slot, "None")
+
+            if str(old_item_name).strip() not in ["None", "", "Unarmed"] and str(item_name).strip() not in ["None", ""]:
+                if target_slot != "ring":
+                    state["save"] = False
+                    return (
+                        f"Error: The {final_slot} slot is already occupied by '{old_item_name}'. "
+                        f"You must un-equip it first (equip 'None') before equipping '{item_name}'."
+                    )
             equipment[final_slot] = item_name if not item else item.name
-            
+
             attuned_items = yaml_data.get("attuned_items", [])
-            if not isinstance(attuned_items, list): attuned_items = []
-            
+            if not isinstance(attuned_items, list):
+                attuned_items = []
+
             if attune and item and getattr(item, "requires_attunement", False):
                 for tag in item.tags:
                     if tag.startswith("requires_attunement_by_"):
                         req = tag.replace("requires_attunement_by_", "").lower()
-                        classes = [c.get("class_name", "").lower() for c in yaml_data.get("classes", [])] if isinstance(yaml_data.get("classes", []), list) else []
+                        classes = (
+                            [c.get("class_name", "").lower() for c in yaml_data.get("classes", [])]
+                            if isinstance(yaml_data.get("classes", []), list)
+                            else []
+                        )
                         species = str(yaml_data.get("species", "")).lower()
                         alignment = str(yaml_data.get("alignment", "")).lower()
                         if req not in classes and req not in species and req not in alignment:
                             state["save"] = False
-                            return f"SYSTEM ERROR: Character does not meet the attunement requirements ({req}) for '{item.name}'."
+                            return (
+                                f"SYSTEM ERROR: {character_name} does not meet the "
+                                f"attunement requirements ({req}) for '{item.name}'."
+                            )
 
                 if len(attuned_items) >= 3 and item.name not in attuned_items:
                     state["save"] = False
@@ -708,23 +894,25 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
                     attuned_items.append(item.name)
                     yaml_data["attuned_items"] = attuned_items
                     yaml_data["attunement_slots"] = f"{len(attuned_items)}/3"
-            
+
             if new_ac_value is not None:
                 yaml_data["ac"] = new_ac_value
             elif item and isinstance(item, ArmorItem) and target_slot == "armor":
                 pc_dex = yaml_data.get("dexterity", yaml_data.get("dex", 10))
                 dex_mod = math.floor((int(pc_dex) - 10) / 2)
-                
+
                 max_dex = item.max_dex_bonus
                 if max_dex is None:
-                    if item.armor_category.lower() == "medium": max_dex = 2
-                    elif item.armor_category.lower() == "heavy": max_dex = 0
-                
+                    if item.armor_category.lower() == "medium":
+                        max_dex = 2
+                    elif item.armor_category.lower() == "heavy":
+                        max_dex = 0
+
                 if item.armor_category.lower() == "heavy":
                     allowed_dex = 0
                 else:
                     allowed_dex = min(dex_mod, max_dex) if max_dex is not None and dex_mod > 0 else dex_mod
-                    
+
                 yaml_data["ac"] = item.base_ac + item.plus_ac_bonus + allowed_dex
                 new_ac_value = yaml_data["ac"]
     except Exception as e:
@@ -741,8 +929,11 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
             dmg_type = "bludgeoning" if "Unarmed" in item_name else "slashing"
             new_weapon = MeleeWeapon(name=item_name, damage_dice=dmg_dice, damage_type=dmg_type, vault_path=vault_path)
             if item and isinstance(item, WeaponItem):
-                new_weapon = MeleeWeapon(name=item.name, damage_dice=item.damage_dice, damage_type=item.damage_type, vault_path=vault_path)
-                if hasattr(item, 'magic_bonus'): new_weapon.magic_bonus = item.magic_bonus
+                new_weapon = MeleeWeapon(
+                    name=item.name, damage_dice=item.damage_dice, damage_type=item.damage_type, vault_path=vault_path
+                )
+                if hasattr(item, "magic_bonus"):
+                    new_weapon.magic_bonus = item.magic_bonus
             else:
                 dmg_dice = "1d4" if "Unarmed" in item_name else "1d8"
                 dmg_type = "bludgeoning" if "Unarmed" in item_name else "slashing"
@@ -751,17 +942,18 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
             engine_creature.equipped_weapon_uuid = new_weapon.entity_uuid
         if new_ac_value is not None:
             engine_creature.ac.base_value = new_ac_value
-            
+
         if old_item and (not getattr(old_item, "requires_attunement", False) or old_item.name in attuned_items):
             for mod in getattr(old_item, "modifiers", []):
                 if hasattr(engine_creature, mod.stat):
                     stat_obj = getattr(engine_creature, mod.stat)
                     if isinstance(stat_obj, ModifiableValue):
                         to_remove = [m for m in stat_obj.modifiers if m.source_name == old_item.name]
-                        for m in to_remove: stat_obj.remove_modifier(m.mod_uuid)
+                        for m in to_remove:
+                            stat_obj.remove_modifier(m.mod_uuid)
                         if old_item.name in engine_creature.active_mechanics:
                             engine_creature.active_mechanics.remove(old_item.name)
-                            
+
         if item:
             if not getattr(item, "requires_attunement", False) or attune or item.name in attuned_items:
                 for mod in getattr(item, "modifiers", []):
@@ -769,21 +961,24 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
                         stat_obj = getattr(engine_creature, mod.stat)
                         if isinstance(stat_obj, ModifiableValue):
                             priority = ModifierPriority.OVERRIDE if mod.value >= 10 else ModifierPriority.ADDITIVE
-                            stat_obj.add_modifier(NumericalModifier(
-                                priority=priority,
-                                value=mod.value,
-                                source_name=item.name,
-                                duration_seconds=-1
-                            ))
+                            stat_obj.add_modifier(
+                                NumericalModifier(
+                                    priority=priority, value=mod.value, source_name=item.name, duration_seconds=-1
+                                )
+                            )
                             if item.name not in engine_creature.active_mechanics:
                                 engine_creature.active_mechanics.append(item.name)
 
     ac_msg = f". Their AC is now {new_ac_value}" if new_ac_value is not None else ""
     attune_msg = f" and attuned to it" if attune else ""
-    return f"Success: {character_name} equipped {item_name if not item else item.name} in the {final_slot} slot{attune_msg}{ac_msg}."
+    return_item_name = item_name if not item else item.name
+    return f"Success: {character_name} equipped {return_item_name} in the {final_slot} slot{attune_msg}{ac_msg}."
+
 
 @tool
-async def attune_item(character_name: str, item_name: str, action: str = "attune", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def attune_item(
+    character_name: str, item_name: str, action: str = "attune", *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
     """
     Attunes or unattunes a magical item to a character.
     Valid actions: 'attune', 'unattune'.
@@ -791,32 +986,40 @@ async def attune_item(character_name: str, item_name: str, action: str = "attune
     """
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
-    
+
     item = await ItemCompendium.load_item(vault_path, item_name)
     if not item:
         return f"SYSTEM ERROR: Item '{item_name}' not found in Compendium."
-        
+
     if not getattr(item, "requires_attunement", False) and action.lower() == "attune":
         return f"MECHANICAL TRUTH: '{item.name}' does not require attunement. You can just equip it."
-        
+
     try:
         async with edit_markdown_entity(file_path) as state:
             yaml_data = state["yaml_data"]
             attuned_items = yaml_data.get("attuned_items", [])
-            if not isinstance(attuned_items, list): attuned_items = []
-            
+            if not isinstance(attuned_items, list):
+                attuned_items = []
+
             max_slots = 3
-            
+
             if action.lower() == "attune":
                 for tag in item.tags:
                     if tag.startswith("requires_attunement_by_"):
                         req = tag.replace("requires_attunement_by_", "").lower()
-                        classes = [c.get("class_name", "").lower() for c in yaml_data.get("classes", [])] if isinstance(yaml_data.get("classes", []), list) else []
+                        classes = (
+                            [c.get("class_name", "").lower() for c in yaml_data.get("classes", [])]
+                            if isinstance(yaml_data.get("classes", []), list)
+                            else []
+                        )
                         species = str(yaml_data.get("species", "")).lower()
                         alignment = str(yaml_data.get("alignment", "")).lower()
                         if req not in classes and req not in species and req not in alignment:
                             state["save"] = False
-                            return f"SYSTEM ERROR: {character_name} does not meet the attunement requirements ({req}) for '{item.name}'."
+                            return (
+                                f"SYSTEM ERROR: {character_name} does not meet the "
+                                f"attunement requirements ({req}) for '{item.name}'."
+                            )
 
                 if len(attuned_items) >= max_slots:
                     state["save"] = False
@@ -829,12 +1032,12 @@ async def attune_item(character_name: str, item_name: str, action: str = "attune
                 else:
                     state["save"] = False
                     return f"SYSTEM ERROR: {character_name} is not attuned to '{item.name}'."
-                    
+
             yaml_data["attuned_items"] = attuned_items
             yaml_data["attunement_slots"] = f"{len(attuned_items)}/{max_slots}"
     except Exception as e:
         return str(e)
-        
+
     engine_creature = await _get_entity_by_name(character_name, vault_path)
     if engine_creature and isinstance(engine_creature, Creature):
         for mod in getattr(item, "modifiers", []):
@@ -842,48 +1045,57 @@ async def attune_item(character_name: str, item_name: str, action: str = "attune
                 stat_obj = getattr(engine_creature, mod.stat)
                 if isinstance(stat_obj, ModifiableValue):
                     to_remove = [m for m in stat_obj.modifiers if m.source_name == item.name]
-                    for m in to_remove: stat_obj.remove_modifier(m.mod_uuid)
-                    
+                    for m in to_remove:
+                        stat_obj.remove_modifier(m.mod_uuid)
+
                     if action.lower() == "attune":
                         priority = ModifierPriority.OVERRIDE if mod.value >= 10 else ModifierPriority.ADDITIVE
-                        stat_obj.add_modifier(NumericalModifier(
-                            priority=priority,
-                            value=mod.value,
-                            source_name=item.name,
-                            duration_seconds=-1
-                        ))
+                        stat_obj.add_modifier(
+                            NumericalModifier(priority=priority, value=mod.value, source_name=item.name, duration_seconds=-1)
+                        )
                         if item.name not in engine_creature.active_mechanics:
                             engine_creature.active_mechanics.append(item.name)
                     else:
                         if item.name in engine_creature.active_mechanics:
                             engine_creature.active_mechanics.remove(item.name)
-                            
+
     if action.lower() == "attune":
-        return f"Success: {character_name} attuned to {item.name}. Active modifiers applied. Slots used: {len(attuned_items)}/{max_slots}."
+        return (
+            f"Success: {character_name} attuned to {item.name}. "
+            f"Active modifiers applied. Slots used: {len(attuned_items)}/{max_slots}."
+        )
     else:
-        return f"Success: {character_name} unattuned from {item.name}. Active modifiers removed. Slots used: {len(attuned_items)}/{max_slots}."
+        return (
+            f"Success: {character_name} unattuned from {item.name}. "
+            f"Active modifiers removed. Slots used: {len(attuned_items)}/{max_slots}."
+        )
+
 
 @tool
-async def use_expendable_resource(character_name: str, resource_name: str, amount_to_deduct: int = 1, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def use_expendable_resource(
+    character_name: str, resource_name: str, amount_to_deduct: int = 1, *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
     """Deducts a use of a class feature, spell slot, or item charge (e.g. 'Second Wind', '1st Level Spell', 'Lucky')."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
-    
+
     log_message = ""
-    
+
     # 1. ACQUIRE LOCK: Read and Write the YAML
     try:
         async with edit_markdown_entity(file_path) as state:
             yaml_data = state["yaml_data"]
             resources = yaml_data.get("resources", {})
-            if not isinstance(resources, dict): resources = {}
-                
+            if not isinstance(resources, dict):
+                resources = {}
+
             target_key = next((k for k in resources.keys() if resource_name.lower() in k.lower()), None)
-            
+
             if not target_key:
                 state["save"] = False
-                return f"Error: Resource '{resource_name}' not found on {character_name}'s sheet. Available: {list(resources.keys())}"
-                
+                avail = list(resources.keys())
+                return f"Error: Resource '{resource_name}' not found on {character_name}'s sheet. Available: {avail}"
+
             val_str = str(resources[target_key])
             match = re.match(r"(\d+)\s*/\s*(\d+)", val_str)
             if match:
@@ -891,126 +1103,174 @@ async def use_expendable_resource(character_name: str, resource_name: str, amoun
                 max_val = int(match.group(2))
                 new_val = max(0, current_val - amount_to_deduct)
                 resources[target_key] = f"{new_val}/{max_val}"
-                
+
                 log_message = f"- Used {amount_to_deduct}x {target_key}. ({new_val}/{max_val} remaining)."
             else:
                 state["save"] = False
-                return f"Error: Resource '{target_key}' has invalid format '{val_str}'. Expected 'current/max' (e.g., '2/3')."
+                return f"Error: Resource '{target_key}' has invalid format '{val_str}'. Expected 'current/max'."
     except Exception as e:
         return str(e)
 
     # 2. LOCK RELEASED: Safely call the next tool
     # Sync OO Engine state dynamically if the entity is active in memory
     engine_creature = await _get_entity_by_name(character_name, vault_path)
-    if engine_creature and isinstance(engine_creature, Creature):
+    if engine_creature and isinstance(engine_creature, Creature) and log_message:
         engine_creature.resources[target_key] = f"{new_val}/{max_val}"
 
     if log_message:
-        await upsert_journal_section.ainvoke({"entity_name": character_name, "section_header": "Event Log", "content": log_message, "mode": "append"}, config)
+        await upsert_journal_section.ainvoke(
+            {"entity_name": character_name, "section_header": "Event Log", "content": log_message, "mode": "append"}, config
+        )
         return f"Success: Deducted {amount_to_deduct} from {target_key}. They now have {new_val}/{max_val} remaining."
 
-@tool
-async def update_character_status(character_name: str, hp: str, resources: str, conditions: str, fatigue: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
-    """Overwrites the 'Status & Conditions' section in a character's markdown log."""
-    content = f"- Current HP: {hp}\n- Expendable Resources: {resources}\n- Active Conditions: {conditions}\n- Fatigue/Exhaustion: {fatigue}"
-    # PASSING CONFIG DOWN THE CHAIN
-    return await upsert_journal_section.ainvoke({"entity_name": character_name, "section_header": "Status & Conditions", "content": content, "mode": "replace"}, config)
 
 @tool
-async def level_up_character(character_name: str, class_name: str, hp_increase: int, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def update_character_status(
+    character_name: str,
+    hp: str,
+    resources: str,
+    conditions: str,
+    fatigue: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """Overwrites the 'Status & Conditions' section in a character's markdown log."""
+    content = (
+        f"- Current HP: {hp}\n- Expendable Resources: {resources}\n"
+        f"- Active Conditions: {conditions}\n- Fatigue/Exhaustion: {fatigue}"
+    )
+    # PASSING CONFIG DOWN THE CHAIN
+    return await upsert_journal_section.ainvoke(
+        {"entity_name": character_name, "section_header": "Status & Conditions", "content": content, "mode": "replace"}, config
+    )
+
+
+@tool
+async def level_up_character(
+    character_name: str, class_name: str, hp_increase: int, *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
     """Updates a character's level in a specific class, increases their Max HP, and applies new features from the compendium."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
-    
-    if not os.path.exists(file_path): 
+
+    if not os.path.exists(file_path):
         return f"Error: Could not locate '{character_name}.md'."
-        
+
     try:
         async with edit_markdown_entity(file_path) as state:
             yaml_data = state["yaml_data"]
             pc_details = PCDetails(**yaml_data)
-            
+
             class_to_level_up = None
             for c in pc_details.classes:
                 if c.class_name.lower() == class_name.lower():
                     class_to_level_up = c
                     break
-            
+
             if not class_to_level_up:
                 state["save"] = False
                 return f"Error: Class '{class_name}' not found on character '{character_name}'."
-    
+
             class_to_level_up.level += 1
             new_level = class_to_level_up.level
-            
+
             new_max_hp = pc_details.hp + hp_increase
             pc_details.hp = new_max_hp
-            
+
             creature = await _get_entity_by_name(character_name, vault_path)
             if not creature or not isinstance(creature, Creature):
                 state["save"] = False
                 return f"Error: Creature '{character_name}' not found in the deterministic engine."
-    
+
             creature.max_hp = new_max_hp
             creature.hp.base_value += hp_increase
             for c in creature.classes:
                 if c.class_name.lower() == class_name.lower():
                     c.level = new_level
-    
+
             class_def = await CompendiumManager.get_class_definition(vault_path, class_to_level_up.class_name)
-            if class_def: creature.apply_features(class_def, new_level)
-            
+            if class_def:
+                creature.apply_features(class_def, new_level)
+
             if class_to_level_up.subclass_name:
                 subclass_def = await CompendiumManager.get_subclass_definition(vault_path, class_to_level_up.subclass_name)
-                if subclass_def: creature.apply_subclass_features(subclass_def, new_level)
-            
-            yaml_data.update({
-                "level": pc_details.character_level,
-                "max_hp": new_max_hp,
-                "classes": [c.model_dump() for c in pc_details.classes]
-            })
+                if subclass_def:
+                    creature.apply_subclass_features(subclass_def, new_level)
+
+            yaml_data.update(
+                {
+                    "level": pc_details.character_level,
+                    "max_hp": new_max_hp,
+                    "classes": [c.model_dump() for c in pc_details.classes],
+                }
+            )
     except Exception as e:
         return str(e)
-    
+
     new_features = [f.name for f in creature.features if f.level == new_level]
     if new_features:
         feature_bullets = "\n".join([f"- **Level {new_level} ({class_name})**: {feat}" for feat in new_features])
-        await upsert_journal_section.ainvoke({"entity_name": character_name, "section_header": "Event Log", "content": feature_bullets, "mode": "append"}, config)
-        
+        await upsert_journal_section.ainvoke(
+            {"entity_name": character_name, "section_header": "Event Log", "content": feature_bullets, "mode": "append"},
+            config,
+        )
+
     return f"Success: {character_name} leveled up to level {new_level} {class_name}. Max HP is now {new_max_hp}."
 
+
 @tool
-async def manage_inventory(character_name: str, item_name: str, action: str, quantity: int = 1, gold_change: int = 0, cp_change: int = 0, sp_change: int = 0, ep_change: int = 0, gp_change: int = 0, pp_change: int = 0, context_log: str = "", metadata: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def manage_inventory(
+    character_name: str,
+    item_name: str,
+    action: str,
+    quantity: int = 1,
+    gold_change: int = 0,
+    cp_change: int = 0,
+    sp_change: int = 0,
+    ep_change: int = 0,
+    gp_change: int = 0,
+    pp_change: int = 0,
+    context_log: str = "",
+    metadata: str = "",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
-    Adds or removes an item and/or currency from a character's YAML inventory. 
+    Adds or removes an item and/or currency from a character's YAML inventory.
     Handles quantity stacking (e.g. 'Torch (x5)') and partial removals.
     It automatically exchanges currencies if spending exceeds the specific denomination.
     """
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
-    
+
     try:
         async with edit_markdown_entity(file_path) as state:
             yaml_data = state["yaml_data"]
-            
+
             # Handle Currency
             if "currency" in yaml_data and isinstance(yaml_data["currency"], dict):
                 curr = yaml_data["currency"]
-                cp, sp, ep, gp, pp = int(curr.get("cp", 0)), int(curr.get("sp", 0)), int(curr.get("ep", 0)), int(curr.get("gp", 0)), int(curr.get("pp", 0))
+                cp, sp, ep, gp, pp = (
+                    int(curr.get("cp", 0)),
+                    int(curr.get("sp", 0)),
+                    int(curr.get("ep", 0)),
+                    int(curr.get("gp", 0)),
+                    int(curr.get("pp", 0)),
+                )
             else:
                 cp, sp, ep, gp, pp = 0, 0, 0, int(yaml_data.get("gold", 0)), 0
-                
+
             gp += gold_change + gp_change
             cp += cp_change
             sp += sp_change
             ep += ep_change
             pp += pp_change
-    
+
             total_copper = cp + (sp * 10) + (ep * 50) + (gp * 100) + (pp * 1000)
             if total_copper < 0:
                 state["save"] = False
                 return "Transaction Failed: Not enough currency to cover the cost."
-                
+
             if cp < 0 or sp < 0 or ep < 0 or gp < 0:
                 pp = total_copper // 1000
                 rem = total_copper % 1000
@@ -1020,27 +1280,28 @@ async def manage_inventory(character_name: str, item_name: str, action: str, qua
                 rem %= 50
                 sp = rem // 10
                 cp = rem % 10
-    
+
             yaml_data["currency"] = {"cp": cp, "sp": sp, "ep": ep, "gp": gp, "pp": pp}
             if "gold" in yaml_data or "gold" not in yaml_data:
-                yaml_data["gold"] = gp 
-            
+                yaml_data["gold"] = gp
+
             inventory = yaml_data.get("inventory", [])
-            if not isinstance(inventory, list): inventory = []
-            
+            if not isinstance(inventory, list):
+                inventory = []
+
             def parse_item(i_str):
                 qty, meta = 1, ""
                 name_part = str(i_str)
-                meta_match = re.search(r'\[(.*?)\]', name_part)
+                meta_match = re.search(r"\[(.*?)\]", name_part)
                 if meta_match:
                     meta = meta_match.group(1)
                     name_part = name_part.replace(f"[{meta}]", "").strip()
-                qty_match = re.search(r'\(\s*x(\d+)\s*\)', name_part)
+                qty_match = re.search(r"\(\s*x(\d+)\s*\)", name_part)
                 if qty_match:
                     qty = int(qty_match.group(1))
                     name_part = name_part.replace(f"(x{qty_match.group(1)})", "").strip()
                 return name_part.strip(), qty, meta
-    
+
             if action.lower() == "add" and item_name:
                 found = False
                 for i, item_str in enumerate(inventory):
@@ -1048,16 +1309,19 @@ async def manage_inventory(character_name: str, item_name: str, action: str, qua
                     if i_name.lower() == item_name.lower() and i_meta == metadata:
                         new_qty = i_qty + quantity
                         new_str = f"{i_name} (x{new_qty})"
-                        if metadata: new_str += f" [{metadata}]"
+                        if metadata:
+                            new_str += f" [{metadata}]"
                         inventory[i] = new_str
                         found = True
                         break
                 if not found:
                     item_str = f"{item_name}"
-                    if quantity > 1: item_str += f" (x{quantity})"
-                    if metadata: item_str += f" [{metadata}]"
+                    if quantity > 1:
+                        item_str += f" (x{quantity})"
+                    if metadata:
+                        item_str += f" [{metadata}]"
                     inventory.append(item_str)
-                    
+
             elif action.lower() == "remove" and item_name:
                 item_index = -1
                 for i, item_str in enumerate(inventory):
@@ -1065,27 +1329,37 @@ async def manage_inventory(character_name: str, item_name: str, action: str, qua
                     if item_name.lower() in i_name.lower():
                         item_index = i
                         break
-                        
+
                 if item_index != -1:
                     i_name, i_qty, i_meta = parse_item(inventory[item_index])
                     if i_qty > quantity:
                         new_qty = i_qty - quantity
                         new_str = f"{i_name}"
-                        if new_qty > 1: new_str += f" (x{new_qty})"
-                        if i_meta: new_str += f" [{i_meta}]"
+                        if new_qty > 1:
+                            new_str += f" (x{new_qty})"
+                        if i_meta:
+                            new_str += f" [{i_meta}]"
                         inventory[item_index] = new_str
                     else:
                         inventory.pop(item_index)
                 else:
                     state["save"] = False
                     return f"Error: '{item_name}' not found in inventory."
-                
+
             yaml_data["inventory"] = inventory
     except Exception as e:
         return str(e)
-         
-    if context_log: 
-        await upsert_journal_section.ainvoke({"entity_name": character_name, "section_header": "Event Log", "content": f"- **Inventory**: {context_log}", "mode": "append"}, config)
+
+    if context_log:
+        await upsert_journal_section.ainvoke(
+            {
+                "entity_name": character_name,
+                "section_header": "Event Log",
+                "content": f"- **Inventory**: {context_log}",
+                "mode": "append",
+            },
+            config,
+        )
 
     curr_str = f"{gp}gp"
     if pp > 0 or ep > 0 or sp > 0 or cp > 0:
@@ -1094,12 +1368,26 @@ async def manage_inventory(character_name: str, item_name: str, action: str, qua
 
 
 @tool
-async def perform_ability_check_or_save(character_name: str, skill_or_stat_name: str, is_hidden: bool = False, is_passive: bool = False, advantage: bool = False, disadvantage: bool = False, extra_modifier: int = 0, bonus_dice: str = None, luck_points_used: int = 0, manual_roll_total: int = None, force_auto_roll: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def perform_ability_check_or_save(
+    character_name: str,
+    skill_or_stat_name: str,
+    is_hidden: bool = False,
+    is_passive: bool = False,
+    advantage: bool = False,
+    disadvantage: bool = False,
+    extra_modifier: int = 0,
+    bonus_dice: str = None,
+    luck_points_used: int = 0,
+    manual_roll_total: int = None,
+    force_auto_roll: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
-    STRICT RULE: Use this ONLY for out-of-combat skill checks (Perception, Persuasion, Stealth) 
+    STRICT RULE: Use this ONLY for out-of-combat skill checks (Perception, Persuasion, Stealth)
     or environmental Saving Throws (dodging a falling rock).
-    
-    CRITICAL: NEVER use this tool for Weapon Attacks, Spell Attacks, or Spell Saves. 
+
+    CRITICAL: NEVER use this tool for Weapon Attacks, Spell Attacks, or Spell Saves.
     Combat mechanics are handled exclusively by `execute_melee_attack` and `use_ability_or_spell`.
     - If the character has Bless, Bane, or Bardic Inspiration, pass '1d4' or '-1d4' into bonus_dice.
     - If the character spends a Luck point or uses Elven Accuracy, pass luck_points_used=1.
@@ -1108,17 +1396,31 @@ async def perform_ability_check_or_save(character_name: str, skill_or_stat_name:
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
     stat_mod = 0
     skill_map = {
-        "perception": "wisdom", "insight": "wisdom", "survival": "wisdom", "animal handling": "wisdom", "medicine": "wisdom",
-        "investigation": "intelligence", "history": "intelligence", "religion": "intelligence", "arcana": "intelligence", "nature": "intelligence",
-        "stealth": "dexterity", "acrobatics": "dexterity", "sleight of hand": "dexterity", "athletics": "strength",
-        "persuasion": "charisma", "deception": "charisma", "intimidation": "charisma", "performance": "charisma"
+        "perception": "wisdom",
+        "insight": "wisdom",
+        "survival": "wisdom",
+        "animal handling": "wisdom",
+        "medicine": "wisdom",
+        "investigation": "intelligence",
+        "history": "intelligence",
+        "religion": "intelligence",
+        "arcana": "intelligence",
+        "nature": "intelligence",
+        "stealth": "dexterity",
+        "acrobatics": "dexterity",
+        "sleight of hand": "dexterity",
+        "athletics": "strength",
+        "persuasion": "charisma",
+        "deception": "charisma",
+        "intimidation": "charisma",
+        "performance": "charisma",
     }
     clean_skill = skill_or_stat_name.lower().strip()
     base_stat = skill_map.get(clean_skill, clean_skill)
-    
+
     stat_mod = 0
     engine_creature = await _get_entity_by_name(character_name, vault_path)
-    
+
     if engine_creature and isinstance(engine_creature, Creature) and base_stat != "none":
         # 1. PREFERRED: Read from OO Engine to capture live buffs/debuffs
         stat_obj = getattr(engine_creature, f"{base_stat}_mod", None)
@@ -1130,126 +1432,145 @@ async def perform_ability_check_or_save(character_name: str, skill_or_stat_name:
             async with read_markdown_entity(file_path) as (yaml_data, _):
                 stat_score = int(yaml_data.get(base_stat, yaml_data.get(base_stat[:3], 10)))
                 stat_mod = math.floor((stat_score - 10) / 2)
-        except Exception: pass
-                    
+        except Exception:
+            pass
+
     total_mod = stat_mod + extra_modifier
-    
+
     is_pc = any(t in engine_creature.tags for t in ["pc", "player"]) if engine_creature else False
     if is_pc and not is_passive and not force_auto_roll and manual_roll_total is None:
         auto_settings = get_roll_automations(character_name)
         if is_hidden and not auto_settings.get("hidden_rolls", True):
-            return f"SYSTEM ALERT: {character_name} has manual hidden rolls enabled. Ask the player to privately roll {clean_skill} and provide the total (including modifiers), OR ask if they want the engine to automate it. Then call this tool again with `manual_roll_total=X` or `force_auto_roll=True`."
+            return (
+                f"SYSTEM ALERT: {character_name} has manual hidden rolls enabled. Ask the player to privately roll "
+                f"{clean_skill} and provide the total (including modifiers), OR ask to automate it."
+            )
         elif not is_hidden and not auto_settings.get("skill_checks", True):
-            return f"SYSTEM ALERT: {character_name} has manual skill checks enabled. Ask the player to roll {clean_skill} and provide the total (including modifiers), OR ask if they want the engine to automate it. Then call this tool again with `manual_roll_total=X` or `force_auto_roll=True`."
+            return (
+                f"SYSTEM ALERT: {character_name} has manual skill checks enabled. Ask the player to roll {clean_skill} "
+                f"and provide the total (including modifiers), OR ask to automate it."
+            )
 
     if is_passive:
         total = 10 + total_mod + (5 if advantage else (-5 if disadvantage else 0))
         result_str = f"Passive {clean_skill.capitalize()} Score: {total}.\nDM DIRECTIVE: Narrate using 'Describe to Me'."
         await write_audit_log(vault_path, "Rules Engine", "perform_ability_check_or_save Executed (Passive)", result_str)
         return result_str
-        
-# --- 1. RESOLVE 5.5e BOOLEAN STATES ---
+
+    # --- 1. RESOLVE 5.5e BOOLEAN STATES ---
     if manual_roll_total is not None:
         total = manual_roll_total
         base_roll = "Manual"
         roll_type_str = "manually"
         bonus_str = ""
-        total_mod = 0 # Included in manual string
+        total_mod = 0  # Included in manual string
     else:
         if luck_points_used > 0:
             advantage = True  # In 5.5e, Luck explicitly grants Advantage
-            
+
         num_d20s = 1
-        if advantage or disadvantage: 
+        if advantage or disadvantage:
             num_d20s = 2
-        if advantage and disadvantage: 
+        if advantage and disadvantage:
             num_d20s = 1  # They perfectly cancel each other out
-            
+
         rolls = [random.randint(1, 20) for _ in range(num_d20s)]
-        
+
         # --- 2. EVALUATE FINAL POOL ---
         if advantage and not disadvantage:
             base_roll = max(rolls)
             roll_type_str = f"Advantage {rolls}"
-            if luck_points_used > 0: 
+            if luck_points_used > 0:
                 roll_type_str += " (via Luck)"
-                
+
         elif disadvantage and not advantage:
             base_roll = min(rolls)
             roll_type_str = f"Disadvantage {rolls}"
-            
+
         else:
             # This catches standard rolls AND canceled out Adv/Dis rolls
             base_roll = rolls[0]
             roll_type_str = "normally"
             if luck_points_used > 0 and disadvantage:
                 roll_type_str += f" {rolls} (Disadvantage canceled by Luck)"
-                
+
         # --- 3. RESOLVE BONUS DICE (Bless/Bane) ---
         bonus_total = 0
         bonus_str = ""
         if bonus_dice:
             match = re.match(r"([+-]?)\s*(\d+)d(\d+)", bonus_dice.strip().lower())
             if match:
-                sign, num, sides = match.group(1) or '+', int(match.group(2)), int(match.group(3))
+                sign, num, sides = match.group(1) or "+", int(match.group(2)), int(match.group(3))
                 b_rolls = [random.randint(1, sides) for _ in range(num)]
-                bonus_total = sum(b_rolls) if sign != '-' else -sum(b_rolls)
+                bonus_total = sum(b_rolls) if sign != "-" else -sum(b_rolls)
                 bonus_str = f" + [{bonus_dice}: {bonus_total}]"
-            
+
         total = base_roll + total_mod + bonus_total
-    
+
     # Query Environmental Lighting to alert the DM for Stealth and Perception checks
     illum_alert = ""
     if engine_creature and isinstance(engine_creature, Creature):
         illum = spatial_service.get_illumination(engine_creature.x, engine_creature.y, engine_creature.z)
-        
-        has_enhanced_vision = any(s in tag for tag in engine_creature.tags for s in ["darkvision", "blindsight", "truesight", "tremorsense"])
+
+        has_enhanced_vision = any(
+            s in tag for tag in engine_creature.tags for s in ["darkvision", "blindsight", "truesight", "tremorsense"]
+        )
         is_deafened = any(c.name.lower() == "deafened" for c in engine_creature.active_conditions)
-        
+
         if clean_skill in ["perception", "investigation"]:
             if illum == "darkness" and not has_enhanced_vision:
                 illum_alert = "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. Sight-based checks automatically fail (Hearing/Smell still work)."
             elif illum == "dim" and not has_enhanced_vision:
                 illum_alert = "\nSYSTEM ALERT: Character is in DIM LIGHT. Disadvantage (-5 to Passive) on sight-based checks."
-                
+
             if is_deafened:
                 illum_alert += "\nSYSTEM ALERT: Character is DEAFENED. Hearing-based checks automatically fail."
-                
+
         elif clean_skill == "stealth":
-            if illum == "bright": illum_alert = "\nSYSTEM ALERT: Character is in BRIGHT LIGHT. They cannot hide without physical cover or invisibility."
-            elif illum == "darkness": illum_alert = "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. They are heavily obscured and can hide freely. If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
-            elif illum == "dim": illum_alert = "\nSYSTEM ALERT: Character is in DIM LIGHT. They are lightly obscured and can hide. If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
-            
+            if illum == "bright":
+                illum_alert = (
+                    "\nSYSTEM ALERT: Character is in BRIGHT LIGHT. They cannot hide without physical cover or invisibility."
+                )
+            elif illum == "darkness":
+                illum_alert = "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. They are heavily obscured and can hide freely. If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
+            elif illum == "dim":
+                illum_alert = "\nSYSTEM ALERT: Character is in DIM LIGHT. They are lightly obscured and can hide. If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
+
     result_str = f"MECHANICAL TRUTH: Roll Result ({clean_skill}): {base_roll} {roll_type_str} + {total_mod} stat mod{bonus_str} = {total}. "
-    result_str += "\nHIDDEN ROLL: Narrate sensory experience only." if is_hidden else "\nYou may reveal the total to the player."
+    result_str += (
+        "\nHIDDEN ROLL: Narrate sensory experience only." if is_hidden else "\nYou may reveal the total to the player."
+    )
     result_str += illum_alert
-       
+
     await write_audit_log(vault_path, "Rules Engine", "perform_ability_check_or_save Executed", result_str)
     return result_str
 
 
 @tool
-async def roll_generic_dice(formula: str,  reason: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def roll_generic_dice(formula: str, reason: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
     Parses and rolls generic D&D dice formulas (e.g., '1d8+3', '8d6').
-    Use this to roll generic dice for random encounters, loot tables, or minor narrative 
+    Use this to roll generic dice for random encounters, loot tables, or minor narrative
     variables (e.g., '1d4 days of travel').
-    
-    CRITICAL: NEVER use this tool to calculate weapon damage, spell damage, or health changes. 
+
+    CRITICAL: NEVER use this tool to calculate weapon damage, spell damage, or health changes.
     Use `modify_health` or the combat tools instead.
     """
     match = re.match(r"(\d+)d(\d+)(?:\s*([+-])\s*(\d+))?", formula.strip().lower())
-    if not match: return f"Error: Invalid dice format '{formula}'. Use 'XdY' or 'XdY+Z'."
-    
+    if not match:
+        return f"Error: Invalid dice format '{formula}'. Use 'XdY' or 'XdY+Z'."
+
     num_dice, die_sides = int(match.group(1)), int(match.group(2))
     modifier_op = match.group(3)
     modifier_val = int(match.group(4)) if match.group(4) else 0
-    
+
     rolls = [random.randint(1, die_sides) for _ in range(num_dice)]
     total = sum(rolls)
-    if modifier_op == '+': total += modifier_val
-    elif modifier_op == '-': total -= modifier_val
-    
+    if modifier_op == "+":
+        total += modifier_val
+    elif modifier_op == "-":
+        total -= modifier_val
+
     result = f"MECHANICAL TRUTH: Rolled {formula} for {reason}. Result:{total}"
     await write_audit_log(config["configurable"].get("thread_id"), "Rules Engine", "roll_generic_dice Executed", result)
     return result
@@ -1260,53 +1581,74 @@ async def search_vault_by_tag(target_tag: str, *, config: Annotated[RunnableConf
     """Scans the YAML frontmatter of files to find entities matching a tag."""
     vault_path = config["configurable"].get("thread_id")
     matching_files, j_dir = [], get_journals_dir(vault_path)
-    
-    if not os.path.exists(j_dir): return "Error: Journal directory not found."
-    
+
+    if not os.path.exists(j_dir):
+        return "Error: Journal directory not found."
+
     for filename in os.listdir(j_dir):
-        if not filename.endswith(".md"): continue
+        if not filename.endswith(".md"):
+            continue
         file_path = os.path.join(j_dir, filename)
-        
+
         try:
             async with read_markdown_entity(file_path) as (yaml_data, _):
                 if target_tag.lower() in [tag.lower() for tag in yaml_data.get("tags", [])]:
                     matching_files.append(filename.replace(".md", ""))
-        except Exception: pass
-                    
-    return f"Entities matching '{target_tag}': " + ", ".join(matching_files) if matching_files else f"No entities found with tag: {target_tag}"
+        except Exception:
+            pass
+
+    return (
+        f"Entities matching '{target_tag}': " + ", ".join(matching_files)
+        if matching_files
+        else f"No entities found with tag: {target_tag}"
+    )
 
 
 @tool
-async def advance_time(days: int = 0, hours: int = 0, minutes: int = 0, seconds: int = 0, trigger_events: bool = True, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def advance_time(
+    days: int = 0,
+    hours: int = 0,
+    minutes: int = 0,
+    seconds: int = 0,
+    trigger_events: bool = True,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """Advances the in-game clock stored in CAMPAIGN_MASTER.md."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), "CAMPAIGN_MASTER.md")
-        
+
     current_day, current_hour, current_minute, current_second = 1, 8, 0, 0
     try:
         async with read_markdown_entity(file_path) as (yaml_data, _):
-            day_match = re.search(r'\d+', str(yaml_data.get("current_date", "Day 1")))
-            if day_match: current_day = int(day_match.group())
+            day_match = re.search(r"\d+", str(yaml_data.get("current_date", "Day 1")))
+            if day_match:
+                current_day = int(day_match.group())
             time_str = str(yaml_data.get("in_game_time", "08:00:00"))
             if ":" in time_str:
                 parts = time_str.split(":")
                 current_hour = int(parts[0])
                 current_minute = int(parts[1]) if len(parts) > 1 else 0
                 current_second = int(parts[2]) if len(parts) > 2 else 0
-    except Exception: pass
-                
+    except Exception:
+        pass
+
     total_seconds = current_second + seconds
     total_minutes = current_minute + minutes + (total_seconds // 60)
     total_hours = current_hour + hours + (total_minutes // 60)
     new_day = current_day + days + (total_hours // 24)
     new_time_str = f"{total_hours % 24:02d}:{total_minutes % 60:02d}:{total_seconds % 60:02d}"
-    
-    await update_yaml_frontmatter.ainvoke({"entity_name": "CAMPAIGN_MASTER", "updates": {"current_date": f"Day {new_day}", "in_game_time": new_time_str}}, config)
-    
+
+    await update_yaml_frontmatter.ainvoke(
+        {"entity_name": "CAMPAIGN_MASTER", "updates": {"current_date": f"Day {new_day}", "in_game_time": new_time_str}}, config
+    )
+
     total_seconds_advanced = days * 86400 + hours * 3600 + minutes * 60 + seconds
     if total_seconds_advanced > 0 and trigger_events:
         # Dispatch an AdvanceTime event to the engine so buffs can expire
-        event = GameEvent(event_type="AdvanceTime", source_uuid=uuid.uuid4(), payload={"seconds_advanced": total_seconds_advanced})
+        event = GameEvent(
+            event_type="AdvanceTime", source_uuid=uuid.uuid4(), payload={"seconds_advanced": total_seconds_advanced}
+        )
         EventBus.dispatch(event)
 
     return f"Success: Time advanced. It is now Day {new_day}, {new_time_str}."
@@ -1318,7 +1660,7 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
     vault_path = config["configurable"].get("thread_id")
     j_dir = get_journals_dir(vault_path)
     combatants = []
-    
+
     for pc in pc_names:
         file_path = os.path.join(j_dir, f"{pc}.md")
         pc_dex_mod, pc_hp, pc_ac, pc_x, pc_y, pc_z = 0, 10, 10, 0.0, 0.0, 0.0
@@ -1330,39 +1672,81 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
                 pc_x = float(yaml_data.get("x", 0.0))
                 pc_y = float(yaml_data.get("y", 0.0))
                 pc_z = float(yaml_data.get("z", 0.0))
-                hp_match = re.search(r'- Current HP:\s*(\d+)', body_text)
-                if hp_match: pc_hp = int(hp_match.group(1))
-        except Exception: pass # Ignores missing PCs or syntax errors, defaulting to 10
-            
-        combatants.append({"name": pc, "init": random.randint(1, 20) + pc_dex_mod, "hp": pc_hp, "max_hp": pc_hp, "ac": pc_ac, "conditions": [], "is_pc": True, "x": pc_x, "y": pc_y, "z": pc_z})
-    
+                hp_match = re.search(r"- Current HP:\s*(\d+)", body_text)
+                if hp_match:
+                    pc_hp = int(hp_match.group(1))
+        except Exception:
+            pass  # Ignores missing PCs or syntax errors, defaulting to 10
+
+        combatants.append(
+            {
+                "name": pc,
+                "init": random.randint(1, 20) + pc_dex_mod,
+                "hp": pc_hp,
+                "max_hp": pc_hp,
+                "ac": pc_ac,
+                "conditions": [],
+                "is_pc": True,
+                "x": pc_x,
+                "y": pc_y,
+                "z": pc_z,
+            }
+        )
+
     for enemy in enemies:
-        combatants.append({"name": enemy.get("name", "Unknown"), "init": random.randint(1, 20) + int(enemy.get("dex_mod", 0)), 
-                           "hp": int(enemy.get("hp", 10)), "max_hp": int(enemy.get("hp", 10)), "ac": int(enemy.get("ac", 10)), "conditions": [], "is_pc": False, "x": float(enemy.get("x", 0.0)), "y": float(enemy.get("y", 0.0)), "z": float(enemy.get("z", 0.0))})
-    
+        combatants.append(
+            {
+                "name": enemy.get("name", "Unknown"),
+                "init": random.randint(1, 20) + int(enemy.get("dex_mod", 0)),
+                "hp": int(enemy.get("hp", 10)),
+                "max_hp": int(enemy.get("hp", 10)),
+                "ac": int(enemy.get("ac", 10)),
+                "conditions": [],
+                "is_pc": False,
+                "x": float(enemy.get("x", 0.0)),
+                "y": float(enemy.get("y", 0.0)),
+                "z": float(enemy.get("z", 0.0)),
+            }
+        )
+
     combatants = sorted(combatants, key=lambda x: x["init"], reverse=True)
-    yaml_str = yaml.dump({"tags": ["combat_whiteboard"], "round": 1, "current_turn_index": 0, "combatants": combatants, "readied_actions": []}, sort_keys=False, default_flow_style=False)
-    dataview_js = (f"```dataviewjs\nconst p = dv.current(); if (!p || !p.combatants) return;\n"
-                   f"let tableData = p.combatants.map((c, i) => [i === p.current_turn_index ? \"👉 \"+c.init : c.init, c.name, `${{c.hp}}/${{c.max_hp}}`, c.ac, `(${{c.x || 0}}, ${{c.y || 0}}, ${{c.z || 0}})`, c.hp <= 0 ? \"💀 Dead\" : (c.conditions.length ? c.conditions.join(\", \") : \"Healthy\")]);\n"
-                   f"dv.header(2, \"⚔️ Active Combat Tracker ⚔️\"); dv.paragraph(`**Round:** ${{p.round}}`);\n"
-                   f"dv.table([\"Init\", \"Combatant\", \"HP\", \"AC\", \"Pos (x,y,z)\", \"Status\"], tableData);\n"
-                   f"if (p.readied_actions && p.readied_actions.length > 0) {{\n    dv.header(3, \"⏱️ Readied Actions\");\n    let raData = p.readied_actions.map(ra => [ra.character, ra.trigger, ra.action]);\n    dv.table([\"Character\", \"Trigger\", \"Action\"], raData);\n}}\n```\n")
-                   
-    async with aiofiles.open(os.path.join(j_dir, "ACTIVE_COMBAT.md"), 'w', encoding='utf-8') as f: 
+    yaml_str = yaml.dump(
+        {"tags": ["combat_whiteboard"], "round": 1, "current_turn_index": 0, "combatants": combatants, "readied_actions": []},
+        sort_keys=False,
+        default_flow_style=False,
+    )
+    dataview_js = (
+        f"```dataviewjs\nconst p = dv.current(); if (!p || !p.combatants) return;\n"
+        f'let tableData = p.combatants.map((c, i) => [i === p.current_turn_index ? "👉 "+c.init : c.init, c.name, `${{c.hp}}/${{c.max_hp}}`, c.ac, `(${{c.x || 0}}, ${{c.y || 0}}, ${{c.z || 0}})`, c.hp <= 0 ? "💀 Dead" : (c.conditions.length ? c.conditions.join(", ") : "Healthy")]);\n'
+        f'dv.header(2, "⚔️ Active Combat Tracker ⚔️"); dv.paragraph(`**Round:** ${{p.round}}`);\n'
+        f'dv.table(["Init", "Combatant", "HP", "AC", "Pos (x,y,z)", "Status"], tableData);\n'
+        f'if (p.readied_actions && p.readied_actions.length > 0) {{\n    dv.header(3, "⏱️ Readied Actions");\n    let raData = p.readied_actions.map(ra => [ra.character, ra.trigger, ra.action]);\n    dv.table(["Character", "Trigger", "Action"], raData);\n}}\n```\n'
+    )
+
+    async with aiofiles.open(os.path.join(j_dir, "ACTIVE_COMBAT.md"), "w", encoding="utf-8") as f:
         await f.write(f"---\n{yaml_str}---\n\n{dataview_js}")
-        
+
     # Update engine memory
     spatial_service.active_combatants[vault_path] = [c["name"] for c in combatants]
     return f"Combat started! {combatants[0]['name']} goes first."
 
 
 @tool
-async def update_combat_state(combatant_name: str = None, hp_change: int = 0, added_conditions: list[str] = None, next_turn: bool = False, force_advance: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def update_combat_state(
+    combatant_name: str = None,
+    hp_change: int = 0,
+    added_conditions: list[str] = None,
+    next_turn: bool = False,
+    force_advance: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """Applies damage/healing to combatants and advances the initiative turn order."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
-    if added_conditions is None: added_conditions = []
-    
+    if added_conditions is None:
+        added_conditions = []
+
     advance_global_clock = False
     new_init = None
     try:
@@ -1375,53 +1759,62 @@ async def update_combat_state(combatant_name: str = None, hp_change: int = 0, ad
                     if c["name"].lower() == combatant_name.lower():
                         if hp_change != 0:
                             c["hp"] = max(0, min(c["max_hp"], c["hp"] + hp_change))
-                            log_msg.append(f"{c['name']} {'healed' if hp_change > 0 else 'took damage'}. HP: {c['hp']}/{c['max_hp']}.")
+                            log_msg.append(
+                                f"{c['name']} {'healed' if hp_change > 0 else 'took damage'}. HP: {c['hp']}/{c['max_hp']}."
+                            )
                         if added_conditions:
                             c["conditions"].extend(added_conditions)
                             log_msg.append(f"{c['name']} gained conditions: {', '.join(added_conditions)}.")
-                            
+
             if next_turn and not force_advance:
                 current_combatant = combatants[yaml_data.get("current_turn_index", 0)]
                 interrupts = []
                 for c in combatants:
-                    if c["name"] == current_combatant["name"] or c["hp"] <= 0: continue
+                    if c["name"] == current_combatant["name"] or c["hp"] <= 0:
+                        continue
                     eng_ent = await _get_entity_by_name(c["name"], vault_path)
                     if eng_ent and isinstance(eng_ent, Creature) and eng_ent.legendary_actions_current > 0:
                         interrupts.append(f"{c['name']} ({eng_ent.legendary_actions_current} LA left)")
-                
+
                 if interrupts:
-                    return f"SYSTEM ALERT: Turn advancement paused! {', '.join(interrupts)} have Legendary Actions. Use combat tools with `is_legendary_action=True` to execute them, then call `update_combat_state(next_turn=True, force_advance=True)` to proceed."
-    
+                    return (
+                        f"SYSTEM ALERT: Turn advancement paused! {', '.join(interrupts)} have Legendary Actions. "
+                        f"Use combat tools with `is_legendary_action=True` to execute them, then call "
+                        f"`update_combat_state(next_turn=True, force_advance=True)` to proceed."
+                    )
+
             if next_turn:
                 yaml_data["current_turn_index"] = (yaml_data.get("current_turn_index", 0) + 1) % len(combatants)
-                if yaml_data["current_turn_index"] == 0: 
+                if yaml_data["current_turn_index"] == 0:
                     yaml_data["round"] = yaml_data.get("round", 1) + 1
                     advance_global_clock = True
-                    
+
                 loop_counter = 0
                 while combatants[yaml_data["current_turn_index"]]["hp"] <= 0 and loop_counter < len(combatants):
-                     yaml_data["current_turn_index"] = (yaml_data["current_turn_index"] + 1) % len(combatants)
-                     loop_counter += 1
-                     
+                    yaml_data["current_turn_index"] = (yaml_data["current_turn_index"] + 1) % len(combatants)
+                    loop_counter += 1
+
                 new_init = combatants[yaml_data["current_turn_index"]]["init"]
                 log_msg.append(f"Turn advanced to {combatants[yaml_data['current_turn_index']]['name']}.")
-                
+
                 # Reset reactions and legendary actions for the character whose turn is starting
-                new_turn_ent = await _get_entity_by_name(combatants[yaml_data['current_turn_index']]['name'], vault_path)
+                new_turn_ent = await _get_entity_by_name(combatants[yaml_data["current_turn_index"]]["name"], vault_path)
                 if new_turn_ent and isinstance(new_turn_ent, Creature):
                     new_turn_ent.reaction_used = False
                     new_turn_ent.legendary_actions_current = new_turn_ent.legendary_actions_max
-                    new_turn_ent.movement_remaining = new_turn_ent.speed # Refresh movement for new turn
+                    new_turn_ent.movement_remaining = new_turn_ent.speed  # Refresh movement for new turn
     except Exception as e:
         return str(e)
-            
+
     if advance_global_clock:
         await advance_time.ainvoke({"seconds": 6, "trigger_events": False}, config)
-        
+
     if new_init is not None:
-        event = GameEvent(event_type="AdvanceTime", source_uuid=uuid.uuid4(), payload={"seconds_advanced": 6, "target_initiative": new_init})
+        event = GameEvent(
+            event_type="AdvanceTime", source_uuid=uuid.uuid4(), payload={"seconds_advanced": 6, "target_initiative": new_init}
+        )
         EventBus.dispatch(event)
-        
+
     return " | ".join(log_msg) if log_msg else "Combat updated."
 
 
@@ -1430,45 +1823,65 @@ async def end_combat(*, config: Annotated[RunnableConfig, InjectedToolArg]) -> s
     """Concludes combat, saves PC final states to permanent files, and deletes ACTIVE_COMBAT.md."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
-    
+
     try:
         async with read_markdown_entity(file_path) as (yaml_data, _):
             combatants = yaml_data.get("combatants", [])
     except Exception as e:
         return str(e)
-            
+
     for c in combatants:
         if c.get("is_pc"):
             conds = ", ".join(c["conditions"]) if c["conditions"] else "None"
-            await update_character_status.ainvoke({"character_name": c["name"], "hp": str(c["hp"]), "resources": "Update Manually", "conditions": conds, "fatigue": "None"}, config)
-            
+            await update_character_status.ainvoke(
+                {
+                    "character_name": c["name"],
+                    "hp": str(c["hp"]),
+                    "resources": "Update Manually",
+                    "conditions": conds,
+                    "fatigue": "None",
+                },
+                config,
+            )
+
         # Flush in-memory combat states
         ent = await _get_entity_by_name(c["name"], vault_path)
         if ent and isinstance(ent, Creature):
             ent.reaction_used = False
-            ent.legendary_actions_current = getattr(ent, 'legendary_actions_max', 0)
+            ent.legendary_actions_current = getattr(ent, "legendary_actions_max", 0)
             ent.movement_remaining = ent.speed
-            
+
     if vault_path in spatial_service.active_combatants:
         del spatial_service.active_combatants[vault_path]
     os.remove(file_path)
     return "Combat ended successfully. ACTIVE_COMBAT.md removed."
 
+
 @tool
-async def move_entity(entity_name: str, target_x: float, target_y: float, target_z: float = None, movement_type: str = "walk", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def move_entity(
+    entity_name: str,
+    target_x: float,
+    target_y: float,
+    target_z: float = None,
+    movement_type: str = "walk",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """Moves an entity to a new (X, Y, Z) coordinate on the spatial grid and visually updates the combat whiteboard.
     Valid movement_type values: 'walk', 'jump', 'climb', 'fly', 'teleport', 'crawl', 'disengage', 'forced', 'fall', 'travel'.
     'walk' and 'crawl' will be blocked by solid walls in a straight line."""
     vault_path = config["configurable"].get("thread_id")
     entity = await _get_entity_by_name(entity_name, vault_path)
-    if not entity: return f"SYSTEM ERROR: Entity '{entity_name}' not found in active memory."
-    
-    if target_z is None: target_z = entity.z
+    if not entity:
+        return f"SYSTEM ERROR: Entity '{entity_name}' not found in active memory."
+
+    if target_z is None:
+        target_z = entity.z
     old_x, old_y, old_z = entity.x, entity.y, entity.z
-    
+
     dz = target_z - old_z
     dist_3d = spatial_service.calculate_distance(old_x, old_y, old_z, target_x, target_y, target_z, vault_path)
-    
+
     # --- Identify Dragged Entities ---
     dragged_entities = []
     if movement_type.lower() not in ["teleport", "fall", "forced"]:
@@ -1477,27 +1890,43 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
                 for cond in ent.active_conditions:
                     if cond.name.lower() == "grappled" and cond.source_uuid == entity.entity_uuid:
                         dragged_entities.append(ent)
-    
+
     # --- Check for Wall Collisions ---
     if movement_type.lower() in ["walk", "crawl", "disengage"]:
-        if dz > 1.5: return "SYSTEM ERROR: Cannot walk up vertical distances. Use 'jump', 'climb', or 'fly'."
-        blocking_wall = spatial_service.check_path_collision(old_x, old_y, old_z, target_x, target_y, target_z, entity.height, vault_path=vault_path)
+        if dz > 1.5:
+            return "SYSTEM ERROR: Cannot walk up vertical distances. Use 'jump', 'climb', or 'fly'."
+        blocking_wall = spatial_service.check_path_collision(
+            old_x, old_y, old_z, target_x, target_y, target_z, entity.height, vault_path=vault_path
+        )
         if blocking_wall:
             str_score = (entity.strength_mod.total * 2) + 10
             run_jump, stand_jump = str_score, str_score // 2
             run_high, stand_high = 3 + entity.strength_mod.total, max(1, (3 + entity.strength_mod.total) // 2)
-            lock_msg = f" It is locked (DC {blocking_wall.interact_dc}). Use `interact_with_object` to pick/force it." if blocking_wall.is_locked else ""
-            return (f"SYSTEM ERROR: Movement blocked! Collided with '{blocking_wall.label}'.{lock_msg}\n"
-                    f"DM DIRECTIVE: You must inform the player their path is blocked and discuss options:\n"
-                    f"1. **Interact/Walk Around/Climb:** Execute multiple shorter `move_entity` calls to navigate corners, or open the obstacle if it is a door.\n"
-                    f"2. **Jump:** {entity.name} can running-long-jump {run_jump}ft (standing {stand_jump}ft) and running-high-jump {run_high}ft (standing {stand_high}ft). Running jumps require 10ft of prior movement. Call `perform_ability_check_or_save` for Athletics if it exceeds bounds, then `move_entity` with `movement_type='jump'`.\n"
-                    f"3. **Crawl/Squeeze:** If there's a gap, they can crawl (costs double movement).\n"
-                    f"4. **Magic:** Spells like Misty Step can `teleport` past obstacles.")
+            lock_msg = (
+                f" It is locked (DC {blocking_wall.interact_dc}). Use `interact_with_object` to pick/force it."
+                if blocking_wall.is_locked
+                else ""
+            )
+            return (
+                f"SYSTEM ERROR: Movement blocked! Collided with '{blocking_wall.label}'.{lock_msg}\n"
+                f"DM DIRECTIVE: You must inform the player their path is blocked and discuss options:\n"
+                f"1. **Interact/Walk Around/Climb:** Execute multiple shorter `move_entity` calls to navigate corners, "
+                f"or open the obstacle if it is a door.\n"
+                f"2. **Jump:** {entity.name} can running-long-jump {run_jump}ft (standing {stand_jump}ft) and "
+                f"running-high-jump {run_high}ft (standing {stand_high}ft). Running jumps require 10ft of prior movement. "
+                f"Call `perform_ability_check_or_save` for Athletics if it exceeds bounds, then `move_entity` with "
+                f"`movement_type='jump'`.\n"
+                f"3. **Crawl/Squeeze:** If there's a gap, they can crawl (costs double movement).\n"
+                f"4. **Magic:** Spells like Misty Step can `teleport` past obstacles."
+            )
     elif movement_type.lower() == "jump":
         str_score = (entity.strength_mod.total * 2) + 10
         run_high = 3 + entity.strength_mod.total
         if dz > run_high or dist_3d > str_score:
-            return f"SYSTEM ERROR: Jump exceeds physical limits. Max running long-jump: {str_score}ft. Max running high-jump: {run_high}ft. Call perform_ability_check_or_save for Athletics to push limits."
+            return (
+                f"SYSTEM ERROR: Jump exceeds physical limits. Max running long-jump: {str_score}ft. "
+                f"Max running high-jump: {run_high}ft. Call perform_ability_check_or_save for Athletics to push limits."
+            )
 
     # --- Determine if in active combat to enforce budget (Paradigm check) ---
     active_list = spatial_service.active_combatants.get(vault_path, [])
@@ -1508,20 +1937,30 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
         event_type="Movement",
         source_uuid=entity.entity_uuid,
         vault_path=vault_path,
-        payload={"target_x": target_x, "target_y": target_y, "target_z": target_z, "movement_type": movement_type, "dragged_uuids": [e.entity_uuid for e in dragged_entities], "ignore_budget": not in_combat}
+        payload={
+            "target_x": target_x,
+            "target_y": target_y,
+            "target_z": target_z,
+            "movement_type": movement_type,
+            "dragged_uuids": [e.entity_uuid for e in dragged_entities],
+            "ignore_budget": not in_combat,
+        },
     )
     result = EventBus.dispatch(event)
-    
+
     if result.status == EventStatus.CANCELLED:
         error_msg = result.payload.get("error", "Movement cancelled by rules engine.")
-        return f"SYSTEM ERROR: {error_msg} Ask the player if they want to use their Action to 'Dash' (call `use_dash_action`), pick a shorter route, or do something else."
-    
+        return (
+            f"SYSTEM ERROR: {error_msg} Ask the player if they want to use their Action to 'Dash' "
+            f"(call `use_dash_action`), pick a shorter route, or do something else."
+        )
+
     entity.x = target_x
     entity.y = target_y
     entity.z = target_z
-    
+
     spatial_service.sync_entity(entity)
-    
+
     # Apply movement to dragged entities
     dx, dy = target_x - old_x, target_y - old_y
     drag_msg_parts = []
@@ -1529,14 +1968,18 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
         new_dx, new_dy, new_dz = dragged.x + dx, dragged.y + dy, dragged.z + dz
         dragged.x, dragged.y, dragged.z = new_dx, new_dy, new_dz
         spatial_service.sync_entity(dragged)
-        if hasattr(dragged, '_filepath'):
-            await update_yaml_frontmatter.ainvoke({"entity_name": dragged.name, "updates": {"x": new_dx, "y": new_dy, "z": new_dz}}, config)
+        if hasattr(dragged, "_filepath"):
+            await update_yaml_frontmatter.ainvoke(
+                {"entity_name": dragged.name, "updates": {"x": new_dx, "y": new_dy, "z": new_dz}}, config
+            )
         drag_msg_parts.append(dragged.name)
-        
+
     # Persist the change to the entity's file
-    if hasattr(entity, '_filepath'):
-        await update_yaml_frontmatter.ainvoke({"entity_name": entity.name, "updates": {"x": target_x, "y": target_y, "z": target_z}}, config)
-        
+    if hasattr(entity, "_filepath"):
+        await update_yaml_frontmatter.ainvoke(
+            {"entity_name": entity.name, "updates": {"x": target_x, "y": target_y, "z": target_z}}, config
+        )
+
     # Visually update the active combat board if it exists
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
     if os.path.exists(file_path):
@@ -1548,54 +1991,77 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
                         c["x"], c["y"] = target_x, target_y
                     elif c.get("name", "") in drag_msg_parts:
                         c["x"], c["y"] = c.get("x", 0) + dx, c.get("y", 0) + dy
-        except Exception: pass
-            
-    base_msg = f"MECHANICAL TRUTH: {entity.name} moved from ({old_x}, {old_y}) to ({target_x}, {target_y}) via {movement_type}."
-    
+        except Exception:
+            pass
+
+    base_msg = (
+        f"MECHANICAL TRUTH: {entity.name} moved from ({old_x}, {old_y}) to ({target_x}, {target_y}) via {movement_type}."
+    )
+
     if drag_msg_parts:
         base_msg += f" They automatically dragged {', '.join(drag_msg_parts)} with them."
-    
+
     if movement_type.lower() == "teleport":
         can_see = spatial_service.has_line_of_sight_to_point(entity.entity_uuid, target_x, target_y)
         if not can_see:
-            base_msg += "\nSYSTEM NOTE: The entity does NOT have line of sight to the teleport destination. Ensure the specific spell allows teleporting to unseen locations, otherwise this move is invalid."
-    
+            base_msg += (
+                "\nSYSTEM NOTE: The entity does NOT have line of sight to the teleport destination. Ensure the "
+                "specific spell allows teleporting to unseen locations, otherwise this move is invalid."
+            )
+
     attackers = result.payload.get("opportunity_attackers", [])
-    
+
     # Fallback to alert DM of spatial triggers even if the engine suppressed them (e.g. reaction_used = True)
     # execute_melee_attack will strictly enforce the reaction limits if they try to attack.
     if movement_type.lower() not in ["teleport", "forced", "fall", "disengage"]:
         for other_entity in get_all_entities(vault_path).values():
-            if other_entity.entity_uuid != entity.entity_uuid and hasattr(other_entity, 'hp') and getattr(other_entity.hp, 'base_value', 0) > 0:
+            if (
+                other_entity.entity_uuid != entity.entity_uuid
+                and hasattr(other_entity, "hp")
+                and getattr(other_entity.hp, "base_value", 0) > 0
+            ):
                 if other_entity.name not in attackers:
                     base_reach = _calculate_reach(other_entity, is_active_turn=False)
                     eff_reach = base_reach + max(0, (other_entity.size - 5.0) / 2.0) + max(0, (entity.size - 5.0) / 2.0)
-                    
-                    dist_before = spatial_service.calculate_distance(old_x, old_y, old_z, other_entity.x, other_entity.y, other_entity.z, vault_path)
-                    dist_after = spatial_service.calculate_distance(target_x, target_y, target_z, other_entity.x, other_entity.y, other_entity.z, vault_path)
+
+                    dist_before = spatial_service.calculate_distance(
+                        old_x, old_y, old_z, other_entity.x, other_entity.y, other_entity.z, vault_path
+                    )
+                    dist_after = spatial_service.calculate_distance(
+                        target_x, target_y, target_z, other_entity.x, other_entity.y, other_entity.z, vault_path
+                    )
                     if dist_before <= eff_reach and dist_after > eff_reach:
                         attackers.append(other_entity.name)
 
     if attackers:
-        base_msg += f"\nSYSTEM ALERT: Movement provoked Opportunity Attacks from: {', '.join(attackers)}. You MUST ask player(s) if they want to use their Reaction. For NPCs, you choose. Use execute_melee_attack(is_reaction=True) to resolve."
-        
+        base_msg += (
+            f"\nSYSTEM ALERT: Movement provoked Opportunity Attacks from: {', '.join(attackers)}. You MUST ask "
+            f"player(s) if they want to use their Reaction. For NPCs, you choose. Use "
+            f"execute_melee_attack(is_reaction=True) to resolve."
+        )
+
     if "trap_results" in result.payload and result.payload["trap_results"]:
         trap_msg = "\n".join(result.payload["trap_results"])
         base_msg += f"\nSYSTEM ALERT: TRAP TRIGGERED during movement!\n{trap_msg}"
-        
+
     return base_msg
+
 
 def _get_config_tone(vault_path: str) -> str:
     """Reads DM_CONFIG.md to optionally retrieve Tone & Boundaries."""
     config_path = os.path.join(vault_path, "DM_CONFIG.md")
-    if not os.path.exists(config_path): return ""
+    if not os.path.exists(config_path):
+        return ""
     try:
-        with open(config_path, 'r', encoding='utf-8') as f: content = f.read()
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read()
         if content.startswith("---"):
             yaml_data = yaml.safe_load(content.split("---", 2)[1]) or {}
             return yaml_data.get("tone_and_boundaries", "")
-    except Exception: pass
+    except Exception:
+        pass
     return ""
+
 
 def _get_config_dirs(vault_path: str, key: str) -> list[str]:
     """Reads DM_CONFIG.md and returns a list of absolute paths for a directory key."""
@@ -1603,11 +2069,13 @@ def _get_config_dirs(vault_path: str, key: str) -> list[str]:
     if not os.path.exists(config_path):
         return []
     try:
-        with open(config_path, 'r', encoding='utf-8') as f: content = f.read()
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read()
         if content.startswith("---"):
             yaml_data = yaml.safe_load(content.split("---", 2)[1]) or {}
             rel_dirs = yaml_data.get("directories", {}).get(key, [])
-            if isinstance(rel_dirs, str): rel_dirs = [rel_dirs]
+            if isinstance(rel_dirs, str):
+                rel_dirs = [rel_dirs]
             target_dirs = []
             for rel_dir in rel_dirs:
                 target_dir = os.path.join(vault_path, os.path.normpath(rel_dir))
@@ -1618,64 +2086,75 @@ def _get_config_dirs(vault_path: str, key: str) -> list[str]:
         print(f"Error reading DM_CONFIG.md: {e}")
     return []
 
+
 def _search_markdown_for_keywords(vault_path: str, category: str, query: str, top_n: int = 3) -> str:
     """Scans in-memory chunks for the most relevant sections."""
     _VAULT_CACHE.build_index(vault_path)
     keywords = set([w.lower() for w in query.replace(",", "").split() if len(w) > 3])
-    if not keywords: keywords = set([query.lower()])
-        
+    if not keywords:
+        keywords = set([query.lower()])
+
     best_chunks = []
     chunks = _VAULT_CACHE.chunk_cache.get(vault_path, {}).get(category, [])
-    
+
     for file, chunk in chunks:
         chunk_lower = chunk.lower()
         file_lower = file.lower()
         score = sum(1 for k in keywords if k in chunk_lower)
-        if any(k in file_lower for k in keywords): score += 2 
-        if score > 0: best_chunks.append((score, file, chunk))
-    
+        if any(k in file_lower for k in keywords):
+            score += 2
+        if score > 0:
+            best_chunks.append((score, file, chunk))
+
     if not best_chunks:
         return f"Cache Miss: No relevant information found for '{query}'."
-        
+
     best_chunks.sort(key=lambda x: x[0], reverse=True)
-    
+
     result = ""
     for score, file, chunk in best_chunks[:top_n]:
         snippet = chunk[:1000] + ("\n[...Truncated]" if len(chunk) > 1000 else "")
         result += f"--- Source: {file} ---\n{snippet}\n\n"
-        
+
     return result
 
+
 @tool
-def query_bestiary(creature_name: str, specific_section: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+def query_bestiary(
+    creature_name: str, specific_section: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
     """
     Retrieves exact stat blocks, abilities, tactics, and lore for a specific creature.
     Optional `specific_section` (e.g., 'Legendary Actions', 'Lair Actions') focuses the output on that specific block.
     """
     vault_path = config["configurable"].get("thread_id")
     _VAULT_CACHE.build_index(vault_path)
-    
+
     search_name = creature_name.lower().strip()
     files_content = _VAULT_CACHE.bestiary_cache.get(vault_path, [])
-    
+
     if not files_content:
         return "Error: Bestiary directory not configured in DM_CONFIG.md."
-        
+
     for file, content in files_content:
         header_pattern = rf"^(#+)\s+.*?(?:\[.*?\]\(.*?\))?.*?{re.escape(search_name)}.*?$"
         match = re.search(header_pattern, content, re.IGNORECASE | re.MULTILINE)
-        
+
         if match:
             header_level = len(match.group(1))
-            tail = content[match.start():]
-            
+            tail = content[match.start() :]
+
             # Negative lookahead ensures we don't truncate early if Lair/Legendary actions are sibling headers
-            next_header_pattern = re.compile(rf"^#{{1,{header_level}}}\s+(?!.*(?:Lair|Legendary|Mythic|Reactions)).*$", re.MULTILINE | re.IGNORECASE)
+            next_header_pattern = re.compile(
+                rf"^#{{1,{header_level}}}\s+(?!.*(?:Lair|Legendary|Mythic|Reactions)).*$", re.MULTILINE | re.IGNORECASE
+            )
             next_match = next_header_pattern.search(tail, pos=len(match.group(0)))
-            
-            if next_match: body = tail[:next_match.start()].strip()
-            else: body = tail.strip()
-            
+
+            if next_match:
+                body = tail[: next_match.start()].strip()
+            else:
+                body = tail.strip()
+
             if specific_section:
                 section_pattern = rf"^(#+)\s+.*?{re.escape(specific_section)}.*?$"
                 sec_match = re.search(section_pattern, body, re.IGNORECASE | re.MULTILINE)
@@ -1683,16 +2162,18 @@ def query_bestiary(creature_name: str, specific_section: str = "", *, config: An
                     sec_match = re.search(section_pattern, content, re.IGNORECASE | re.MULTILINE)
                     if sec_match:
                         body = content
-                
+
                 if sec_match:
                     sec_level = len(sec_match.group(1))
-                    sec_tail = body[sec_match.start():]
+                    sec_tail = body[sec_match.start() :]
                     next_sec_pattern = re.compile(rf"^#{{1,{sec_level}}}\s+", re.MULTILINE)
                     next_sec_match = next_sec_pattern.search(sec_tail, pos=len(sec_match.group(0)))
                     if next_sec_match:
-                        return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{sec_tail[:next_sec_match.start()].strip()}"[:4000]
+                        content_block = sec_tail[: next_sec_match.start()].strip()
+                        return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{content_block}"[:4000]
                     else:
-                        return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{sec_tail.strip()}"[:4000]
+                        content_block = sec_tail.strip()
+                        return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{content_block}"[:4000]
                 else:
                     return f"Cache Miss: '{specific_section}' not found for {creature_name}."
 
@@ -1700,14 +2181,18 @@ def query_bestiary(creature_name: str, specific_section: str = "", *, config: An
 
     return _search_markdown_for_keywords(vault_path, "bestiary", f"{creature_name} {specific_section}".strip(), top_n=1)
 
+
 @tool
 def query_rulebook(topic: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Searches the local D&D rules directories for game mechanics, spells, and systems."""
     vault_path = config["configurable"].get("thread_id")
     return _search_markdown_for_keywords(vault_path, "rules", topic, top_n=2)
 
+
 @tool
-def query_campaign_module(search_terms: list[str], current_chapter_context: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+def query_campaign_module(
+    search_terms: list[str], current_chapter_context: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
     """Searches pre-written campaign modules, lore bibles, and published adventure notes.
     Pass a list of unique nouns and aliases (e.g. ["Strahd", "Zarovich", "Devil"]) to ensure broad coverage."""
     vault_path = config["configurable"].get("thread_id")
@@ -1715,15 +2200,33 @@ def query_campaign_module(search_terms: list[str], current_chapter_context: str 
     return _search_markdown_for_keywords(vault_path, "modules", query, top_n=3)
 
 
-
 @tool
-async def use_ability_or_spell(caster_name: str, ability_name: str, target_names: list[str] = None, target_x: float = None, target_y: float = None, target_z: float = None, aoe_shape: str = None, aoe_size: float = None, is_reaction: bool = False, is_legendary_action: bool = False, manual_attack_roll: int = None, is_critical: bool = False, manual_saves: dict = None, force_auto_roll: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def use_ability_or_spell(
+    caster_name: str,
+    ability_name: str,
+    target_names: list[str] = None,
+    target_x: float = None,
+    target_y: float = None,
+    target_z: float = None,
+    aoe_shape: str = None,
+    aoe_size: float = None,
+    is_reaction: bool = False,
+    is_legendary_action: bool = False,
+    manual_attack_roll: int = None,
+    is_critical: bool = False,
+    manual_saves: dict = None,
+    force_auto_roll: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """Use this tool whenever a character casts a spell or uses a class feature.
-    If the spell is an Area of Effect (AoE) and coordinates are provided, pass target_x, target_y, aoe_shape, and aoe_size. 
-    The engine will override 'target_names' and compute the true targets and structural damage using line-of-effect raycasting."""
+    If the spell is an Area of Effect (AoE) and coordinates are provided, pass target_x, target_y, aoe_shape, and aoe_size.
+    The engine will override 'target_names' and compute the true targets and structural damage using line-of-effect raycasting.
+    """
     vault_path = config["configurable"].get("thread_id")
     caster = await _get_entity_by_name(caster_name, vault_path)
-    if not caster: return f"SYSTEM ERROR: Caster '{caster_name}' not found."
+    if not caster:
+        return f"SYSTEM ERROR: Caster '{caster_name}' not found."
 
     spell_def = await SpellCompendium.load_spell(vault_path, ability_name)
     if spell_def:
@@ -1756,14 +2259,14 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
             requires_attack_roll = getattr(entry.mechanics, "requires_attack_roll", False)
             save_required = getattr(entry.mechanics, "save_required", "")
             ability_display_name = entry.name
-    
+
     target_uuids = []
     target_wall_ids = []
     target_terrain_ids = []
-    
+
     ignore_walls = "ignore_walls" in granted_tags
     penetrates = "penetrates_destructible" in granted_tags
-    
+
     ox, oy, oz, tx, ty, tz = None, None, None, None, None, None
     if aoe_shape and aoe_size and target_x is not None and target_y is not None:
         shape = aoe_shape.lower()
@@ -1771,29 +2274,47 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
         if shape in ["circle", "sphere", "cylinder", "cube"]:
             ox, oy, tx, ty = target_x, target_y, target_x, target_y
             oz = target_z if target_z is not None else 0.0
-        else: # cone, line originate from the caster
+        else:  # cone, line originate from the caster
             ox, oy, tx, ty = caster.x, caster.y, target_x, target_y
             oz = caster.z
-            if tz is None: tz = caster.z
-            
-        hits, walls, terrains = spatial_service.get_aoe_targets(shape, aoe_size, ox, oy, tx, ty, origin_z=oz, target_z=tz, ignore_walls=ignore_walls, penetrates_destructible=penetrates, vault_path=vault_path)
+            if tz is None:
+                tz = caster.z
+
+        hits, walls, terrains = spatial_service.get_aoe_targets(
+            shape,
+            aoe_size,
+            ox,
+            oy,
+            tx,
+            ty,
+            origin_z=oz,
+            target_z=tz,
+            ignore_walls=ignore_walls,
+            penetrates_destructible=penetrates,
+            vault_path=vault_path,
+        )
         target_uuids.extend(hits)
         target_wall_ids.extend(walls)
         target_terrain_ids.extend(terrains)
         target_string = f"{aoe_size}ft {shape} at coordinates ({target_x}, {target_y})"
     else:
-        for name in (target_names or []):
+        for name in target_names or []:
             ent = await _get_entity_by_name(name, vault_path)
-            if ent: target_uuids.append(ent.entity_uuid)
+            if ent:
+                target_uuids.append(ent.entity_uuid)
         target_string = ", ".join(target_names or []) or "themselves"
-    
+
     manual_saves = manual_saves or {}
     is_caster_pc = any(t in caster.tags for t in ["pc", "player"])
-    
+
     if requires_attack_roll and is_caster_pc and not force_auto_roll and manual_attack_roll is None:
         auto_settings = get_roll_automations(caster.name)
         if not auto_settings.get("attack_rolls", True):
-            return f"SYSTEM ALERT: {caster.name} has manual attack rolls enabled. Ask the player to roll the spell attack (including modifiers) and provide the total. Then call this tool again with `manual_attack_roll=X` (and `is_critical=True` if natural 20) or `force_auto_roll=True`."
+            return (
+                f"SYSTEM ALERT: {caster.name} has manual attack rolls enabled. Ask the player to roll the "
+                f"spell attack (including modifiers) and provide the total. Then call this tool again with "
+                f"`manual_attack_roll=X` (and `is_critical=True` if natural 20) or `force_auto_roll=True`."
+            )
 
     if save_required:
         missing_saves = []
@@ -1804,7 +2325,11 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
                 if not auto_settings.get("saving_throws", True) and ent.name not in manual_saves and not force_auto_roll:
                     missing_saves.append(ent.name)
         if missing_saves:
-            return f"SYSTEM ALERT: The following players have manual saving throws enabled: {', '.join(missing_saves)}. Ask them to roll their {save_required} saving throws (including modifiers) and provide the totals. Then call this tool again with `manual_saves={{'PlayerName': 15, ...}}` or `force_auto_roll=True`."
+            return (
+                f"SYSTEM ALERT: The following players have manual saving throws enabled: {', '.join(missing_saves)}. "
+                f"Ask them to roll their {save_required} saving throws (including modifiers) and provide the totals. "
+                f"Then call this tool again with `manual_saves={{'PlayerName': 15, ...}}` or `force_auto_roll=True`."
+            )
 
     current_init = await _get_current_combat_initiative(vault_path)
     event = GameEvent(
@@ -1828,17 +2353,19 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
             "origin_z": oz,
             "target_x": tx,
             "target_y": ty,
-            "target_z": tz
-        }
+            "target_z": tz,
+        },
     )
-    
+
     result = EventBus.dispatch(event)
-    
+
     results_list = result.payload.get("results", [])
     if results_list:
-        return f"MECHANICAL TRUTH: {caster.name} cast {ability_display_name} on {target_string}.\n" + "\n".join(results_list)
-    
+        res_msg = "\n".join(results_list)
+        return f"MECHANICAL TRUTH: {caster.name} cast {ability_display_name} on {target_string}.\n{res_msg}"
+
     return f"MECHANICAL TRUTH: {caster.name} used {ability_display_name} on {target_string}. Effect: {description}"
+
 
 @tool
 async def encode_new_compendium_entry(
@@ -1850,74 +2377,72 @@ async def encode_new_compendium_entry(
     damage_dice: str = Field("", description="e.g., '8d6'. Leave empty string if no damage."),
     damage_type: str = Field("", description="e.g., 'fire'."),
     save_required: str = Field("", description="e.g., 'dexterity'."),
-    granted_tags: list[str] = Field(default_factory=list, description="List of boolean tags granted by this feature (e.g. ['ignore_difficult_terrain', 'ignore_ranged_melee_disadvantage'])."),
-    requires_engine_update: bool = Field(False, description="Set to True if this feat introduces complex logic the engine does not natively support yet."),
-    *, config: Annotated[RunnableConfig, InjectedToolArg]
+    granted_tags: list[str] = Field(
+        default_factory=list,
+        description="List of boolean tags granted by this feature (e.g. ['ignore_difficult_terrain']).",
+    ),
+    requires_engine_update: bool = Field(
+        False, description="Set to True if this feat introduces logic the engine does not natively support yet."
+    ),
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
     """Teach the engine a new ability. Call ONLY when you receive a CACHE MISS."""
     vault_path = config["configurable"].get("thread_id")
-    
+
     if category.lower() == "spell":
         spell_mech = SpellMechanics(
             requires_attack_roll=action_type.lower() == "attack",
             save_required=save_required,
             damage_dice=damage_dice,
             damage_type=damage_type,
-            granted_tags=granted_tags
+            granted_tags=granted_tags,
         )
-        spell_def = SpellDefinition(
-            name=name,
-            casting_time=action_type,
-            description=description,
-            mechanics=spell_mech
-        )
+        spell_def = SpellDefinition(name=name, casting_time=action_type, description=description, mechanics=spell_mech)
         filepath = await SpellCompendium.save_spell(vault_path, spell_def)
     elif category.lower() in ["item", "weapon", "armor"]:
         if category.lower() == "weapon" or action_type.lower() == "attack":
             item_def = WeaponItem(
-                name=name,
-                description=description,
-                damage_dice=damage_dice,
-                damage_type=damage_type,
-                tags=granted_tags
+                name=name, description=description, damage_dice=damage_dice, damage_type=damage_type, tags=granted_tags
             )
         elif category.lower() == "armor":
-            item_def = ArmorItem(
-                name=name,
-                description=description,
-                tags=granted_tags
-            )
+            item_def = ArmorItem(name=name, description=description, tags=granted_tags)
         else:
-            mech = SpellMechanics(save_required=save_required, damage_dice=damage_dice, damage_type=damage_type, granted_tags=granted_tags) if (save_required or damage_dice) else None
-            item_def = WondrousItem(
-                name=name,
-                description=description,
-                tags=granted_tags,
-                active_mechanics=mech
+            mech = (
+                SpellMechanics(
+                    save_required=save_required, damage_dice=damage_dice, damage_type=damage_type, granted_tags=granted_tags
+                )
+                if (save_required or damage_dice)
+                else None
             )
+            item_def = WondrousItem(name=name, description=description, tags=granted_tags, active_mechanics=mech)
         filepath = await ItemCompendium.save_item(vault_path, item_def)
     else:
         mechanics = MechanicEffect(
-            damage_dice=damage_dice,
-            damage_type=damage_type,
-            save_required=save_required,
-            granted_tags=granted_tags
+            damage_dice=damage_dice, damage_type=damage_type, save_required=save_required, granted_tags=granted_tags
         )
-        
+
         entry = CompendiumEntry(
             name=name,
             category=category,
             action_type=action_type,
             description=description,
             references=[source_reference],
-            mechanics=mechanics
+            mechanics=mechanics,
         )
         filepath = await CompendiumManager.save_entry(vault_path, entry)
-    
+
     warning = ""
     if requires_engine_update:
-        warning = "\n[SYSTEM ALERT]: This feat introduces novel logic. The human DM must manually update `dnd_rules_engine.py` to evaluate these new tags!"
-    return f"SUCCESS: '{name}' encoded to {filepath}. The engine now understands this ability.{warning} Proceed with your action."
+        warning = (
+            "\n[SYSTEM ALERT]: This feat introduces novel logic. "
+            "The human DM must manually update `dnd_rules_engine.py` to evaluate these new tags!"
+        )
+    return (
+        f"SUCCESS: '{name}' encoded to {filepath}. The engine now understands this ability."
+        f"{warning} Proceed with your action."
+    )
+
 
 @tool
 async def take_rest(character_names: list[str], rest_type: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
@@ -1927,22 +2452,27 @@ async def take_rest(character_names: list[str], rest_type: str, *, config: Annot
     """
     hours_to_advance = 8 if rest_type.lower() == "long" else 1
     await advance_time.ainvoke({"hours": hours_to_advance}, config)
-    
+
     uuids = []
     for name in character_names:
         entity = await _get_entity_by_name(name, config["configurable"].get("thread_id"))
-        if entity: uuids.append(entity.entity_uuid)
-        
+        if entity:
+            uuids.append(entity.entity_uuid)
+
     if uuids:
         event = GameEvent(
             event_type="Rest",
-            source_uuid=uuids[0], 
+            source_uuid=uuids[0],
             vault_path=config["configurable"].get("thread_id"),
-            payload={"rest_type": rest_type.lower(), "target_uuids": uuids}
+            payload={"rest_type": rest_type.lower(), "target_uuids": uuids},
         )
         EventBus.dispatch(event)
-        
-    return f"MECHANICAL TRUTH: {', '.join(character_names)} completed a {rest_type} rest. Time advanced {hours_to_advance} hours. HP and resources processed."
+
+    return (
+        f"MECHANICAL TRUTH: {', '.join(character_names)} completed a {rest_type} rest. "
+        f"Time advanced {hours_to_advance} hours. HP and resources processed."
+    )
+
 
 @tool
 async def drop_concentration(character_name: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
@@ -1951,59 +2481,64 @@ async def drop_concentration(character_name: str, *, config: Annotated[RunnableC
     entity = await _get_entity_by_name(character_name, vault_path)
     if not entity or not isinstance(entity, Creature):
         return f"SYSTEM ERROR: '{character_name}' not found."
-        
+
     if not entity.concentrating_on:
         return f"MECHANICAL TRUTH: {entity.name} is not currently concentrating on any spell."
-        
+
     spell_name = entity.concentrating_on
-    
-    event = GameEvent(
-        event_type="DropConcentration",
-        source_uuid=entity.entity_uuid,
-        vault_path=vault_path
-    )
+
+    event = GameEvent(event_type="DropConcentration", source_uuid=entity.entity_uuid, vault_path=vault_path)
     EventBus.dispatch(event)
-    
-    return f"MECHANICAL TRUTH: {entity.name} dropped concentration on {spell_name}. All associated effects have been cleared."
+
+    return (
+        f"MECHANICAL TRUTH: {entity.name} dropped concentration on {spell_name}. " f"All associated effects have been cleared."
+    )
+
 
 @tool
-async def ready_action(character_name: str, action_description: str, trigger_condition: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def ready_action(
+    character_name: str, action_description: str, trigger_condition: str, *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
     """Saves a readied action to the ACTIVE_COMBAT.md whiteboard. The AI Planner will monitor this trigger."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
-    
+
     try:
         async with edit_markdown_entity(file_path) as state:
             yaml_data = state["yaml_data"]
             readied = yaml_data.get("readied_actions", [])
-            if not isinstance(readied, list): readied = []
-            
+            if not isinstance(readied, list):
+                readied = []
+
             readied = [ra for ra in readied if ra.get("character") != character_name]
             readied.append({"character": character_name, "action": action_description, "trigger": trigger_condition})
             yaml_data["readied_actions"] = readied
     except Exception as e:
         return str(e)
-        
+
     return f"MECHANICAL TRUTH: {character_name} readied an action. Trigger: '{trigger_condition}'."
+
 
 @tool
 async def clear_readied_action(character_name: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Removes a readied action from the whiteboard after it is triggered or cancelled."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
-    
+
     try:
         async with edit_markdown_entity(file_path) as state:
             yaml_data = state["yaml_data"]
             readied = yaml_data.get("readied_actions", [])
-            if not isinstance(readied, list): readied = []
-            
+            if not isinstance(readied, list):
+                readied = []
+
             readied = [ra for ra in readied if ra.get("character") != character_name]
             yaml_data["readied_actions"] = readied
     except Exception as e:
         return str(e)
-            
+
     return f"Success: Cleared readied action for {character_name}."
+
 
 @tool
 async def use_dash_action(entity_name: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
@@ -2012,12 +2547,26 @@ async def use_dash_action(entity_name: str, *, config: Annotated[RunnableConfig,
     entity = await _get_entity_by_name(entity_name, vault_path)
     if not entity or not isinstance(entity, Creature):
         return f"SYSTEM ERROR: Entity '{entity_name}' not found."
-        
+
     entity.movement_remaining += entity.speed
-    return f"MECHANICAL TRUTH: {entity.name} took the Dash action. Their remaining movement is now {entity.movement_remaining}ft."
+    return (
+        f"MECHANICAL TRUTH: {entity.name} took the Dash action. Their remaining movement is now {entity.movement_remaining}ft."
+    )
+
 
 @tool
-async def manage_light_sources(action: str, label: str, x: float = 0.0, y: float = 0.0, z: float = 5.0, bright_radius: float = 20.0, dim_radius: float = 40.0, attached_to_entity: str = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def manage_light_sources(
+    action: str,
+    label: str,
+    x: float = 0.0,
+    y: float = 0.0,
+    z: float = 5.0,
+    bright_radius: float = 20.0,
+    dim_radius: float = 40.0,
+    attached_to_entity: str = None,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """Dynamically adds or removes light sources (e.g. torches, spells) from the spatial environment."""
     if action.lower() == "add":
         ent_uuid = None
@@ -2031,21 +2580,35 @@ async def manage_light_sources(action: str, label: str, x: float = 0.0, y: float
                 ent_msg = f" attached to {entity.name}"
             else:
                 return f"SYSTEM ERROR: Entity '{attached_to_entity}' not found."
-                
-        new_light = LightSource(label=label, x=x, y=y, z=z, bright_radius=bright_radius, dim_radius=dim_radius, attached_to_entity_uuid=ent_uuid)
+
+        new_light = LightSource(
+            label=label, x=x, y=y, z=z, bright_radius=bright_radius, dim_radius=dim_radius, attached_to_entity_uuid=ent_uuid
+        )
         vp = config["configurable"].get("thread_id", "default")
         spatial_service.get_map_data(vp).lights.append(new_light)
         return f"MECHANICAL TRUTH: Added light source '{label}' at ({x}, {y}, {z}){ent_msg} with Bright/Dim radii ({bright_radius}/{dim_radius})."
     elif action.lower() == "remove":
         vp = config["configurable"].get("thread_id", "default")
         initial_count = len(spatial_service.get_map_data(vp).lights)
-        spatial_service.get_map_data(vp).lights = [l for l in spatial_service.get_map_data(vp).lights if l.label.lower() != label.lower()]
-        if len(spatial_service.get_map_data(vp).lights) < initial_count: return f"MECHANICAL TRUTH: Removed light source '{label}'."
+        spatial_service.get_map_data(vp).lights = [
+            light for light in spatial_service.get_map_data(vp).lights if light.label.lower() != label.lower()
+        ]
+        if len(spatial_service.get_map_data(vp).lights) < initial_count:
+            return f"MECHANICAL TRUTH: Removed light source '{label}'."
         return f"SYSTEM ERROR: Light source '{label}' not found."
     return "SYSTEM ERROR: Invalid action. Use 'add' or 'remove'."
 
+
 @tool
-async def interact_with_object(character_name: str, target_label: str, interaction_type: str, stat_used: str = "dexterity", extra_modifier: int = 0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def interact_with_object(
+    character_name: str,
+    target_label: str,
+    interaction_type: str,
+    stat_used: str = "dexterity",
+    extra_modifier: int = 0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     Resolves a character trying to pick a lock, force open a door, or disarm a trap on the spatial map.
     - interaction_type: 'lockpick' (uses Dex), 'force' (uses Str), 'disarm' (uses Dex or Int).
@@ -2053,72 +2616,103 @@ async def interact_with_object(character_name: str, target_label: str, interacti
     """
     vault_path = config["configurable"].get("thread_id")
     character = await _get_entity_by_name(character_name, vault_path)
-    if not character: return f"SYSTEM ERROR: Character '{character_name}' not found."
-    
-    target_walls = [w for w in spatial_service.get_map_data(vault_path).active_walls if target_label.lower() in w.label.lower()]
+    if not character:
+        return f"SYSTEM ERROR: Character '{character_name}' not found."
+
+    target_walls = [
+        w for w in spatial_service.get_map_data(vault_path).active_walls if target_label.lower() in w.label.lower()
+    ]
     if not target_walls:
         return f"SYSTEM ERROR: No object found matching '{target_label}'. Check the map."
-        
+
     target = target_walls[0]
-    
+
     if not target.is_locked and interaction_type in ["lockpick", "force"]:
         spatial_service.modify_wall(target.wall_id, is_solid=False, is_visible=True, vault_path=vault_path)
         return f"MECHANICAL TRUTH: {target.label} was not locked. {character.name} simply opened it."
-        
+
     if target.interact_dc is None:
-        return f"MECHANICAL TRUTH: {target.label} cannot be interacted with in that way (No DC assigned). It might require a specific key or magical mechanism."
+        return (
+            f"MECHANICAL TRUTH: {target.label} cannot be interacted with in that way (No DC assigned). "
+            f"It might require a specific key or magical mechanism."
+        )
 
     # Calculate modifier
     stat_mod = getattr(character, f"{stat_used.lower()}_mod").total if hasattr(character, f"{stat_used.lower()}_mod") else 0
-    
+
     # Give standard proficiency bonus if using lockpicks or forcing
     prof_bonus = math.ceil(character.character_level / 4) + 1 if character.character_level > 0 else 2
     total_mod = stat_mod + prof_bonus + extra_modifier
-    
+
     roll = random.randint(1, 20)
     total = roll + total_mod
-    
-    log = f"{character.name} attempts to {interaction_type} the {target.label}. Rolled {roll} + {total_mod} = {total} vs DC {target.interact_dc}. "
-    
+
+    log = (
+        f"{character.name} attempts to {interaction_type} the {target.label}. "
+        f"Rolled {roll} + {total_mod} = {total} vs DC {target.interact_dc}. "
+    )
+
     if total >= target.interact_dc:
         if interaction_type in ["lockpick", "force"]:
-            spatial_service.modify_wall(target.wall_id, is_locked=False, is_solid=False, is_visible=True, vault_path=vault_path)
-            if target.trap: target.trap.is_active = False # Bypassed successfully
+            spatial_service.modify_wall(
+                target.wall_id, is_locked=False, is_solid=False, is_visible=True, vault_path=vault_path
+            )
+            if target.trap:
+                target.trap.is_active = False  # Bypassed successfully
             return f"MECHANICAL TRUTH: SUCCESS! {log} The {target.label} is now unlocked and opened."
         else:
-            if target.trap: target.trap.is_active = False
+            if target.trap:
+                target.trap.is_active = False
             return f"MECHANICAL TRUTH: SUCCESS! {log} The {target.label} is safely disarmed/resolved."
     else:
         msg = f"MECHANICAL TRUTH: FAILURE! {log} The attempt failed."
         if target.trap and target.trap.is_active and target.trap.trigger_on_interact_fail:
             target.trap.is_active = False
             trap = target.trap
-            trap_msg = await trigger_environmental_hazard.ainvoke({
-                "hazard_name": trap.hazard_name,
-                "target_names": [character.name],
-                "origin_x": target.start[0], "origin_y": target.start[1], 
-                "radius": trap.radius if trap.radius > 0 else None,
-                "requires_attack_roll": trap.requires_attack_roll, "attack_bonus": trap.attack_bonus,
-                "save_required": trap.save_required, "save_dc": trap.save_dc,
-                "damage_dice": trap.damage_dice, "damage_type": trap.damage_type,
-                "half_damage_on_save": trap.half_damage_on_save,
-                "condition_applied": trap.condition_applied
-            }, config=config)
+            trap_msg = await trigger_environmental_hazard.ainvoke(
+                {
+                    "hazard_name": trap.hazard_name,
+                    "target_names": [character.name],
+                    "origin_x": target.start[0],
+                    "origin_y": target.start[1],
+                    "radius": trap.radius if trap.radius > 0 else None,
+                    "requires_attack_roll": trap.requires_attack_roll,
+                    "attack_bonus": trap.attack_bonus,
+                    "save_required": trap.save_required,
+                    "save_dc": trap.save_dc,
+                    "damage_dice": trap.damage_dice,
+                    "damage_type": trap.damage_type,
+                    "half_damage_on_save": trap.half_damage_on_save,
+                    "condition_applied": trap.condition_applied,
+                },
+                config=config,
+            )
             msg += f"\nSYSTEM ALERT: TRAP TRIGGERED!\n{trap_msg}"
-            
+
         return msg
+
 
 @tool
 async def trigger_environmental_hazard(
-    hazard_name: str, 
+    hazard_name: str,
     target_names: list[str] = None,
-    origin_x: Optional[float] = None, origin_y: Optional[float] = None, radius: Optional[float] = None,
-    requires_attack_roll: bool = False, attack_bonus: int = 5,
-    save_required: str = "", save_dc: int = 15,
-    damage_dice: str = "", damage_type: str = "", half_damage_on_save: bool = True,
+    origin_x: Optional[float] = None,
+    origin_y: Optional[float] = None,
+    radius: Optional[float] = None,
+    requires_attack_roll: bool = False,
+    attack_bonus: int = 5,
+    save_required: str = "",
+    save_dc: int = 15,
+    damage_dice: str = "",
+    damage_type: str = "",
+    half_damage_on_save: bool = True,
     condition_applied: str = "",
-    manual_attack_roll: int = None, is_critical: bool = False, manual_saves: dict = None, force_auto_roll: bool = False,
-    *, config: Annotated[RunnableConfig, InjectedToolArg]
+    manual_attack_roll: int = None,
+    is_critical: bool = False,
+    manual_saves: dict = None,
+    force_auto_roll: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
     """
     Triggers a trap or environmental hazard (e.g. Fireball trap, Poison Darts, Cave-in).
@@ -2127,20 +2721,22 @@ async def trigger_environmental_hazard(
     """
     vault_path = config["configurable"].get("thread_id", "default")
     manual_saves = manual_saves or {}
-    if target_names is None: target_names = []
-    
+    if target_names is None:
+        target_names = []
+
     target_uuids = set()
     for name in target_names:
         ent = await _get_entity_by_name(name, vault_path)
-        if ent: target_uuids.add(ent.entity_uuid)
-        
+        if ent:
+            target_uuids.add(ent.entity_uuid)
+
     if origin_x is not None and origin_y is not None and radius is not None:
         spatial_hits = spatial_service.get_targets_in_radius(origin_x, origin_y, radius, vault_path)
         target_uuids.update(spatial_hits)
-        
+
     if not target_uuids:
         return f"MECHANICAL TRUTH: {hazard_name} triggered, but no valid targets were in range."
-        
+
     if save_required:
         missing_saves = []
         for t_uuid in target_uuids:
@@ -2161,9 +2757,9 @@ async def trigger_environmental_hazard(
         hp=ModifiableValue(base_value=1),
         ac=ModifiableValue(base_value=10),
         strength_mod=ModifiableValue(base_value=0),
-        dexterity_mod=ModifiableValue(base_value=0)
+        dexterity_mod=ModifiableValue(base_value=0),
     )
-    
+
     cond_list = [{"condition": condition_applied, "duration": "1 minute"}] if condition_applied else []
     mechanics = {
         "requires_attack_roll": requires_attack_roll,
@@ -2171,11 +2767,11 @@ async def trigger_environmental_hazard(
         "damage_dice": damage_dice,
         "damage_type": damage_type.lower(),
         "half_damage_on_save": half_damage_on_save,
-        "conditions_applied": cond_list
+        "conditions_applied": cond_list,
     }
-    
+
     current_init = await _get_current_combat_initiative(config["configurable"].get("thread_id"))
-    
+
     event = GameEvent(
         event_type="SpellCast",
         source_uuid=trap_source.entity_uuid,
@@ -2187,21 +2783,40 @@ async def trigger_environmental_hazard(
             "current_initiative": current_init,
             "manual_attack_roll": manual_attack_roll,
             "is_critical": is_critical,
-            "manual_saves": manual_saves
-        }
+            "manual_saves": manual_saves,
+        },
     )
-    
+
     result = EventBus.dispatch(event)
     BaseGameEntity.remove(trap_source.entity_uuid)
-    
+
     results_list = result.payload.get("results", [])
     if results_list:
         return f"MECHANICAL TRUTH: {hazard_name} triggered!\n" + "\n".join(results_list)
-        
+
     return f"MECHANICAL TRUTH: {hazard_name} triggered but had no effect."
 
+
 @tool
-async def manage_map_geometry(action: str, label: str = "", start_x: float = 0.0, start_y: float = 0.0, end_x: float = 0.0, end_y: float = 0.0, z: float = 0.0, height: float = 10.0, is_solid: bool = True, is_visible: bool = True, is_locked: bool = False, interact_dc: int = 15, is_temporary: bool = True, hp: int = None, ac: int = 10, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def manage_map_geometry(
+    action: str,
+    label: str = "",
+    start_x: float = 0.0,
+    start_y: float = 0.0,
+    end_x: float = 0.0,
+    end_y: float = 0.0,
+    z: float = 0.0,
+    height: float = 10.0,
+    is_solid: bool = True,
+    is_visible: bool = True,
+    is_locked: bool = False,
+    interact_dc: int = 15,
+    is_temporary: bool = True,
+    hp: int = None,
+    ac: int = 10,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     Dynamically alters the spatial map's physical geometry (e.g., opening a door, breaking a wall, casting Wall of Stone).
     - hp / ac: Assign Hit Points and Armor Class if the wall/door is destructible (e.g. standard wooden door = hp 18, ac 15).
@@ -2215,34 +2830,67 @@ async def manage_map_geometry(action: str, label: str = "", start_x: float = 0.0
     """
     if action.lower() == "add_wall":
         vp = config["configurable"].get("thread_id", "default")
-        new_wall = Wall(label=label, start=(start_x, start_y), end=(end_x, end_y), z=z, height=height, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked, interact_dc=interact_dc, hp=hp, max_hp=hp, ac=ac)
+        new_wall = Wall(
+            label=label,
+            start=(start_x, start_y),
+            end=(end_x, end_y),
+            z=z,
+            height=height,
+            is_solid=is_solid,
+            is_visible=is_visible,
+            is_locked=is_locked,
+            interact_dc=interact_dc,
+            hp=hp,
+            max_hp=hp,
+            ac=ac,
+        )
         spatial_service.add_wall(new_wall, is_temporary=is_temporary, vault_path=vp)
-        return f"MECHANICAL TRUTH: Added new wall '{label}' from ({start_x}, {start_y}) to ({end_x}, {end_y}). Solid: {is_solid}, Visible: {is_visible}."
-        
+        return (
+            f"MECHANICAL TRUTH: Added new wall '{label}' from ({start_x}, {start_y}) "
+            f"to ({end_x}, {end_y}). Solid: {is_solid}, Visible: {is_visible}."
+        )
+
     elif action.lower() in ["remove_wall", "modify_wall"]:
         vp = config["configurable"].get("thread_id", "default")
         target_walls = [w for w in spatial_service.get_map_data(vp).active_walls if label.lower() in w.label.lower()]
         if not target_walls:
-            return f"SYSTEM ERROR: No wall found matching label '{label}'. Please check the map or provide a broader label."
-            
+            return (
+                f"SYSTEM ERROR: No wall found matching label '{label}'. " f"Please check the map or provide a broader label."
+            )
+
         target = target_walls[0]
         if action.lower() == "remove_wall":
             spatial_service.remove_wall(target.wall_id, vp)
             return f"MECHANICAL TRUTH: Removed wall/obstacle '{target.label}'."
         else:
-            spatial_service.modify_wall(target.wall_id, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked, vault_path=vp)
-            return f"MECHANICAL TRUTH: Modified wall/obstacle '{target.label}'. Solid: {is_solid}, Visible: {is_visible}."
-            
+            spatial_service.modify_wall(
+                target.wall_id, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked, vault_path=vp
+            )
+            return f"MECHANICAL TRUTH: Modified wall/obstacle '{target.label}'. " f"Solid: {is_solid}, Visible: {is_visible}."
+
     return "SYSTEM ERROR: Invalid action. Use 'add_wall', 'remove_wall', or 'modify_wall'."
 
+
 @tool
-async def manage_map_terrain(action: str, label: str = "", center_x: float = 0.0, center_y: float = 0.0, radius: float = 5.0, is_difficult: bool = True, tags: list[str] = None, is_temporary: bool = True, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def manage_map_terrain(
+    action: str,
+    label: str = "",
+    center_x: float = 0.0,
+    center_y: float = 0.0,
+    radius: float = 5.0,
+    is_difficult: bool = True,
+    tags: list[str] = None,
+    is_temporary: bool = True,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     Dynamically adds or removes terrain zones (e.g., Grease, Ice, Webs, Water).
     - action: 'add' or 'remove'.
     - tags: Pass elemental descriptors like 'wet', 'frozen', or 'flammable'.
     """
     from spatial_engine import TerrainZone
+
     vp = config["configurable"].get("thread_id", "default")
     if action.lower() == "add":
         tags = tags or []
@@ -2250,26 +2898,46 @@ async def manage_map_terrain(action: str, label: str = "", center_x: float = 0.0
         for i in range(6):
             angle = 2 * math.pi * i / 6
             points.append((center_x + radius * math.cos(angle), center_y + radius * math.sin(angle)))
-            
+
         tz = TerrainZone(label=label, points=points, is_difficult=is_difficult, tags=tags)
         spatial_service.add_terrain(tz, is_temporary=is_temporary, vault_path=vp)
-        return f"MECHANICAL TRUTH: Added terrain '{label}' at ({center_x}, {center_y}) with radius {radius}ft. Tags: {tags}."
+        return (
+            f"MECHANICAL TRUTH: Added terrain '{label}' at ({center_x}, {center_y}) " f"with radius {radius}ft. Tags: {tags}."
+        )
     elif action.lower() == "remove":
         target_zones = [t for t in spatial_service.get_map_data(vp).active_terrain if label.lower() in t.label.lower()]
-        if not target_zones: return f"SYSTEM ERROR: Terrain '{label}' not found."
+        if not target_zones:
+            return f"SYSTEM ERROR: Terrain '{label}' not found."
         spatial_service.remove_terrain(target_zones[0].zone_id, vp)
         return f"MECHANICAL TRUTH: Removed terrain '{target_zones[0].label}'."
     return "SYSTEM ERROR: Invalid action."
 
+
 @tool
-async def manage_map_trap(target_label: str, hazard_name: str, trigger_on_interact_fail: bool = False, trigger_on_move: bool = False, requires_attack_roll: bool = False, attack_bonus: int = 5, save_required: str = "", save_dc: int = 15, damage_dice: str = "", damage_type: str = "", condition_applied: str = "", radius: float = 0.0, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def manage_map_trap(
+    target_label: str,
+    hazard_name: str,
+    trigger_on_interact_fail: bool = False,
+    trigger_on_move: bool = False,
+    requires_attack_roll: bool = False,
+    attack_bonus: int = 5,
+    save_required: str = "",
+    save_dc: int = 15,
+    damage_dice: str = "",
+    damage_type: str = "",
+    condition_applied: str = "",
+    radius: float = 0.0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     Attaches a trap or alarm to an existing wall, door, or terrain zone on the spatial map.
     The trap will automatically trigger if someone fails to pick the lock/force it, or if someone moves through it.
     """
     from spatial_engine import TrapDefinition
+
     vp = config["configurable"].get("thread_id", "default")
-    
+
     target = None
     for w in spatial_service.get_map_data(vp).active_walls:
         if target_label.lower() in w.label.lower():
@@ -2280,20 +2948,25 @@ async def manage_map_trap(target_label: str, hazard_name: str, trigger_on_intera
             if target_label.lower() in t.label.lower():
                 target = t
                 break
-                
+
     if not target:
         return f"SYSTEM ERROR: No wall, door, or terrain found matching '{target_label}'."
-        
+
     target.trap = TrapDefinition(
-        hazard_name=hazard_name, requires_attack_roll=requires_attack_roll, attack_bonus=attack_bonus,
-        save_required=save_required.lower(), save_dc=save_dc,
-        damage_dice=damage_dice, damage_type=damage_type.lower(),
+        hazard_name=hazard_name,
+        requires_attack_roll=requires_attack_roll,
+        attack_bonus=attack_bonus,
+        save_required=save_required.lower(),
+        save_dc=save_dc,
+        damage_dice=damage_dice,
+        damage_type=damage_type.lower(),
         condition_applied=condition_applied,
         trigger_on_interact_fail=trigger_on_interact_fail,
         trigger_on_move=trigger_on_move,
-        radius=radius
+        radius=radius,
     )
     return f"MECHANICAL TRUTH: Successfully trapped '{target.label}' with '{hazard_name}'."
+
 
 @tool
 async def discover_trap(target_label: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
@@ -2309,19 +2982,27 @@ async def discover_trap(target_label: str, *, config: Annotated[RunnableConfig, 
             if target_label.lower() in t.label.lower():
                 target = t
                 break
-                
+
     if not target or not target.trap:
         return f"SYSTEM ERROR: No trap found on object '{target_label}'."
-        
+
     target.trap.known_by_players = True
     return f"MECHANICAL TRUTH: The trap on '{target.label}' is now known to the players."
 
+
 @tool
-async def toggle_condition(character_name: str, condition_name: str, is_active: bool, source_character_name: str = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def toggle_condition(
+    character_name: str,
+    condition_name: str,
+    is_active: bool,
+    source_character_name: str = None,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """Applies or removes a condition (e.g. 'Hidden', 'Prone', 'Poisoned') from an entity's sheet."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
-    
+
     source_ent = await _get_entity_by_name(source_character_name, vault_path) if source_character_name else None
     source_uuid = source_ent.entity_uuid if source_ent else None
     source_name = source_ent.name if source_ent else "Manual"
@@ -2331,15 +3012,19 @@ async def toggle_condition(character_name: str, condition_name: str, is_active: 
     if engine_creature and isinstance(engine_creature, Creature):
         if is_active:
             if not any(c.name.lower() == condition_name.lower() for c in engine_creature.active_conditions):
-                engine_creature.active_conditions.append(ActiveCondition(name=condition_name.capitalize(), source_name=source_name, source_uuid=source_uuid))
-                
+                engine_creature.active_conditions.append(
+                    ActiveCondition(name=condition_name.capitalize(), source_name=source_name, source_uuid=source_uuid)
+                )
+
             # Instant mechanical enforcement for 0-speed conditions
             zero_speed = {"grappled", "restrained", "stunned", "paralyzed", "petrified", "unconscious"}
             if condition_name.lower() in zero_speed:
                 engine_creature.movement_remaining = 0
         else:
-            engine_creature.active_conditions = [c for c in engine_creature.active_conditions if c.name.lower() != condition_name.lower()]
-    
+            engine_creature.active_conditions = [
+                c for c in engine_creature.active_conditions if c.name.lower() != condition_name.lower()
+            ]
+
     # Update YAML
     try:
         async with edit_markdown_entity(file_path) as state:
@@ -2348,38 +3033,68 @@ async def toggle_condition(character_name: str, condition_name: str, is_active: 
             if isinstance(conds, list):
                 if is_active:
                     if not any(isinstance(c, dict) and c.get("name", "").lower() == condition_name.lower() for c in conds):
-                        new_cond = {"name": condition_name.capitalize(), "duration_seconds": -1, "source_name": source_name, "applied_initiative": 0}
-                        if source_uuid: new_cond["source_uuid"] = str(source_uuid)
+                        new_cond = {
+                            "name": condition_name.capitalize(),
+                            "duration_seconds": -1,
+                            "source_name": source_name,
+                            "applied_initiative": 0,
+                        }
+                        if source_uuid:
+                            new_cond["source_uuid"] = str(source_uuid)
                         conds.append(new_cond)
                 else:
-                    conds = [c for c in conds if not (isinstance(c, dict) and c.get("name", "").lower() == condition_name.lower())]
-            
+                    conds = [
+                        c for c in conds if not (isinstance(c, dict) and c.get("name", "").lower() == condition_name.lower())
+                    ]
+
             yaml_data["active_conditions"] = conds
             if engine_creature:
                 yaml_data["movement_remaining"] = engine_creature.movement_remaining
     except Exception as e:
         return str(e)
-        
+
     state = "applied to" if is_active else "removed from"
     result_msg = f"MECHANICAL TRUTH: Condition '{condition_name}' was {state} {character_name}."
-    
+
     # Add Contextual DM Alerts based on D&D 5e Rules
     if is_active:
         cond_lower = condition_name.lower()
         zero_speed = {"grappled", "restrained", "stunned", "paralyzed", "petrified", "unconscious"}
         if cond_lower in zero_speed:
-            result_msg += f"\nSYSTEM ALERT: '{condition_name.capitalize()}' reduces speed to 0. They cannot move until freed."
+            result_msg += (
+                f"\nSYSTEM ALERT: '{condition_name.capitalize()}' reduces speed to 0. " f"They cannot move until freed."
+            )
         elif cond_lower == "prone":
-            result_msg += "\nSYSTEM ALERT: 'Prone' means standing up costs half their movement speed. Melee attacks against them have Advantage."
+            result_msg += (
+                "\nSYSTEM ALERT: 'Prone' means standing up costs half their movement speed. "
+                "Melee attacks against them have Advantage."
+            )
         elif cond_lower == "frightened":
-            result_msg += "\nSYSTEM ALERT: 'Frightened' means they have Disadvantage on attacks/checks while the source is visible, and CANNOT willingly move closer to it."
+            result_msg += (
+                "\nSYSTEM ALERT: 'Frightened' means they have Disadvantage on attacks/checks "
+                "while the source is visible, and CANNOT willingly move closer to it."
+            )
         elif cond_lower in ["dazed", "confused"]:
-            result_msg += f"\nSYSTEM ALERT: '{condition_name.capitalize()}' restricts actions and movement. Review the specific ability rules."
-            
+            result_msg += (
+                f"\nSYSTEM ALERT: '{condition_name.capitalize()}' restricts actions and movement. "
+                f"Review the specific ability rules."
+            )
+
     return result_msg
 
+
 @tool
-async def manage_skill_challenge(action: str, name: str = "", max_successes: int = 3, max_failures: int = 3, successes_delta: int = 0, failures_delta: int = 0, note: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def manage_skill_challenge(
+    action: str,
+    name: str = "",
+    max_successes: int = 3,
+    max_failures: int = 3,
+    successes_delta: int = 0,
+    failures_delta: int = 0,
+    note: str = "",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     Manages a Skill Challenge or Progress Clock for complex non-combat encounters (chases, negotiations, puzzles).
     - action: 'start', 'update', or 'end'.
@@ -2396,56 +3111,96 @@ async def manage_skill_challenge(action: str, name: str = "", max_successes: int
         yaml_data = {
             "tags": ["challenge_whiteboard"],
             "challenge_name": name,
-            "successes": 0, "max_successes": max_successes,
-            "failures": 0, "max_failures": max_failures,
-            "history": [note] if note else []
+            "successes": 0,
+            "max_successes": max_successes,
+            "failures": 0,
+            "max_failures": max_failures,
+            "history": [note] if note else [],
         }
         dataview_js = (
             "```dataviewjs\nconst p = dv.current(); if (!p) return;\n"
             "dv.header(2, `⏱️ Skill Challenge: ${p.challenge_name}`);\n"
             "dv.paragraph(`**Successes:** ${p.successes} / ${p.max_successes} 🟩`);\n"
             "dv.paragraph(`**Failures:** ${p.failures} / ${p.max_failures} 🟥`);\n"
-            "if (p.history && p.history.length > 0) {\n    dv.header(3, \"📜 History\");\n    dv.list(p.history);\n}\n```\n"
+            'if (p.history && p.history.length > 0) {\n    dv.header(3, "📜 History");\n    dv.list(p.history);\n}\n```\n'
         )
         yaml_str = yaml.dump(yaml_data, sort_keys=False, default_flow_style=False)
-        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+        async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
             await f.write(f"---\n{yaml_str}---\n\n{dataview_js}")
-        return f"MECHANICAL TRUTH: Skill Challenge '{name}' started. Target: {max_successes} Successes before {max_failures} Failures."
+        return (
+            f"MECHANICAL TRUTH: Skill Challenge '{name}' started. "
+            f"Target: {max_successes} Successes before {max_failures} Failures."
+        )
 
     elif action.lower() == "update":
-        if not os.path.exists(file_path): return "SYSTEM ERROR: No active skill challenge found. Use action='start' first."
+        if not os.path.exists(file_path):
+            return "SYSTEM ERROR: No active skill challenge found. Use action='start' first."
         try:
             async with edit_markdown_entity(file_path) as state:
                 yaml_data = state["yaml_data"]
                 yaml_data["successes"] += successes_delta
                 yaml_data["failures"] += failures_delta
-                if note: yaml_data.setdefault("history", []).append(note)
+                if note:
+                    yaml_data.setdefault("history", []).append(note)
                 s, ms = yaml_data["successes"], yaml_data["max_successes"]
                 f, mf = yaml_data["failures"], yaml_data["max_failures"]
-                
-                outcome = "VICTORY" if s >= ms else ("DEFEAT" if f >= mf else "")
-        except Exception as e: return str(e)
-        
+
+            outcome = "VICTORY" if s >= ms else ("DEFEAT" if f >= mf else "")
+        except Exception as e:
+            return str(e)
+
         if outcome:
-            return f"MECHANICAL TRUTH: Challenge updated. [{s}/{ms} Successes] | [{f}/{mf} Failures]. SYSTEM ALERT: The challenge has reached a {outcome} condition! Use manage_skill_challenge(action='end') to close it out and resolve the narrative consequences."
+            return (
+                f"MECHANICAL TRUTH: Challenge updated. [{s}/{ms} Successes] | [{f}/{mf} Failures]. "
+                f"SYSTEM ALERT: The challenge has reached a {outcome} condition! Use "
+                f"manage_skill_challenge(action='end') to close it out and resolve the narrative consequences."
+            )
         return f"MECHANICAL TRUTH: Challenge updated. [{s}/{ms} Successes] | [{f}/{mf} Failures]. Log: {note}"
 
     elif action.lower() == "end":
-        if not os.path.exists(file_path): return "SYSTEM ERROR: No active skill challenge found."
+        if not os.path.exists(file_path):
+            return "SYSTEM ERROR: No active skill challenge found."
         try:
             async with read_markdown_entity(file_path) as (yaml_data, _):
-                s, f, c_name = yaml_data.get("successes", 0), yaml_data.get("failures", 0), yaml_data.get("challenge_name", "Challenge")
-        except Exception: s, f, c_name = 0, 0, "Unknown"
+                s, f, c_name = (
+                    yaml_data.get("successes", 0),
+                    yaml_data.get("failures", 0),
+                    yaml_data.get("challenge_name", "Challenge"),
+                )
+        except Exception:
+            s, f, c_name = 0, 0, "Unknown"
 
         os.remove(file_path)
         summary = f"Completed Skill Challenge: '{c_name}' with {s} Successes and {f} Failures. {note}"
-        await upsert_journal_section.ainvoke({"entity_name": "CAMPAIGN_MASTER", "section_header": "Major Milestones (Event Log)", "content": f"- {summary}", "mode": "append"}, config)
-        return f"MECHANICAL TRUTH: Skill Challenge '{c_name}' ended and removed from whiteboard. Event logged to CAMPAIGN_MASTER."
-        
+        await upsert_journal_section.ainvoke(
+            {
+                "entity_name": "CAMPAIGN_MASTER",
+                "section_header": "Major Milestones (Event Log)",
+                "content": f"- {summary}",
+                "mode": "append",
+            },
+            config,
+        )
+        return (
+            f"MECHANICAL TRUTH: Skill Challenge '{c_name}' ended and removed from whiteboard. "
+            f"Event logged to CAMPAIGN_MASTER."
+        )
+
     return "SYSTEM ERROR: Invalid action. Use 'start', 'update', or 'end'."
 
+
 @tool
-async def execute_grapple_or_shove(attacker_name: str, target_name: str, action_type: str, shove_type: str = "prone", throw_distance: float = 10.0, advantage: bool = False, disadvantage: bool = False, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def execute_grapple_or_shove(
+    attacker_name: str,
+    target_name: str,
+    action_type: str,
+    shove_type: str = "prone",
+    throw_distance: float = 10.0,
+    advantage: bool = False,
+    disadvantage: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     Resolves a contested Athletics check for a Grapple, Shove, or Throw. action_type must be 'grapple', 'shove', or 'throw'.
     The engine automatically calculates the correct Modifiers based on the entities' stats.
@@ -2453,54 +3208,86 @@ async def execute_grapple_or_shove(attacker_name: str, target_name: str, action_
     vault_path = config["configurable"].get("thread_id")
     attacker = await _get_entity_by_name(attacker_name, vault_path)
     target = await _get_entity_by_name(target_name, vault_path)
-    
+
     if not attacker or not target:
         return "SYSTEM ERROR: Attacker or Target not found in active memory."
-        
+
     att_roll1, att_roll2 = random.randint(1, 20), random.randint(1, 20)
-    if advantage and not disadvantage: att_roll = max(att_roll1, att_roll2)
-    elif disadvantage and not advantage: att_roll = min(att_roll1, att_roll2)
-    else: att_roll = att_roll1
-        
+    if advantage and not disadvantage:
+        att_roll = max(att_roll1, att_roll2)
+    elif disadvantage and not advantage:
+        att_roll = min(att_roll1, att_roll2)
+    else:
+        att_roll = att_roll1
+
     tgt_roll = random.randint(1, 20)
-    
+
     # Force engine to evaluate accurate modifiers natively
     attacker_mod = attacker.strength_mod.total
-    target_mod = max(target.strength_mod.total, target.dexterity_mod.total) # Target resists with better of Athletics/Acrobatics
-    
+    target_mod = max(
+        target.strength_mod.total, target.dexterity_mod.total
+    )  # Target resists with better of Athletics/Acrobatics
+
     att_total = att_roll + attacker_mod
     tgt_total = tgt_roll + target_mod
-    
+
     log = f"Contest: {attacker.name} ({att_roll} + {attacker_mod} = {att_total}) vs {target.name} ({tgt_roll} + {target_mod} = {tgt_total}). "
-    
+
     # In D&D 5e, ties result in the situation remaining unchanged (defender wins ties).
     if att_total > tgt_total:
         log += "Attacker wins! "
         if action_type.lower() == "grapple":
-            res = await toggle_condition.ainvoke({"character_name": target_name, "condition_name": "Grappled", "is_active": True, "source_character_name": attacker.name}, config=config)
+            await toggle_condition.ainvoke(
+                {
+                    "character_name": target_name,
+                    "condition_name": "Grappled",
+                    "is_active": True,
+                    "source_character_name": attacker.name,
+                },
+                config=config,
+            )
             log += f"{target.name} is now Grappled by {attacker.name}. (Target speed reduced to 0). "
         elif action_type.lower() in ["shove", "throw"]:
             if shove_type.lower() == "prone" and action_type.lower() == "shove":
-                res = await toggle_condition.ainvoke({"character_name": target_name, "condition_name": "Prone", "is_active": True}, config=config)
+                await toggle_condition.ainvoke(
+                    {"character_name": target_name, "condition_name": "Prone", "is_active": True}, config=config
+                )
                 log += f"{target.name} is knocked Prone. "
             else:
                 dist_to_move = 5.0 if action_type.lower() == "shove" else throw_distance
                 dx, dy = target.x - attacker.x, target.y - attacker.y
                 dist = math.hypot(dx, dy)
-                if dist == 0: dx, dy, dist = 1, 0, 1 # Fallback if exactly stacked
+                if dist == 0:
+                    dx, dy, dist = 1, 0, 1  # Fallback if exactly stacked
                 nx, ny = target.x + (dx / dist) * dist_to_move, target.y + (dy / dist) * dist_to_move
-                move_res = await move_entity.ainvoke({"entity_name": target_name, "target_x": round(nx, 1), "target_y": round(ny, 1), "movement_type": "forced"}, config=config)
-                log += f"{target.name} is {'shoved' if action_type.lower() == 'shove' else 'thrown'} {dist_to_move} feet away. " + move_res
+                move_res = await move_entity.ainvoke(
+                    {
+                        "entity_name": target_name,
+                        "target_x": round(nx, 1),
+                        "target_y": round(ny, 1),
+                        "movement_type": "forced",
+                    },
+                    config=config,
+                )
+                log += (
+                    f"{target.name} is {'shoved' if action_type.lower() == 'shove' else 'thrown'} {dist_to_move} feet away. "
+                    + move_res
+                )
                 if action_type.lower() == "throw":
-                    res = await toggle_condition.ainvoke({"character_name": target_name, "condition_name": "Prone", "is_active": True}, config=config)
+                    await toggle_condition.ainvoke(
+                        {"character_name": target_name, "condition_name": "Prone", "is_active": True}, config=config
+                    )
                     log += f" {target.name} lands Prone."
     else:
         log += "Defender wins! Nothing happens."
-        
+
     return f"MECHANICAL TRUTH: {log}"
 
+
 @tool
-async def generate_random_loot(challenge_rating: int = 1, loot_type: str = "hoard", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def generate_random_loot(
+    challenge_rating: int = 1, loot_type: str = "hoard", *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
     """
     Generates random D&D loot based on Challenge Rating (CR) and loot type ('individual' or 'hoard').
     Returns a formatted string of generated currency and items.
@@ -2508,77 +3295,116 @@ async def generate_random_loot(challenge_rating: int = 1, loot_type: str = "hoar
     """
     cp, sp, ep, gp, pp = 0, 0, 0, 0, 0
     items = []
-    
+
     cr = challenge_rating
     if loot_type.lower() == "individual":
         if cr <= 4:
             roll = random.randint(1, 100)
-            if roll <= 30: cp = sum(random.randint(1, 6) for _ in range(5))
-            elif roll <= 60: sp = sum(random.randint(1, 6) for _ in range(4))
-            elif roll <= 70: ep = sum(random.randint(1, 6) for _ in range(3))
-            elif roll <= 95: gp = sum(random.randint(1, 6) for _ in range(3))
-            else: pp = sum(random.randint(1, 6) for _ in range(1))
+            if roll <= 30:
+                cp = sum(random.randint(1, 6) for _ in range(5))
+            elif roll <= 60:
+                sp = sum(random.randint(1, 6) for _ in range(4))
+            elif roll <= 70:
+                ep = sum(random.randint(1, 6) for _ in range(3))
+            elif roll <= 95:
+                gp = sum(random.randint(1, 6) for _ in range(3))
+            else:
+                pp = sum(random.randint(1, 6) for _ in range(1))
         elif cr <= 10:
             roll = random.randint(1, 100)
-            if roll <= 30: cp, ep = sum(random.randint(1, 6) for _ in range(4)) * 100, sum(random.randint(1, 6) for _ in range(1)) * 10
-            elif roll <= 60: sp, gp = sum(random.randint(1, 6) for _ in range(6)) * 10, sum(random.randint(1, 6) for _ in range(2)) * 10
-            elif roll <= 70: ep, gp = sum(random.randint(1, 6) for _ in range(3)) * 10, sum(random.randint(1, 6) for _ in range(2)) * 10
-            elif roll <= 95: gp = sum(random.randint(1, 6) for _ in range(4)) * 10
-            else: gp, pp = sum(random.randint(1, 6) for _ in range(2)) * 10, sum(random.randint(1, 6) for _ in range(3))
-        else: # 11+
+            if roll <= 30:
+                cp, ep = sum(random.randint(1, 6) for _ in range(4)) * 100, sum(random.randint(1, 6) for _ in range(1)) * 10
+            elif roll <= 60:
+                sp, gp = sum(random.randint(1, 6) for _ in range(6)) * 10, sum(random.randint(1, 6) for _ in range(2)) * 10
+            elif roll <= 70:
+                ep, gp = sum(random.randint(1, 6) for _ in range(3)) * 10, sum(random.randint(1, 6) for _ in range(2)) * 10
+            elif roll <= 95:
+                gp = sum(random.randint(1, 6) for _ in range(4)) * 10
+            else:
+                gp, pp = sum(random.randint(1, 6) for _ in range(2)) * 10, sum(random.randint(1, 6) for _ in range(3))
+        else:  # 11+
             gp = sum(random.randint(1, 6) for _ in range(4)) * 100
             pp = sum(random.randint(1, 6) for _ in range(1)) * 10
-    else: # Hoard
+    else:  # Hoard
         if cr <= 4:
-            cp, sp, gp = sum(random.randint(1, 6) for _ in range(6)) * 100, sum(random.randint(1, 6) for _ in range(3)) * 100, sum(random.randint(1, 6) for _ in range(2)) * 10
+            cp, sp, gp = (
+                sum(random.randint(1, 6) for _ in range(6)) * 100,
+                sum(random.randint(1, 6) for _ in range(3)) * 100,
+                sum(random.randint(1, 6) for _ in range(2)) * 10,
+            )
             roll = random.randint(1, 100)
-            if 37 <= roll <= 78: items.append(f"10gp Gem (x{random.randint(2, 12)})")
-            elif 79 <= roll <= 100: items.append(f"25gp Art Object (x{random.randint(2, 8)})")
-            if roll > 50: items.append("Potion of Healing")
-            if roll > 90: items.append(random.choice(["+1 Weapon", "Bag of Holding", "Wand of Magic Missiles"]))
+            if 37 <= roll <= 78:
+                items.append(f"10gp Gem (x{random.randint(2, 12)})")
+            elif 79 <= roll <= 100:
+                items.append(f"25gp Art Object (x{random.randint(2, 8)})")
+            if roll > 50:
+                items.append("Potion of Healing")
+            if roll > 90:
+                items.append(random.choice(["+1 Weapon", "Bag of Holding", "Wand of Magic Missiles"]))
         elif cr <= 10:
             cp, sp = sum(random.randint(1, 6) for _ in range(2)) * 100, sum(random.randint(1, 6) for _ in range(2)) * 1000
             gp, pp = sum(random.randint(1, 6) for _ in range(6)) * 100, sum(random.randint(1, 6) for _ in range(3)) * 10
             roll = random.randint(1, 100)
-            if 29 <= roll <= 68: items.append(f"50gp Gem (x{random.randint(3, 18)})")
-            elif 69 <= roll <= 100: items.append(f"250gp Art Object (x{random.randint(2, 8)})")
-            if roll > 60: items.append(random.choice(["Potion of Greater Healing", "Scroll of Fireball"]))
-            if roll > 80: items.append(random.choice(["+2 Weapon", "Cloak of Displacement", "Ring of Protection"]))
-        else: # 11+
+            if 29 <= roll <= 68:
+                items.append(f"50gp Gem (x{random.randint(3, 18)})")
+            elif 69 <= roll <= 100:
+                items.append(f"250gp Art Object (x{random.randint(2, 8)})")
+            if roll > 60:
+                items.append(random.choice(["Potion of Greater Healing", "Scroll of Fireball"]))
+            if roll > 80:
+                items.append(random.choice(["+2 Weapon", "Cloak of Displacement", "Ring of Protection"]))
+        else:  # 11+
             gp, pp = sum(random.randint(1, 6) for _ in range(4)) * 1000, sum(random.randint(1, 6) for _ in range(5)) * 100
             items.append(random.choice(["1000gp Gem", "2500gp Art Object"]) + f" (x{random.randint(1, 4)})")
             items.append(random.choice(["+3 Weapon", "Staff of Power", "Robe of the Archmagi"]))
 
     loot_str = []
     for cur, name in [(pp, "pp"), (gp, "gp"), (ep, "ep"), (sp, "sp"), (cp, "cp")]:
-        if cur > 0: loot_str.append(f"{cur} {name}")
-        
+        if cur > 0:
+            loot_str.append(f"{cur} {name}")
+
     res = "Loot Generated:\n- Currency: " + (", ".join(loot_str) if loot_str else "None")
-    if items: res += "\n- Items: " + ", ".join(items)
-        
+    if items:
+        res += "\n- Items: " + ", ".join(items)
+
     await write_audit_log(config["configurable"].get("thread_id"), "Rules Engine", "Generated Random Loot", res)
-    return f"MECHANICAL TRUTH: {res}\nDM DIRECTIVE: Describe the characters finding this loot. If they take it, use `manage_inventory` to add the currency/items to their sheets."
+    return (
+        f"MECHANICAL TRUTH: {res}\nDM DIRECTIVE: Describe the characters finding this loot. "
+        f"If they take it, use `manage_inventory` to add the currency/items to their sheets."
+    )
+
 
 @tool
 async def ingest_battlemap_json(map_json_str: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
-    Parses a complete JSON map payload (generated by the Vision Map Ingestion model) 
+    Parses a complete JSON map payload (generated by the Vision Map Ingestion model)
     and natively bulk-loads all walls, terrain, and lights into the Spatial Engine.
     """
     import json
     from spatial_engine import MapData
+
     try:
         # Clean markdown code blocks if the LLM wrapped the JSON payload
         clean_json = map_json_str.strip()
-        if clean_json.startswith("```json"): clean_json = clean_json[7:]
-        elif clean_json.startswith("```"): clean_json = clean_json[3:]
-        if clean_json.endswith("```"): clean_json = clean_json[:-3]
-            
+        if clean_json.startswith("```json"):
+            clean_json = clean_json[7:]
+        elif clean_json.startswith("```"):
+            clean_json = clean_json[3:]
+        if clean_json.endswith("```"):
+            clean_json = clean_json[:-3]
+
         map_dict = json.loads(clean_json.strip())
         new_map_data = MapData(**map_dict)
         vp = config["configurable"].get("thread_id", "default")
         spatial_service.load_map(new_map_data, vp)
-        
-        return f"MECHANICAL TRUTH: Successfully ingested battlemap. Loaded {len(new_map_data.walls)} walls, {len(new_map_data.terrain)} terrain zones, and {len(new_map_data.lights)} light sources."
+
+        wall_cnt = len(new_map_data.walls)
+        terr_cnt = len(new_map_data.terrain)
+        lght_cnt = len(new_map_data.lights)
+
+        return (
+            f"MECHANICAL TRUTH: Successfully ingested battlemap. Loaded {wall_cnt} walls, "
+            f"{terr_cnt} terrain zones, and {lght_cnt} light sources."
+        )
     except Exception as e:
         return f"SYSTEM ERROR: Failed to parse or load map JSON. Details: {str(e)}"
