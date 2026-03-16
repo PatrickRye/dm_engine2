@@ -20,9 +20,9 @@ def setup_engine_state():
     spatial_service.clear()
     spatial_service.map_data.pixels_per_foot = 1.0  # Ensure waypoint calculations match the spatial coordinates directly
     # Seed with a player and an enemy
-    player = Creature(name="Player", x=0.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=2))
+    player = Creature(name="Player", vault_path="default", x=0.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=2))
     player.movement_remaining = 30.0  # Ensure movement pool is initialized for tests
-    enemy = Creature(name="Enemy", x=10.0, y=10.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=12), strength_mod=ModifiableValue(base_value=1), dexterity_mod=ModifiableValue(base_value=1))
+    enemy = Creature(name="Enemy", vault_path="default", x=10.0, y=10.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=12), strength_mod=ModifiableValue(base_value=1), dexterity_mod=ModifiableValue(base_value=1))
     register_entity(player)
     register_entity(enemy)
     spatial_service.sync_entity(player)
@@ -34,7 +34,7 @@ def test_propose_valid_move(client):
     request_data = {
         "entity_name": "Player",
         "waypoints": [[0.0, 0.0], [10.0, 0.0]],
-        "vault_path": "/mock/vault"
+        "vault_path": "default"
     }
     response = client.post("/propose_move", json=request_data)
     assert response.status_code == 200
@@ -53,7 +53,7 @@ def test_propose_invalid_move_wall_collision(client):
     request_data = {
         "entity_name": "Player",
         "waypoints": [[0.0, 0.0], [10.0, 0.0]],
-        "vault_path": "/mock/vault"
+        "vault_path": "default"
     }
     response = client.post("/propose_move", json=request_data)
     assert response.status_code == 200
@@ -77,7 +77,7 @@ def test_propose_move_triggers_opportunity_attack(client):
     request_data = {
         "entity_name": "Player",
         "waypoints": [[5.0, 5.0], [20.0, 5.0]],
-        "vault_path": "/mock/vault"
+        "vault_path": "default"
     }
     
     response = client.post("/propose_move", json=request_data)
@@ -101,7 +101,7 @@ def test_propose_move_within_reach_no_opportunity_attack(client):
     request_data = {
         "entity_name": "Player",
         "waypoints": [[5.0, 5.0], [10.0, 10.0]], # Chebyshev distance from (10,10) to (10,5) is still 5ft
-        "vault_path": "/mock/vault"
+        "vault_path": "default"
     }
     
     response = client.post("/propose_move", json=request_data)
@@ -127,7 +127,7 @@ def test_propose_move_with_disengage_condition(client):
     request_data = {
         "entity_name": "Player",
         "waypoints": [[5.0, 5.0], [20.0, 5.0]],
-        "vault_path": "/mock/vault"
+        "vault_path": "default"
     }
     
     response = client.post("/propose_move", json=request_data)
@@ -142,9 +142,10 @@ def test_propose_move_difficult_terrain_cost(client, tmp_path):
     vault_path = str(tmp_path)
     
     # Set in-memory combat state
-    spatial_service.active_combatants = ["Player"]
+    spatial_service.active_combatants[vault_path] = ["Player"]
         
-    player = get_entity_by_name("Player")
+    player = Creature(name="Player", vault_path=vault_path, x=0.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=2))
+    register_entity(player)
     player.x, player.y = 0.0, 0.0
     player.movement_remaining = 30.0
     spatial_service.sync_entity(player)
@@ -154,7 +155,7 @@ def test_propose_move_difficult_terrain_cost(client, tmp_path):
         points=[(5.0, -5.0), (15.0, -5.0), (15.0, 5.0), (5.0, 5.0)],
         is_difficult=True
     )
-    spatial_service.map_data.terrain = [mock_terrain]
+    spatial_service.get_map_data(vault_path).terrain = [mock_terrain]
     
     # Move 20 ft. 0->5 is normal (5), 5->15 is DT (20), 15->20 is normal (5). Total = 30.
     request_data = {
@@ -174,15 +175,15 @@ def test_propose_move_difficult_terrain_cost(client, tmp_path):
     clear_registry()
     spatial_service.clear()
     spatial_service.map_data.pixels_per_foot = 1.0
-    player3 = Creature(name="Player3", x=0.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=2))      
+    player3 = Creature(name="Player3", vault_path=vault_path, x=0.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=2))      
     player3.movement_remaining = 30.0
     register_entity(player3)
     spatial_service.sync_entity(player3)
     
     mock_terrain2 = TerrainZone(points=[(5.0, -5.0), (15.0, -5.0), (15.0, 5.0), (5.0, 5.0)], is_difficult=True)
-    spatial_service.map_data.terrain = [mock_terrain2]
+    spatial_service.get_map_data(vault_path).terrain = [mock_terrain2]
 
-    spatial_service.active_combatants = ["Player3"]
+    spatial_service.active_combatants[vault_path] = ["Player3"]
 
     # Move 25 ft. Total cost = 35. Exceeds 30 ft movement remaining.
     request_data_invalid = {
@@ -207,7 +208,7 @@ def test_propose_move_unknown_trap_auto_executes(client):
     wall.trap = TrapDefinition(hazard_name="Hidden Pit", known_by_players=False)
     spatial_service.add_wall(wall)
     
-    request_data = {"entity_name": "Player", "waypoints": [[0.0, 0.0], [10.0, 0.0]], "vault_path": "/mock/vault"}
+    request_data = {"entity_name": "Player", "waypoints": [[0.0, 0.0], [10.0, 0.0]], "vault_path": "default"}
     response = client.post("/propose_move", json=request_data)
     data = response.json()
     assert data["is_valid"] is True
@@ -222,7 +223,7 @@ def test_propose_move_known_trap_prompts(client):
     wall.trap = TrapDefinition(hazard_name="Spike Trap", known_by_players=True)
     spatial_service.add_wall(wall)
     
-    request_data = {"entity_name": "Player", "waypoints": [[0.0, 0.0], [10.0, 0.0]], "vault_path": "/mock/vault"}
+    request_data = {"entity_name": "Player", "waypoints": [[0.0, 0.0], [10.0, 0.0]], "vault_path": "default"}
     response = client.post("/propose_move", json=request_data)
     data = response.json()
     assert data["is_valid"] is True
@@ -233,10 +234,12 @@ def test_movement_interruption_on_oa(client, tmp_path):
     """Tests that movement budget is exactly deducted up until the interruption point, and tests zero-speed resume logic."""
     vault_path = str(tmp_path)
     
-    spatial_service.active_combatants = ["Player", "Enemy"]
+    spatial_service.active_combatants[vault_path] = ["Player", "Enemy"]
         
-    player = get_entity_by_name("Player")
-    enemy = get_entity_by_name("Enemy")
+    player = Creature(name="Player", vault_path=vault_path, x=0.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=2))
+    enemy = Creature(name="Enemy", vault_path=vault_path, x=0.0, y=5.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=12), strength_mod=ModifiableValue(base_value=1), dexterity_mod=ModifiableValue(base_value=1))
+    register_entity(player)
+    register_entity(enemy)
     player.x, player.y = 0.0, 0.0
     enemy.x, enemy.y = 0.0, 5.0 # Adjacent
     player.movement_remaining = 30.0
@@ -295,10 +298,10 @@ def test_movement_interruption_on_oa(client, tmp_path):
     assert data6["is_valid"] is False
     assert "exceeds remaining speed" in data6["invalid_reason"]
 
-def get_entity_by_name(name: str):
+def get_entity_by_name(name: str, vault_path: str = "default"):
     """Helper to find an entity by name in the registry."""
     from registry import get_all_entities
-    for entity in get_all_entities().values():
+    for entity in get_all_entities(vault_path).values():
         if entity.name == name:
             return entity
     return None

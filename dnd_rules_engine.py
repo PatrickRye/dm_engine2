@@ -21,6 +21,7 @@ class BaseGameEntity(BaseModel):
     inherits from this to get a UUID and be added to the global registry.
     """
     entity_uuid: uuid.UUID = Field(default_factory=uuid.uuid4)
+    vault_path: str = "default"
     name: str
     icon_url: str = ""
     x: float = 0.0
@@ -266,6 +267,7 @@ class GameEvent(BaseModel):
     event_type: str
     source_uuid: uuid.UUID
     target_uuid: Optional[uuid.UUID] = None
+    vault_path: str = "default"
     status: EventStatus = EventStatus.PENDING
     payload: Dict[str, Any] = Field(default_factory=dict)
 

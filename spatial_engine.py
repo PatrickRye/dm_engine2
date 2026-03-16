@@ -132,107 +132,184 @@ class SpatialQueryService:
     Provides mathematical answers to mechanical game logic without rendering.
     """
     def __init__(self):
-        self.map_data = MapData()
-        self.active_paths: Dict[str, dict] = {} # Maps entity_name -> path_data
-        self.active_combatants: List[str] = [] # Memory-state for Combat Mode
+        self._map_data: Dict[str, MapData] = {}
+        self.active_paths: Dict[str, Dict[str, dict]] = {} # Maps vault_path -> entity_name -> path_data
+        self.active_combatants: Dict[str, List[str]] = {} # Maps vault_path -> [combatant_names]
         if HAS_GIS:
-            p = index.Property()
-            self.entity_idx = index.Index(properties=p)
-            self._entities: Dict[uuid.UUID, SpatialObject] = {}
-            self._uuid_to_id: Dict[uuid.UUID, int] = {}
-            self._id_to_uuid: Dict[int, uuid.UUID] = {}
-            self._uuid_to_bbox: Dict[uuid.UUID, Tuple[float, float, float, float]] = {}
-            self._next_id = 0
-            self._raycast_cache: Dict[Tuple, any] = {}
+            self.entity_idx: Dict[str, index.Index] = {}
+            self.wall_idx: Dict[str, index.Index] = {}
+            self.terrain_idx: Dict[str, index.Index] = {}
+            self._entities: Dict[str, Dict[uuid.UUID, SpatialObject]] = {}
+            self._uuid_to_id: Dict[str, Dict[uuid.UUID, int]] = {}
+            self._id_to_uuid: Dict[str, Dict[int, uuid.UUID]] = {}
+            self._uuid_to_bbox: Dict[str, Dict[uuid.UUID, Tuple[float, float, float, float]]] = {}
+            self._wall_map: Dict[str, Dict[int, Wall]] = {}
+            self._terrain_map: Dict[str, Dict[int, TerrainZone]] = {}
+            self._next_id: Dict[str, int] = {}
+            self._raycast_cache: Dict[str, Dict[Tuple, any]] = {}
+
+    @property
+    def map_data(self) -> MapData:
+        """Fallback helper for backward compatibility in test suites."""
+        return self.get_map_data("default")
+        
+    @map_data.setter
+    def map_data(self, value: MapData):
+        self._map_data["default"] = value
+        
+    def get_map_data(self, vault_path: str = "default") -> MapData:
+        if not vault_path: vault_path = "default"
+        if vault_path not in self._map_data:
+            self._map_data[vault_path] = MapData()
+            self.active_paths[vault_path] = {}
+            if HAS_GIS:
+                p = index.Property()
+                self.entity_idx[vault_path] = index.Index(properties=p)
+                self.wall_idx[vault_path] = index.Index(properties=p)
+                self.terrain_idx[vault_path] = index.Index(properties=p)
+                self._entities[vault_path] = {}
+                self._uuid_to_id[vault_path] = {}
+                self._id_to_uuid[vault_path] = {}
+                self._uuid_to_bbox[vault_path] = {}
+                self._wall_map[vault_path] = {}
+                self._terrain_map[vault_path] = {}
+                self._next_id[vault_path] = 0
+                self._raycast_cache[vault_path] = {}
+        return self._map_data[vault_path]
             
-    def clear(self):
+    def clear(self, vault_path: str = None):
         """Completely resets the spatial engine and Rtree index for testing."""
-        self.map_data = MapData()
-        self.active_paths.clear()
-        self.active_combatants.clear()
-        if HAS_GIS:
-            self.entity_idx = index.Index(properties=index.Property())
-            self._entities.clear()
-            self._uuid_to_id.clear()
-            self._id_to_uuid.clear()
-            self._uuid_to_bbox.clear()
-            self._next_id = 0
-            self._raycast_cache.clear()
+        if vault_path:
+            if vault_path in self._map_data: del self._map_data[vault_path]
+            if vault_path in self.active_paths: del self.active_paths[vault_path]
+            if vault_path in self.active_combatants: del self.active_combatants[vault_path]
+            if HAS_GIS:
+                if vault_path in self.entity_idx: del self.entity_idx[vault_path]
+                if vault_path in self.wall_idx: del self.wall_idx[vault_path]
+                if vault_path in self.terrain_idx: del self.terrain_idx[vault_path]
+                if vault_path in self._entities: del self._entities[vault_path]
+                if vault_path in self._uuid_to_id: del self._uuid_to_id[vault_path]
+                if vault_path in self._id_to_uuid: del self._id_to_uuid[vault_path]
+                if vault_path in self._uuid_to_bbox: del self._uuid_to_bbox[vault_path]
+                if vault_path in self._wall_map: del self._wall_map[vault_path]
+                if vault_path in self._terrain_map: del self._terrain_map[vault_path]
+                if vault_path in self._next_id: del self._next_id[vault_path]
+                if vault_path in self._raycast_cache: del self._raycast_cache[vault_path]
+        else:
+            self._map_data.clear()
+            self.active_paths.clear()
+            self.active_combatants.clear()
+            if HAS_GIS:
+                self.entity_idx.clear()
+                self.wall_idx.clear()
+                self.terrain_idx.clear()
+                self._entities.clear()
+                self._uuid_to_id.clear()
+                self._id_to_uuid.clear()
+                self._uuid_to_bbox.clear()
+                self._wall_map.clear()
+                self._terrain_map.clear()
+                self._next_id.clear()
+                self._raycast_cache.clear()
             
-    def get_wall_by_id(self, wall_id: uuid.UUID) -> Optional[Wall]:
+    def get_wall_by_id(self, wall_id: uuid.UUID, vault_path: str = "default") -> Optional[Wall]:
         """Retrieves a specific wall object from the active layers."""
-        for w in self.map_data.active_walls:
+        for w in self.get_map_data(vault_path).active_walls:
             if w.wall_id == wall_id: return w
         return None
         
-    def get_terrain_by_id(self, zone_id: uuid.UUID) -> Optional[TerrainZone]:
-        for tz in self.map_data.active_terrain:
+    def get_terrain_by_id(self, zone_id: uuid.UUID, vault_path: str = "default") -> Optional[TerrainZone]:
+        for tz in self.get_map_data(vault_path).active_terrain:
             if tz.zone_id == zone_id: return tz
         return None
             
-    def reveal_fog_of_war(self, x: float, y: float, radius: float):
+    def reveal_fog_of_war(self, x: float, y: float, radius: float, vault_path: str = "default"):
         """Adds a circular area to the explored regions of the current map."""
-        # Quantize to prevent endless floating point arrays
         qx, qy, qr = round(x, 1), round(y, 1), round(radius, 1)
-        # Simple optimization: check if already fully enveloped by another explored area
-        for ex, ey, er in self.map_data.explored_areas:
+        md = self.get_map_data(vault_path)
+        for ex, ey, er in md.explored_areas:
             dist = math.hypot(qx - ex, qy - ey)
             if dist + qr <= er:
-                return # Already fully explored
+                return 
                 
-        self.map_data.explored_areas.append((qx, qy, qr))
+        md.explored_areas.append((qx, qy, qr))
+        
+    def _rebuild_indices(self, vault_path: str = "default"):
+        """Rebuilds the R-tree indices for static map geometry (Walls & Terrain)."""
+        if not HAS_GIS: return
+        self.get_map_data(vault_path)
+        p = index.Property()
+        self.wall_idx[vault_path] = index.Index(properties=p)
+        self._wall_map[vault_path].clear()
+        for i, w in enumerate(self.get_map_data(vault_path).active_walls):
+            if w.line:
+                self.wall_idx[vault_path].insert(i, w.line.bounds)
+                self._wall_map[vault_path][i] = w
+                
+        self.terrain_idx[vault_path] = index.Index(properties=p)
+        self._terrain_map[vault_path].clear()
+        for i, t in enumerate(self.get_map_data(vault_path).active_terrain):
+            if t.polygon:
+                self.terrain_idx[vault_path].insert(i, t.polygon.bounds)
+                self._terrain_map[vault_path][i] = t
 
-    def invalidate_cache(self):
-        """Clears the raycast cache when map geometry changes."""
+    def invalidate_cache(self, vault_path: str = "default"):
+        """Clears the raycast cache and rebuilds spatial geometry indices when map geometry changes."""
         if HAS_GIS:
-            self._raycast_cache.clear()
+            self.get_map_data(vault_path)
+            self._raycast_cache.setdefault(vault_path, {}).clear()
+            self._rebuild_indices(vault_path)
 
-    def add_wall(self, wall: Wall, is_temporary: bool = False):
+    def add_wall(self, wall: Wall, is_temporary: bool = False, vault_path: str = "default"):
         """Dynamically adds a wall to the current or temporary map."""
+        md = self.get_map_data(vault_path)
         if is_temporary:
-            self.map_data.temporary_walls.append(wall)
+            md.temporary_walls.append(wall)
         else:
-            self.map_data.walls.append(wall)
-        self.invalidate_cache()
+            md.walls.append(wall)
+        self.invalidate_cache(vault_path)
         
-    def remove_wall(self, wall_id: uuid.UUID):
+    def remove_wall(self, wall_id: uuid.UUID, vault_path: str = "default"):
         """Removes a wall from the dynamic or temporary layers."""
-        initial_count = len(self.map_data.walls) + len(self.map_data.temporary_walls)
-        self.map_data.walls = [w for w in self.map_data.walls if w.wall_id != wall_id]
-        self.map_data.temporary_walls = [w for w in self.map_data.temporary_walls if w.wall_id != wall_id]
-        if len(self.map_data.walls) + len(self.map_data.temporary_walls) < initial_count:
-            self.invalidate_cache()
+        md = self.get_map_data(vault_path)
+        initial_count = len(md.walls) + len(md.temporary_walls)
+        md.walls = [w for w in md.walls if w.wall_id != wall_id]
+        md.temporary_walls = [w for w in md.temporary_walls if w.wall_id != wall_id]
+        if len(md.walls) + len(md.temporary_walls) < initial_count:
+            self.invalidate_cache(vault_path)
             
-    def add_terrain(self, terrain: TerrainZone, is_temporary: bool = False):
-        if is_temporary: self.map_data.temporary_terrain.append(terrain)
-        else: self.map_data.terrain.append(terrain)
-        self.invalidate_cache()
+    def add_terrain(self, terrain: TerrainZone, is_temporary: bool = False, vault_path: str = "default"):
+        md = self.get_map_data(vault_path)
+        if is_temporary: md.temporary_terrain.append(terrain)
+        else: md.terrain.append(terrain)
+        self.invalidate_cache(vault_path)
         
-    def remove_terrain(self, zone_id: uuid.UUID):
-        initial_count = len(self.map_data.terrain) + len(self.map_data.temporary_terrain)
-        self.map_data.terrain = [t for t in self.map_data.terrain if t.zone_id != zone_id]
-        self.map_data.temporary_terrain = [t for t in self.map_data.temporary_terrain if t.zone_id != zone_id]
-        if len(self.map_data.terrain) + len(self.map_data.temporary_terrain) < initial_count:
-            self.invalidate_cache()
+    def remove_terrain(self, zone_id: uuid.UUID, vault_path: str = "default"):
+        md = self.get_map_data(vault_path)
+        initial_count = len(md.terrain) + len(md.temporary_terrain)
+        md.terrain = [t for t in md.terrain if t.zone_id != zone_id]
+        md.temporary_terrain = [t for t in md.temporary_terrain if t.zone_id != zone_id]
+        if len(md.terrain) + len(md.temporary_terrain) < initial_count:
+            self.invalidate_cache(vault_path)
 
-    def modify_wall(self, wall_id: uuid.UUID, is_solid: Optional[bool] = None, is_visible: Optional[bool] = None, is_locked: Optional[bool] = None):
+    def modify_wall(self, wall_id: uuid.UUID, is_solid: Optional[bool] = None, is_visible: Optional[bool] = None, is_locked: Optional[bool] = None, vault_path: str = "default"):
         """Dynamically updates a wall's state (e.g., opening a door or destroying a wall)."""
-        for wall in self.map_data.active_walls:
+        for wall in self.get_map_data(vault_path).active_walls:
             if wall.wall_id == wall_id:
                 if is_solid is not None: wall.is_solid = is_solid
                 if is_visible is not None: wall.is_visible = is_visible
                 if is_locked is not None: wall.is_locked = is_locked
-                self.invalidate_cache()
+                self.invalidate_cache(vault_path)
                 return
 
-    def reset_map_geometry(self):
+    def reset_map_geometry(self, vault_path: str = "default"):
         """Restores the current map to the original base map, wiping all damage/doors/temporary effects."""
-        self.map_data.walls = [w.model_copy(deep=True) for w in self.map_data.original_walls]
-        self.map_data.temporary_walls.clear()
-        self.invalidate_cache()
+        md = self.get_map_data(vault_path)
+        md.walls = [w.model_copy(deep=True) for w in md.original_walls]
+        md.temporary_walls.clear()
+        self.invalidate_cache(vault_path)
 
-    def load_map(self, map_data: MapData):
-        # Preserve the original untouched geometry state
+    def load_map(self, map_data: MapData, vault_path: str = "default"):
         if not map_data.original_walls and map_data.walls:
             map_data.original_walls = [w.model_copy(deep=True) for w in map_data.walls]
         if not map_data.original_terrain and map_data.terrain:
@@ -240,50 +317,56 @@ class SpatialQueryService:
         if not map_data.original_lights and map_data.lights:
             map_data.original_lights = [l.model_copy(deep=True) for l in map_data.lights]
             
-        self.map_data = map_data
-        self.invalidate_cache()
+        self.get_map_data(vault_path)
+        self._map_data[vault_path] = map_data
+        self.invalidate_cache(vault_path)
 
     def sync_entity(self, entity: SpatialObject):
         """Adds or updates an entity's bounding box in the Rtree spatial index."""
         if not HAS_GIS: return
         
-        self._entities[entity.entity_uuid] = entity
+        vp = getattr(entity, 'vault_path', 'default')
+        if not vp: vp = 'default'
+        self.get_map_data(vp)
+        
+        self._entities[vp][entity.entity_uuid] = entity
         new_bbox = self._get_bbox(entity)
         
-        if entity.entity_uuid not in self._uuid_to_id:
-            curr_id = self._next_id
-            self._uuid_to_id[entity.entity_uuid] = curr_id
-            self._id_to_uuid[curr_id] = entity.entity_uuid
-            self._next_id += 1
+        if entity.entity_uuid not in self._uuid_to_id[vp]:
+            curr_id = self._next_id[vp]
+            self._uuid_to_id[vp][entity.entity_uuid] = curr_id
+            self._id_to_uuid[vp][curr_id] = entity.entity_uuid
+            self._next_id[vp] += 1
         else:
-            curr_id = self._uuid_to_id[entity.entity_uuid]
-            old_bbox = self._uuid_to_bbox.get(entity.entity_uuid)
+            curr_id = self._uuid_to_id[vp][entity.entity_uuid]
+            old_bbox = self._uuid_to_bbox[vp].get(entity.entity_uuid)
             if old_bbox:
-                self.entity_idx.delete(curr_id, old_bbox)
+                self.entity_idx[vp].delete(curr_id, old_bbox)
             
-        self.entity_idx.insert(curr_id, new_bbox)
-        self._uuid_to_bbox[entity.entity_uuid] = new_bbox
+        self.entity_idx[vp].insert(curr_id, new_bbox)
+        self._uuid_to_bbox[vp][entity.entity_uuid] = new_bbox
 
-    def remove_entity(self, entity_uuid: uuid.UUID):
+    def remove_entity(self, entity_uuid: uuid.UUID, vault_path: str = "default"):
         """Removes an entity from the spatial index."""
-        if not HAS_GIS or entity_uuid not in self._uuid_to_id: return
+        vp = vault_path
+        if not HAS_GIS or vp not in self._uuid_to_id or entity_uuid not in self._uuid_to_id[vp]: return
         
-        curr_id = self._uuid_to_id[entity_uuid]
-        old_bbox = self._uuid_to_bbox.get(entity_uuid)
+        curr_id = self._uuid_to_id[vp][entity_uuid]
+        old_bbox = self._uuid_to_bbox[vp].get(entity_uuid)
         if old_bbox:
-            self.entity_idx.delete(curr_id, old_bbox)
-        del self._id_to_uuid[curr_id]
-        del self._uuid_to_id[entity_uuid]
-        del self._uuid_to_bbox[entity_uuid]
-        if entity_uuid in self._entities:
-            del self._entities[entity_uuid]
+            self.entity_idx[vp].delete(curr_id, old_bbox)
+        del self._id_to_uuid[vp][curr_id]
+        del self._uuid_to_id[vp][entity_uuid]
+        del self._uuid_to_bbox[vp][entity_uuid]
+        if entity_uuid in self._entities[vp]:
+            del self._entities[vp][entity_uuid]
         
-    def calculate_distance(self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float) -> float:
+    def calculate_distance(self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float, vault_path: str = "default") -> float:
         """Calculates 3D distance using the map's configured metric."""
         dx = abs(x1 - x2)
         dy = abs(y1 - y2)
         dz = abs(z1 - z2)
-        if self.map_data.distance_metric == "chebyshev":
+        if self.get_map_data(vault_path).distance_metric == "chebyshev":
             return max(dx, dy, dz)
         else:
             return math.hypot(dx, dy, dz)
@@ -300,40 +383,41 @@ class SpatialQueryService:
         """Quantizes an entity's spatial state to 1 decimal place (~1.2 inches) for cache keys."""
         return (round(entity.x, 1), round(entity.y, 1), round(entity.z, 1), round(entity.size, 1), round(getattr(entity, 'height', 5.0), 1))
 
-    def _cache_set(self, key: Tuple, value: any):
-        if len(self._raycast_cache) > 10000:
-            self._raycast_cache.clear() # Fast clear if memory bounds are exceeded
-        self._raycast_cache[key] = value
+    def _cache_set(self, vault_path: str, key: Tuple, value: any):
+        cache = self._raycast_cache.setdefault(vault_path, {})
+        if len(cache) > 10000:
+            cache.clear() # Fast clear if memory bounds are exceeded
+        cache[key] = value
 
-    def get_targets_in_radius(self, origin_x: float, origin_y: float, radius: float) -> List[uuid.UUID]:
+    def get_targets_in_radius(self, origin_x: float, origin_y: float, radius: float, vault_path: str = "default") -> List[uuid.UUID]:
         """Resolves circular Area of Effect (AoE) like Fireball perfectly."""
         if not HAS_GIS: return []
+        self.get_map_data(vault_path)
         
-        if self.map_data.distance_metric == "chebyshev":
+        if self.get_map_data(vault_path).distance_metric == "chebyshev":
             search_area = box(origin_x - radius, origin_y - radius, origin_x + radius, origin_y + radius)
         else:
             search_area = Point(origin_x, origin_y).buffer(radius)
         
-        # 1. Broad phase query (Rtree instantly filters out entities across the map)
-        candidate_ids = list(self.entity_idx.intersection(search_area.bounds))
+        candidate_ids = list(self.entity_idx[vault_path].intersection(search_area.bounds))
         
-        # 2. Narrow phase query (Shapely precise intersection on the remaining candidates)
         hit_uuids = []
         origin_z = 0.0 # Default flat if not specified
         for cid in candidate_ids:
-            ent_uuid = self._id_to_uuid[cid]
-            entity = self._entities.get(ent_uuid)
+            ent_uuid = self._id_to_uuid[vault_path][cid]
+            entity = self._entities[vault_path].get(ent_uuid)
             if entity:
                 ent_poly = self._get_entity_bbox(entity)
                 if search_area.intersects(ent_poly):
-                    if self.calculate_distance(entity.x, entity.y, entity.z, origin_x, origin_y, origin_z) <= radius:
+                    if self.calculate_distance(entity.x, entity.y, entity.z, origin_x, origin_y, origin_z, vault_path) <= radius:
                         hit_uuids.append(ent_uuid)
                     
         return hit_uuids
         
-    def get_targets_in_cone(self, origin_x: float, origin_y: float, target_x: float, target_y: float, length: float, angle_degrees: float = 60.0) -> List[uuid.UUID]:
+    def get_targets_in_cone(self, origin_x: float, origin_y: float, target_x: float, target_y: float, length: float, angle_degrees: float = 60.0, vault_path: str = "default") -> List[uuid.UUID]:
         """Resolves cone Area of Effect (like Burning Hands)."""
         if not HAS_GIS: return []
+        self.get_map_data(vault_path)
         
         base_angle = math.degrees(math.atan2(target_y - origin_y, target_x - origin_x))
         start_angle = math.radians(base_angle - (angle_degrees / 2))
@@ -346,12 +430,12 @@ class SpatialQueryService:
             points.append((origin_x + length * math.cos(theta), origin_y + length * math.sin(theta)))
             
         cone_poly = Polygon(points)
-        candidate_ids = list(self.entity_idx.intersection(cone_poly.bounds))
+        candidate_ids = list(self.entity_idx[vault_path].intersection(cone_poly.bounds))
         
         hit_uuids = []
         for cid in candidate_ids:
-            ent_uuid = self._id_to_uuid[cid]
-            entity = self._entities.get(ent_uuid)
+            ent_uuid = self._id_to_uuid[vault_path][cid]
+            entity = self._entities[vault_path].get(ent_uuid)
             if entity:
                 ent_poly = self._get_entity_bbox(entity)
                 if cone_poly.intersects(ent_poly):
@@ -359,10 +443,11 @@ class SpatialQueryService:
                     
         return hit_uuids
         
-    def get_aoe_targets(self, shape: str, size: float, origin_x: float, origin_y: float, target_x: float = None, target_y: float = None, origin_z: float = 0.0, target_z: float = None, aoe_height: float = None, ignore_walls: bool = False, penetrates_destructible: bool = False) -> Tuple[List[uuid.UUID], List[uuid.UUID], List[uuid.UUID]]:
+    def get_aoe_targets(self, shape: str, size: float, origin_x: float, origin_y: float, target_x: float = None, target_y: float = None, origin_z: float = 0.0, target_z: float = None, aoe_height: float = None, ignore_walls: bool = False, penetrates_destructible: bool = False, vault_path: str = "default") -> Tuple[List[uuid.UUID], List[uuid.UUID], List[uuid.UUID]]:
         """Returns all valid Entities, Walls, and Terrain hit by an AoE, enforcing Line of Effect."""
         if not HAS_GIS: return [], [], []
         if target_z is None: target_z = origin_z
+        self.get_map_data(vault_path)
         
         hit_entities = []
         hit_walls = []
@@ -371,13 +456,12 @@ class SpatialQueryService:
         aoe_poly = None
         vx, vy, vz = 0.0, 0.0, 0.0
         
-        # 1. Mathematically construct the AoE Geometry
         if shape in ["circle", "sphere", "cylinder"]:
             aoe_poly = Point(origin_x, origin_y).buffer(size)
         elif shape == "cube":
             aoe_poly = box(origin_x - size/2, origin_y - size/2, origin_x + size/2, origin_y + size/2)
         elif shape in ["cone", "line"]:
-            if target_x is None or target_y is None: return [], []
+            if target_x is None or target_y is None: return [], [], []
             
             dx = target_x - origin_x
             dy = target_y - origin_y
@@ -403,31 +487,28 @@ class SpatialQueryService:
                         theta = start_angle + i * (end_angle - start_angle) / num_segments
                         points.append((origin_x + size * math.cos(theta), origin_y + size * math.sin(theta)))
                     aoe_poly = Polygon(points)
-            else: # Line (Standard 5ft wide)
+            else: # Line
                 ex = origin_x + vx * size
                 ey = origin_y + vy * size
-                # Avoid Shapely throwing an error for degenerate linestrings if aimed completely vertically
                 if origin_x == ex and origin_y == ey:
                     aoe_poly = Point(origin_x, origin_y).buffer(2.5)
                 else:
                     aoe_poly = LineString([(origin_x, origin_y), (ex, ey)]).buffer(2.5)
                 
-        if not aoe_poly: return [], []
+        if not aoe_poly: return [], [], []
         
-        # 2. Extract Hit Entities (with Line-of-Effect raycasting)
-        candidate_ids = list(self.entity_idx.intersection(aoe_poly.bounds))
+        candidate_ids = list(self.entity_idx[vault_path].intersection(aoe_poly.bounds))
         for cid in candidate_ids:
-            ent_uuid = self._id_to_uuid[cid]
-            entity = self._entities.get(ent_uuid)
+            ent_uuid = self._id_to_uuid[vault_path][cid]
+            entity = self._entities[vault_path].get(ent_uuid)
             if entity and aoe_poly.intersects(self._get_entity_bbox(entity)):
                 ent_min_z = entity.z
                 ent_max_z = entity.z + getattr(entity, 'height', 5.0)
                 
-                # Z-Axis / 3D Filtering
                 is_hit = True
                 if shape == "sphere":
                     ent_center_z = entity.z + (getattr(entity, 'height', 5.0) / 2.0)
-                    dist = self.calculate_distance(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z)
+                    dist = self.calculate_distance(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z, vault_path)
                     if dist - (entity.size / 2.0) > size:
                         is_hit = False
                 elif shape == "cube":
@@ -444,7 +525,7 @@ class SpatialQueryService:
                         is_hit = False
                 elif shape == "cone":
                     ent_center_z = entity.z + (getattr(entity, 'height', 5.0) / 2.0)
-                    dist = self.calculate_distance(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z)
+                    dist = self.calculate_distance(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z, vault_path)
                     if dist - (entity.size / 2.0) > size:
                         is_hit = False
                     else:
@@ -467,58 +548,58 @@ class SpatialQueryService:
                     
                     ab_len_sq = ab_x**2 + ab_y**2 + ab_z**2
                     if ab_len_sq == 0:
-                        dist = self.calculate_distance(ex, ey, ez, ax, ay, az)
+                        dist = self.calculate_distance(ex, ey, ez, ax, ay, az, vault_path)
                     else:
                         t = max(0.0, min(1.0, (ae_x*ab_x + ae_y*ab_y + ae_z*ab_z) / ab_len_sq))
                         cx, cy, cz = ax + t * ab_x, ay + t * ab_y, az + t * ab_z
-                        dist = self.calculate_distance(ex, ey, ez, cx, cy, cz)
+                        dist = self.calculate_distance(ex, ey, ez, cx, cy, cz, vault_path)
                         
-                    if dist - (entity.size / 2.0) > 2.5: # 5ft wide line = 2.5ft radius
+                    if dist - (entity.size / 2.0) > 2.5: 
                         is_hit = False
                         
                 if is_hit:
-                    # Check Line of Effect from the AoE origin point to the target entity
                     ent_center_z = entity.z + (getattr(entity, 'height', 5.0) / 2.0)
                     if ignore_walls:
                         hit_entities.append(ent_uuid)
                     else:
-                        blocking_wall = self.check_path_collision(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z, entity_height=0.1, check_vision=False)
+                        blocking_wall = self.check_path_collision(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z, entity_height=0.1, check_vision=False, vault_path=vault_path)
                         if not blocking_wall:
                             hit_entities.append(ent_uuid)
                         elif penetrates_destructible and getattr(blocking_wall, 'hp', None) is not None and blocking_wall.hp < 9999:
                             hit_entities.append(ent_uuid)
                     
-        # 3. Extract Hit Geometry (Walls/Doors)
-        for wall in self.map_data.active_walls:
+        wall_candidates = list(self.wall_idx[vault_path].intersection(aoe_poly.bounds))
+        for cid in wall_candidates:
+            wall = self._wall_map[vault_path][cid]
             if wall.line and aoe_poly.intersects(wall.line):
                 hit_walls.append(wall.wall_id)
                 
-        # 4. Extract Hit Terrain (e.g., freezing a puddle)
-        for tz in self.map_data.active_terrain:
+        terrain_candidates = list(self.terrain_idx[vault_path].intersection(aoe_poly.bounds))
+        for cid in terrain_candidates:
+            tz = self._terrain_map[vault_path][cid]
             if tz.polygon and aoe_poly.intersects(tz.polygon):
                 hit_terrains.append(tz.zone_id)
                 
         return hit_entities, hit_walls, hit_terrains
 
-    def get_distance_and_cover(self, source_uuid: uuid.UUID, target_uuid: uuid.UUID) -> Tuple[float, str]:
+    def get_distance_and_cover(self, source_uuid: uuid.UUID, target_uuid: uuid.UUID, vault_path: str = "default") -> Tuple[float, str]:
         """Calculates distance and determines cover (None, Half, Three-Quarters, Total)."""
         if not HAS_GIS: return 0.0, "None"
         
-        source = self._entities.get(source_uuid)
-        target = self._entities.get(target_uuid)
+        self.get_map_data(vault_path)
+        source = self._entities.get(vault_path, {}).get(source_uuid)
+        target = self._entities.get(vault_path, {}).get(target_uuid)
         if not source or not target:
-            # Fallback for purely mathematical combat tests that don't sync spatial data
             return 5.0, "None"
             
-        # 3D Distance calculated via configured metric
-        dist = self.calculate_distance(source.x, source.y, source.z, target.x, target.y, target.z)
+        dist = self.calculate_distance(source.x, source.y, source.z, target.x, target.y, target.z, vault_path)
         
         source_hash = self._get_entity_spatial_hash(source)
         target_hash = self._get_entity_spatial_hash(target)
         cache_key = ("cover", source_hash, target_hash)
         
-        if cache_key in self._raycast_cache:
-            return dist, self._raycast_cache[cache_key]
+        if cache_key in self._raycast_cache.get(vault_path, {}):
+            return dist, self._raycast_cache[vault_path][cache_key]
         
         source_poly = self._get_entity_bbox(source)
         target_poly = self._get_entity_bbox(target)
@@ -532,7 +613,9 @@ class SpatialQueryService:
             for t_corner in target_corners:
                 line = LineString([s_corner, t_corner])
                 blocked = False
-                for wall in self.map_data.active_walls:
+                wall_candidates = list(self.wall_idx[vault_path].intersection(line.bounds))
+                for cid in wall_candidates:
+                    wall = self._wall_map[vault_path][cid]
                     if wall.is_solid and line.intersects(wall.line):
                         min_z = min(source.z, target.z)
                         max_z = max(source.z + getattr(source, 'height', 5.0), target.z + getattr(target, 'height', 5.0))
@@ -545,7 +628,7 @@ class SpatialQueryService:
             if visible_corners > best_visible_corners:
                 best_visible_corners = visible_corners
             if best_visible_corners == 4:
-                break # Cannot get better cover than no cover!
+                break 
                 
         if best_visible_corners == 4:
             cover = "None"
@@ -556,20 +639,20 @@ class SpatialQueryService:
         else:
             cover = "Total"
             
-        self._cache_set(cache_key, cover)
+        self._cache_set(vault_path, cache_key, cover)
         return dist, cover
 
-    def has_line_of_sight(self, source_uuid: uuid.UUID, target_uuid: uuid.UUID) -> bool:
+    def has_line_of_sight(self, source_uuid: uuid.UUID, target_uuid: uuid.UUID, vault_path: str = "default") -> bool:
         """Determines if the center point of the target is visible."""
-        target = self._entities.get(target_uuid)
+        target = self._entities.get(vault_path, {}).get(target_uuid)
         if not target: return False
-        # Check Line of Sight exactly to the center-mass of the target
-        return self.has_line_of_sight_to_point(source_uuid, target.x, target.y, target.z + (getattr(target, 'height', 5.0) / 2.0))
+        return self.has_line_of_sight_to_point(source_uuid, target.x, target.y, target.z + (getattr(target, 'height', 5.0) / 2.0), vault_path)
 
-    def calculate_path_terrain_costs(self, start_x: float, start_y: float, start_z: float, end_x: float, end_y: float, end_z: float) -> Tuple[float, float]:
+    def calculate_path_terrain_costs(self, start_x: float, start_y: float, start_z: float, end_x: float, end_y: float, end_z: float, vault_path: str = "default") -> Tuple[float, float]:
         """Calculates how much of a path traverses normal terrain vs difficult terrain."""
-        total_distance = self.calculate_distance(start_x, start_y, start_z, end_x, end_y, end_z)
-        if not HAS_GIS or not self.map_data.active_terrain:
+        total_distance = self.calculate_distance(start_x, start_y, start_z, end_x, end_y, end_z, vault_path)
+        md = self.get_map_data(vault_path)
+        if not HAS_GIS or not md.active_terrain:
             return total_distance, 0.0
             
         path = LineString([(start_x, start_y), (end_x, end_y)])
@@ -577,7 +660,9 @@ class SpatialQueryService:
         max_z = max(start_z, end_z)
         
         difficult_polys = []
-        for zone in self.map_data.active_terrain:
+        terrain_candidates = list(self.terrain_idx[vault_path].intersection(path.bounds))
+        for cid in terrain_candidates:
+            zone = self._terrain_map[vault_path][cid]
             if zone.is_difficult and (max_z >= zone.z and min_z <= zone.z + max(zone.height, 0.1)):
                 if zone.polygon: difficult_polys.append(zone.polygon)
                     
@@ -598,66 +683,69 @@ class SpatialQueryService:
                 for line in lines:
                     coords = list(line.coords)
                     if len(coords) >= 2:
-                        # Map 2D fractions back onto the 3D path to get exact 3D hypotenuses
                         z1 = start_z + (end_z - start_z) * (path.project(Point(coords[0])) / total_2d)
                         z2 = start_z + (end_z - start_z) * (path.project(Point(coords[-1])) / total_2d)
-                        difficult_distance += self.calculate_distance(coords[0][0], coords[0][1], z1, coords[-1][0], coords[-1][1], z2)
+                        difficult_distance += self.calculate_distance(coords[0][0], coords[0][1], z1, coords[-1][0], coords[-1][1], z2, vault_path)
                         
         difficult_distance = min(difficult_distance, total_distance)
         return total_distance - difficult_distance, difficult_distance
 
-    def check_path_collision(self, start_x: float, start_y: float, start_z: float, end_x: float, end_y: float, end_z: float, entity_height: float = 5.0, check_vision: bool = False) -> Optional[Wall]:
+    def check_path_collision(self, start_x: float, start_y: float, start_z: float, end_x: float, end_y: float, end_z: float, entity_height: float = 5.0, check_vision: bool = False, vault_path: str = "default") -> Optional[Wall]:
         """Returns the Wall object if the straight 3D line between start and end intersects it."""
         if not HAS_GIS: return False
+        self.get_map_data(vault_path)
         
         cache_key = ("path", round(start_x, 1), round(start_y, 1), round(start_z, 1), round(end_x, 1), round(end_y, 1), round(end_z, 1), round(entity_height, 1), check_vision)
-        if cache_key in self._raycast_cache:
-            return self._raycast_cache[cache_key]
+        if cache_key in self._raycast_cache.get(vault_path, {}):
+            return self._raycast_cache[vault_path][cache_key]
             
         path = LineString([(start_x, start_y), (end_x, end_y)])
-        for wall in self.map_data.active_walls:
+        wall_candidates = list(self.wall_idx[vault_path].intersection(path.bounds))
+        for cid in wall_candidates:
+            wall = self._wall_map[vault_path][cid]
             blocks = wall.is_visible if check_vision else wall.is_solid
             if blocks and path.intersects(wall.line):
                 min_z = min(start_z, end_z)
                 max_z = max(start_z, end_z) + entity_height
                 if not (max_z <= wall.z or min_z >= wall.z + wall.height):
-                    self._cache_set(cache_key, wall)
+                    self._cache_set(vault_path, cache_key, wall)
                     return wall
-        self._cache_set(cache_key, False)
+        self._cache_set(vault_path, cache_key, False)
         return None
 
-    def get_illumination(self, target_x: float, target_y: float, target_z: float) -> str:
+    def get_illumination(self, target_x: float, target_y: float, target_z: float, vault_path: str = "default") -> str:
         """Determines the highest level of illumination at a specific point, respecting Line of Sight."""
-        if not HAS_GIS: return "bright" # Default gracefully if engine disabled
+        if not HAS_GIS: return "bright" 
         
+        md = self.get_map_data(vault_path)
         highest_illum = "darkness"
-        for light in self.map_data.active_lights:
+        for light in md.active_lights:
             lx, ly, lz = light.x, light.y, light.z
             if light.attached_to_entity_uuid:
-                ent = self._entities.get(light.attached_to_entity_uuid)
+                ent = self._entities.get(vault_path, {}).get(light.attached_to_entity_uuid)
                 if ent:
                     lx, ly, lz = ent.x, ent.y, ent.z
                     
-            dist = self.calculate_distance(lx, ly, lz, target_x, target_y, target_z)
+            dist = self.calculate_distance(lx, ly, lz, target_x, target_y, target_z, vault_path)
             if dist <= light.dim_radius:
-                # Check Line of Sight from light source to the target point
-                if not self.check_path_collision(lx, ly, lz, target_x, target_y, target_z, entity_height=0.1, check_vision=True):
+                if not self.check_path_collision(lx, ly, lz, target_x, target_y, target_z, entity_height=0.1, check_vision=True, vault_path=vault_path):
                     if dist <= light.bright_radius:
-                        return "bright" # Cannot get brighter than this, return early
+                        return "bright" 
                     highest_illum = "dim"
         return highest_illum
 
-    def has_line_of_sight_to_point(self, source_uuid: uuid.UUID, target_x: float, target_y: float, target_z: float = 0.0) -> bool:
+    def has_line_of_sight_to_point(self, source_uuid: uuid.UUID, target_x: float, target_y: float, target_z: float = 0.0, vault_path: str = "default") -> bool:
         """Checks if a source entity has unbroken line of sight to a specific coordinate from ANY of its corners."""
         if not HAS_GIS: return True
+        self.get_map_data(vault_path)
         
-        source = self._entities.get(source_uuid)
+        source = self._entities.get(vault_path, {}).get(source_uuid)
         if not source: return False
         
         source_hash = self._get_entity_spatial_hash(source)
         cache_key = ("los_point", source_hash, round(target_x, 1), round(target_y, 1), round(target_z, 1))
-        if cache_key in self._raycast_cache:
-            return self._raycast_cache[cache_key]
+        if cache_key in self._raycast_cache.get(vault_path, {}):
+            return self._raycast_cache[vault_path][cache_key]
             
         source_poly = self._get_entity_bbox(source)
         source_corners = list(source_poly.exterior.coords)[:-1]
@@ -665,15 +753,17 @@ class SpatialQueryService:
         for s_corner in source_corners:
             path = LineString([s_corner, (target_x, target_y)])
             corner_blocked = False
-            for wall in self.map_data.active_walls:
+            wall_candidates = list(self.wall_idx[vault_path].intersection(path.bounds))
+            for cid in wall_candidates:
+                wall = self._wall_map[vault_path][cid]
                 if wall.is_visible and path.intersects(wall.line):
                     if not (source.z + getattr(source, 'height', 5.0) <= wall.z or target_z >= wall.z + wall.height):
                         corner_blocked = True
                         break
             if not corner_blocked:
-                self._cache_set(cache_key, True)
-                return True # At least one corner has unbroken LoS!
-        self._cache_set(cache_key, False)
+                self._cache_set(vault_path, cache_key, True)
+                return True 
+        self._cache_set(vault_path, cache_key, False)
         return False
         
     def get_shape_points(self, shape: str, size: float, origin_x: float, origin_y: float, target_x: float = None, target_y: float = None) -> List[Tuple[float, float]]:
@@ -719,27 +809,25 @@ class SpatialQueryService:
             elif aoe_poly.geom_type == 'MultiPolygon': return list(aoe_poly.geoms[0].exterior.coords)
         return []
 
-    def render_ascii_map(self, width: int = 40, height: int = 20) -> str:
+    def render_ascii_map(self, vault_path: str = "default", width: int = 40, height: int = 20) -> str:
         """Generates a simple 2D ASCII graphical representation for the UI or debugging."""
         if not HAS_GIS: return "Map engine disabled."
+        md = self.get_map_data(vault_path)
         grid = [["." for _ in range(width)] for _ in range(height)]
         
-        # Draw Walls (simplified rasterization)
-        for wall in self.map_data.active_walls:
-            sx, sy = int(wall.start[0] / self.map_data.grid_scale), int(wall.start[1] / self.map_data.grid_scale)
-            ex, ey = int(wall.end[0] / self.map_data.grid_scale), int(wall.end[1] / self.map_data.grid_scale)
+        for wall in md.active_walls:
+            sx, sy = int(wall.start[0] / md.grid_scale), int(wall.start[1] / md.grid_scale)
+            ex, ey = int(wall.end[0] / md.grid_scale), int(wall.end[1] / md.grid_scale)
             if 0 <= sx < width and 0 <= sy < height: grid[sy][sx] = "#"
             if 0 <= ex < width and 0 <= ey < height: grid[ey][ex] = "#"
             
-        # Draw Entities
-        for uid, eid in self._uuid_to_id.items():
-            entity = self._entities.get(uid)
+        for uid, eid in self._uuid_to_id.get(vault_path, {}).items():
+            entity = self._entities[vault_path].get(uid)
             if entity:
-                x = int(entity.x / self.map_data.grid_scale)
-                y = int(entity.y / self.map_data.grid_scale)
+                x = int(entity.x / md.grid_scale)
+                y = int(entity.y / md.grid_scale)
                 if 0 <= x < width and 0 <= y < height:
                     char = "P" if "pc" in getattr(entity, 'tags', []) else "E"
-                    # Highlighting in markdown format
                     grid[y][x] = f"**{char}**" 
                     
         return "\n".join([" ".join(row) for row in grid])

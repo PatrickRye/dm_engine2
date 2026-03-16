@@ -40,10 +40,10 @@ def test_calculate_reach_permutations():
 
 @pytest.mark.asyncio
 async def test_execute_melee_attack_reach_enforcement():
-    attacker = Creature(name="Attacker", x=0.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
-    target = Creature(name="Target", x=10.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    attacker = Creature(name="Attacker", vault_path="/mock/vault", x=0.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    target = Creature(name="Target", vault_path="/mock/vault", x=10.0, y=0.0, size=5.0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
     
-    weapon = MeleeWeapon(name="Fists", damage_dice="1d4", damage_type="bludgeoning")
+    weapon = MeleeWeapon(name="Fists", vault_path="/mock/vault", damage_dice="1d4", damage_type="bludgeoning")
     register_entity(weapon)
     attacker.equipped_weapon_uuid = weapon.entity_uuid
     
@@ -87,7 +87,7 @@ def test_propose_move_opportunity_attack_reach(client):
     
     # Player moves from (0,0) to (5,0). Distance to enemy goes from 15 to 10.
     # Enemy reach is 10. Player is entering reach, not leaving. No OA.
-    req1 = {"entity_name": "Player", "waypoints": [[0.0, 0.0], [5.0, 0.0]], "vault_path": "/mock/vault"}
+    req1 = {"entity_name": "Player", "waypoints": [[0.0, 0.0], [5.0, 0.0]], "vault_path": "default"}
     res1 = client.post("/propose_move", json=req1)
     assert "Enemy" not in res1.json()["opportunity_attacks"]
     
@@ -95,7 +95,7 @@ def test_propose_move_opportunity_attack_reach(client):
     # Leaving 10ft reach -> Triggers OA!
     player.x = 5.0
     spatial_service.sync_entity(player)
-    req2 = {"entity_name": "Player", "waypoints": [[5.0, 0.0], [0.0, 0.0]], "vault_path": "/mock/vault"}
+    req2 = {"entity_name": "Player", "waypoints": [[5.0, 0.0], [0.0, 0.0]], "vault_path": "default"}
     res2 = client.post("/propose_move", json=req2)
     assert "Enemy" in res2.json()["opportunity_attacks"]
     
@@ -118,6 +118,6 @@ def test_large_creature_reach(client):
     register_entity(enemy)
     
     # Moving outside the center-to-center threshold of the Large creature triggers OA!
-    req = {"entity_name": "Player", "waypoints": [[5.0, 0.0], [0.0, 0.0]], "vault_path": "/mock/vault"}
+    req = {"entity_name": "Player", "waypoints": [[5.0, 0.0], [0.0, 0.0]], "vault_path": "default"}
     res = client.post("/propose_move", json=req)
     assert "Enemy" in res.json()["opportunity_attacks"]

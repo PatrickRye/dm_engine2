@@ -122,7 +122,7 @@ async def narrator_node(state: DMState, config: RunnableConfig):
     # 1. Check if we are in a revision loop
     feedback_context = ""
     if state.get("qa_feedback") and state["qa_feedback"] != "APPROVED":
-        feedback_context = f"\n\n[QA REJECTION FEEDBACK]: Your previous draft was rejected for the following reason:\n{state['qa_feedback']}\nFix this in your new draft."
+        feedback_context = f"\n\n[QA REJECTION FEEDBACK]: Your previous draft was rejected for the following reason:\n{state['qa_feedback']}\n\nYour rejected draft was:\n\"{state.get('draft_response')}\"\n\nFix this in your new draft."
 
     sys_msg = SystemMessage(content=f"""
     You are the Dungeon Master. Read the history of the current interaction.
@@ -177,12 +177,12 @@ async def qa_node(state: DMState, config: RunnableConfig):
     # --- ESCAPE CLAUSE 1: Allow DM to ask questions without being audited ---
     if draft.strip().startswith("[OOC") or draft.strip().startswith("OOC:"):
         await write_audit_log(vault, "QA Agent", "Bypass", "OOC Clarification detected. Auto-approving.")
-        return {"qa_feedback": "APPROVED"}
+        return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
     
     # --- ESCAPE CLAUSE 2: Max Revisions ---
     if revisions >= 3:
         await write_audit_log(vault, "QA Agent", "Force Approve", "Max revisions reached. Passing to prevent loop.")
-        return {"qa_feedback": "APPROVED"}
+        return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
 
     # --- GATHER CONTEXT (Tools & Mechanical Truths) ---
     recent_tools = []
@@ -250,27 +250,23 @@ async def qa_node(state: DMState, config: RunnableConfig):
     # --- QA INTERCEPT: QA takes over and asks the player directly ---
     if getattr(result, 'requires_clarification', False):
         await write_audit_log(vault, "QA Agent", "Clarification Intercept", result.clarification_message)
+        final_msg = f"**[OOC - Engine Supervisor]:** {result.clarification_message}"
         return {
-            "draft_response": f"**[OOC - Engine Supervisor]:** {result.clarification_message}", 
-            "qa_feedback": "APPROVED" # Approving it forces the graph to end and output this clarification
+            "draft_response": final_msg, 
+            "qa_feedback": "APPROVED", # Approving it forces the graph to end and output this clarification
+            "messages": [AIMessage(content=final_msg)]
         }
     
     elif result.approved:
         await write_audit_log(vault, "QA Agent", "Result", "APPROVED")
-        return {"qa_feedback": "APPROVED"}
+        return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
     
     else:
         await write_audit_log(vault, "QA Agent", "Result", f"REJECTED. Feedback: {result.feedback}")
         
-        # We append a HumanMessage directly to the state's message array, just like your old code!
-        rejection_msg = HumanMessage(
-            content=f"[SYSTEM OVERRIDE - QA REJECTION]: {result.feedback}\n\nYou MUST rewrite your response to fix these explicit errors immediately. DO NOT apologize, DO NOT acknowledge the error, and DO NOT break character. Simply output the newly corrected narrative."
-        )
-        
         return {
             "qa_feedback": result.feedback, 
-            "revision_count": revisions + 1,
-            "messages": [rejection_msg]
+            "revision_count": revisions + 1
         }
  
 
@@ -421,11 +417,11 @@ async def ooc_move_entity_endpoint(request: OOCMoveRequest):
     from tools import _get_entity_by_name
     from vault_io import get_journals_dir, edit_markdown_entity
     
-    entity = _get_entity_by_name(request.entity_name)
+    entity = await _get_entity_by_name(request.entity_name, request.vault_path)
     if not entity: raise HTTPException(status_code=404, detail="Entity not found")
     
-    if request.entity_name in spatial_service.active_paths:
-        del spatial_service.active_paths[request.entity_name]
+    if request.entity_name in spatial_service.active_paths.get(request.vault_path, {}):
+        del spatial_service.active_paths[request.vault_path][request.entity_name]
         
     entity.x, entity.y = round(request.x, 1), round(request.y, 1)
     spatial_service.sync_entity(entity)
@@ -450,14 +446,14 @@ async def ooc_move_entity_endpoint(request: OOCMoveRequest):
 @app.post("/toggle_fow")
 async def toggle_fow_endpoint(request: ToggleFoWRequest):
     """Overwrites the list of characters who bypass Fog of War."""
-    spatial_service.map_data.fow_disabled_for = request.disabled_for
+    spatial_service.get_map_data(request.vault_path).fow_disabled_for = request.disabled_for
     return {"status": "success", "fow_disabled_for": spatial_service.map_data.fow_disabled_for}
 
 @app.post("/clear_path")
 async def clear_path_endpoint(request: ClearPathRequest):
     """Clears a proposed or alternate path from the canvas."""
-    if request.entity_name in spatial_service.active_paths:
-        del spatial_service.active_paths[request.entity_name]
+    if request.entity_name in spatial_service.active_paths.get(request.vault_path, {}):
+        del spatial_service.active_paths[request.vault_path][request.entity_name]
     return {"status": "success"}
 
 @app.post("/ping")
@@ -482,12 +478,12 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
     from tools import _get_entity_by_name, move_entity
     from vault_io import read_markdown_entity, get_journals_dir
 
-    entity = _get_entity_by_name(request.entity_name)
+    entity = await _get_entity_by_name(request.entity_name, request.vault_path)
     if not entity:
         raise HTTPException(status_code=404, detail="Entity not found")
         
-    if request.entity_name in spatial_service.active_paths:
-        del spatial_service.active_paths[request.entity_name]
+    if request.entity_name in spatial_service.active_paths.get(request.vault_path, {}):
+        del spatial_service.active_paths[request.vault_path][request.entity_name]
 
     is_valid = True
     invalid_reason = ""
@@ -495,7 +491,8 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
     traps_triggered = []
     alternative_path = []
     
-    is_in_combat = any(c.lower() == request.entity_name.lower() for c in spatial_service.active_combatants)
+    active_list = spatial_service.active_combatants.get(request.vault_path, [])
+    is_in_combat = any(c.lower() == request.entity_name.lower() for c in active_list)
     # 0. Enforce Combat Turn Order
     combat_file = os.path.join(get_journals_dir(request.vault_path), "ACTIVE_COMBAT.md")
     if os.path.exists(combat_file):
@@ -513,7 +510,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
                         )
         except Exception: pass
     
-    pixels_per_foot = getattr(spatial_service.map_data, 'pixels_per_foot', 1.0)
+    pixels_per_foot = getattr(spatial_service.get_map_data(request.vault_path), 'pixels_per_foot', 1.0)
     foot_waypoints = [(p[0] / pixels_per_foot, p[1] / pixels_per_foot) for p in request.waypoints]
 
     # Discretize path into <= 5ft chunks for precise trigger detection
@@ -521,7 +518,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
     for i in range(1, len(foot_waypoints)):
         start = detailed_path[-1]
         end = foot_waypoints[i]
-        dist = spatial_service.calculate_distance(start[0], start[1], entity.z, end[0], end[1], entity.z)
+        dist = spatial_service.calculate_distance(start[0], start[1], entity.z, end[0], end[1], entity.z, request.vault_path)
         if dist > 5.0:
             num_steps = int(dist // 5.0)
             for s in range(1, num_steps + 1):
@@ -541,7 +538,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
     movement_cost = 0.0
     ignores_dt = any(t.lower() == "ignore_difficult_terrain" for t in getattr(entity, 'tags', []))
     is_disengaging = any(c.name.lower() == "disengage" for c in getattr(entity, 'active_conditions', []))
-    all_entities = get_all_entities()
+    all_entities = get_all_entities(request.vault_path)
 
     executed_waypoints = [detailed_path[0]]
     final_x, final_y = detailed_path[0][0], detailed_path[0][1]
@@ -550,13 +547,13 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
         start = detailed_path[i-1]
         end = detailed_path[i]
         
-        segment_dist = spatial_service.calculate_distance(start[0], start[1], entity.z, end[0], end[1], entity.z)
+        segment_dist = spatial_service.calculate_distance(start[0], start[1], entity.z, end[0], end[1], entity.z, request.vault_path)
         if segment_dist == 0: continue
         
         segment_cost = segment_dist
         path_line = LineString([start, end])
         
-        collision = spatial_service.check_path_collision(start[0], start[1], entity.z, end[0], end[1], entity.z)
+        collision = spatial_service.check_path_collision(start[0], start[1], entity.z, end[0], end[1], entity.z, vault_path=request.vault_path)
         if collision:
             is_valid = False
             invalid_reason = f"Path blocked by {collision.label}."
@@ -568,7 +565,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
             break
             
         if not ignores_dt:
-            for terrain in spatial_service.map_data.active_terrain:
+            for terrain in spatial_service.get_map_data(request.vault_path).active_terrain:
                 if getattr(terrain, 'is_difficult', False):
                     from shapely.geometry import Polygon
                     try:
@@ -590,13 +587,13 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
             
         # Check Known Traps
         trap_hit = None
-        for wall in spatial_service.map_data.active_walls:
+        for wall in spatial_service.get_map_data(request.vault_path).active_walls:
             if getattr(wall, 'trap', None) and getattr(wall.trap, 'known_by_players', False):
                 if path_line.intersects(wall.line):
                     trap_hit = wall.trap.hazard_name
                     break
         if not trap_hit:
-            for terrain in spatial_service.map_data.active_terrain:
+            for terrain in spatial_service.get_map_data(request.vault_path).active_terrain:
                 if getattr(terrain, 'trap', None) and getattr(terrain.trap, 'known_by_players', False):
                     if path_line.intersects(terrain.polygon):
                         trap_hit = terrain.trap.hazard_name
@@ -616,8 +613,8 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
                 base_reach = _calculate_reach(other_entity, is_active_turn=False)
                 eff_reach = base_reach + max(0, (other_entity.size - 5.0) / 2.0) + max(0, (entity.size - 5.0) / 2.0)
                 
-                dist_before = spatial_service.calculate_distance(start[0], start[1], 0, other_entity.x, other_entity.y, 0)
-                dist_after = spatial_service.calculate_distance(end[0], end[1], 0, other_entity.x, other_entity.y, 0)
+                dist_before = spatial_service.calculate_distance(start[0], start[1], 0, other_entity.x, other_entity.y, 0, request.vault_path)
+                dist_after = spatial_service.calculate_distance(end[0], end[1], 0, other_entity.x, other_entity.y, 0, request.vault_path)
                 if dist_before <= eff_reach and dist_after > eff_reach:
                     oa_hit = True
                     opportunity_attacks.append(other_entity.name)
@@ -655,7 +652,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):
             executed = True
         
     if not executed:
-        spatial_service.active_paths[request.entity_name] = {
+        spatial_service.active_paths.setdefault(request.vault_path, {})[request.entity_name] = {
             "entity_name": request.entity_name,
             "waypoints": request.waypoints,
             "alternative_path": alternative_path,
@@ -689,7 +686,7 @@ async def list_characters_endpoint(request: VaultRequest):
                         if content.startswith("---"):
                             parts = content.split("---", 2)
                             if len(parts) >= 3:
-                                yaml_data = yaml.safe_load(parts[1]) or {}
+                                yaml_data = await asyncio.to_thread(yaml.safe_load, parts[1]) or {}
                                 tags = yaml_data.get("tags", [])
                                 if isinstance(tags, str): tags = [tags]
                                 if any(t.lower() in ["pc", "player"] for t in tags):
@@ -717,7 +714,7 @@ async def character_sheet_endpoint(request: CharSheetRequest):
             if content.startswith("---"):
                 parts = content.split("---", 2)
                 if len(parts) >= 3:
-                    return {"sheet": yaml.safe_load(parts[1]) or {}}
+                    return {"sheet": await asyncio.to_thread(yaml.safe_load, parts[1]) or {}}
     except Exception as e:
         return {"error": str(e)}
     return {"error": "Invalid format."}
@@ -741,11 +738,11 @@ async def maps_endpoint():
 @app.post("/map_state")
 async def map_state_endpoint(request: VaultRequest):
     """Exports the rich JSON geometry, image paths, and FoW for the VTT Canvas."""
-    md = spatial_service.map_data
+    md = spatial_service.get_map_data(request.vault_path)
     
     entities = []
     from registry import get_all_entities
-    for uid, ent in get_all_entities().items():
+    for uid, ent in get_all_entities(request.vault_path).items():
         if hasattr(ent, 'x') and hasattr(ent, 'y'):
             is_pc = any(t in getattr(ent, 'tags', []) for t in ["pc", "player"])
             
@@ -782,7 +779,7 @@ async def map_state_endpoint(request: VaultRequest):
         "map_data": md.model_dump(), 
         "entities": entities, 
         "known_traps": known_traps,
-        "active_paths": list(spatial_service.active_paths.values())
+        "active_paths": list(spatial_service.active_paths.get(request.vault_path, {}).values())
     }
 
 @app.post("/heartbeat")
@@ -933,7 +930,7 @@ async def chat_endpoint(request: ChatRequest): # <--- Added async
                             await broadcaster.broadcast(request.client_id, payload)
 
             # 3. Save combat math back to Obsidian files
-            await sync_engine_to_vault()
+            await sync_engine_to_vault(request.vault_path)
             payload = f"data: {json.dumps({'reply': '', 'status': 'done'})}\n\n"
             yield payload
             await broadcaster.broadcast(request.client_id, payload)

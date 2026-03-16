@@ -27,8 +27,8 @@ def test_system_barovian_church_ranged_combat():
     # 1. Setup Environment (Church with pews and rubble)
     pew_wall = Wall(start=(15, 0), end=(15, 10), height=3.0, is_solid=True) # Low wall
     rubble_zone = TerrainZone(points=[(5, -5), (10, -5), (10, 5), (5, 5)], is_difficult=True)
-    spatial_service.map_data.walls.append(pew_wall)
-    spatial_service.map_data.terrain.append(rubble_zone)
+    spatial_service.add_wall(pew_wall)
+    spatial_service.add_terrain(rubble_zone)
     
     # 2. Setup Entities
     ranger = Creature(name="Ireena", x=0, y=0, z=0, hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=14), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=3), speed=30, movement_remaining=30)
@@ -106,7 +106,7 @@ def test_system_feat_ignore_difficult_terrain():
     ranger = Creature(name="Strider", tags=["ignore_difficult_terrain"], x=0, y=0, speed=30, movement_remaining=30, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
     
     zone = TerrainZone(points=[(0, -5), (20, -5), (20, 5), (0, 5)], is_difficult=True)
-    spatial_service.map_data.terrain.append(zone)
+    spatial_service.add_terrain(zone)
     spatial_service.sync_entity(ranger)
     
     move_event = GameEvent(event_type="Movement", source_uuid=ranger.entity_uuid, payload={"target_x": 20, "target_y": 0, "target_z": 0, "movement_type": "walk"})
@@ -191,7 +191,7 @@ async def test_system_dynamic_lighting_and_combat():
     assert atk_event.payload.get("disadvantage") is True # Human can't see target
     
     # 2. Add light via tool & re-attack
-    await manage_light_sources.ainvoke({"action": "add", "label": "Torch", "x": 0, "y": 0, "bright_radius": 20, "dim_radius": 40}, config={"configurable": {"thread_id": "dummy"}})
+    await manage_light_sources.ainvoke({"action": "add", "label": "Torch", "x": 0, "y": 0, "bright_radius": 20, "dim_radius": 40}, config={"configurable": {"thread_id": "default"}})
     atk_event_2 = GameEvent(event_type="MeleeAttack", source_uuid=human.entity_uuid, target_uuid=target.entity_uuid)
     EventBus.dispatch(atk_event_2)
     assert atk_event_2.payload.get("disadvantage") is not True # Environment is now bright
@@ -201,7 +201,8 @@ async def test_system_dynamic_light_movement_and_static_torches():
     """Tests that static torches remain in place while attached lights follow entities."""
     pc = Creature(name="Lightbringer", x=0, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
     spatial_service.sync_entity(pc)
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
+    config = {"configurable": {"thread_id": "default"}}
     
     # Add static torch at (50, 0)
     await manage_light_sources.ainvoke({"action": "add", "label": "Wall Torch", "x": 50, "y": 0, "bright_radius": 20, "dim_radius": 40}, config=config)
@@ -230,7 +231,7 @@ async def test_system_disarm_and_drop_light():
     """Tests that a dropped or disarmed light source stops following the player."""
     pc = Creature(name="Wizard", x=0, y=0, hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
     spatial_service.sync_entity(pc)
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     
     await manage_light_sources.ainvoke({"action": "add", "label": "Magic Staff", "attached_to_entity": "Wizard", "bright_radius": 10, "dim_radius": 20}, config=config)
     
@@ -253,7 +254,7 @@ async def test_system_disarm_and_drop_light():
 @pytest.mark.asyncio
 async def test_system_snuff_light_source():
     """Tests that snuffing a light source instantly plunges the area into darkness."""
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     await manage_light_sources.ainvoke({"action": "add", "label": "Campfire", "x": 0, "y": 0, "bright_radius": 15, "dim_radius": 30}, config=config)
     assert spatial_service.get_illumination(10, 0, 0) == "bright"
     
@@ -263,7 +264,7 @@ async def test_system_snuff_light_source():
 @pytest.mark.asyncio
 async def test_system_spell_illumination_areas():
     """Tests that spells (like Daylight) correctly cast bright and dim light at specific ranges."""
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     # Daylight spell: 60ft bright, additional 60ft dim (120ft total)
     await manage_light_sources.ainvoke({"action": "add", "label": "Daylight Spell", "x": 0, "y": 0, "bright_radius": 60, "dim_radius": 120}, config=config)
     
@@ -289,12 +290,12 @@ async def test_system_stealth_and_hidden_combat():
     # Create dummy file so tool doesn't crash looking for the YAML file
     import os
     from vault_io import get_journals_dir
-    j_dir = get_journals_dir("dummy")
+    j_dir = get_journals_dir("default")
     with open(os.path.join(j_dir, "Rogue.md"), "w") as f:
         f.write("---\nname: Rogue\nactive_conditions: []\n---\n")
         
     # Guard has no darkvision, Rogue applies "Hidden" via tool
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     await toggle_condition.ainvoke({"character_name": "Rogue", "condition_name": "Hidden", "is_active": True}, config=config)
     
     # Verify condition applied
@@ -323,11 +324,11 @@ async def test_system_grapple_contest_success_and_fail():
     
     import os
     from vault_io import get_journals_dir
-    j_dir = get_journals_dir("dummy")
+    j_dir = get_journals_dir("default")
     with open(os.path.join(j_dir, "Bard.md"), "w") as f:
         f.write("---\nname: Bard\nactive_conditions: []\n---\n")
         
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     
     # Test 1: Attacker Wins (Roll 15 vs 5)
     with patch('random.randint', side_effect=[15, 15, 5]):
@@ -357,11 +358,11 @@ async def test_system_shove_movement_direction():
     
     import os
     from vault_io import get_journals_dir
-    j_dir = get_journals_dir("dummy")
+    j_dir = get_journals_dir("default")
     with open(os.path.join(j_dir, "Bard.md"), "w") as f:
         f.write("---\nname: Bard\nactive_conditions: []\n---\n")
         
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     
     with patch('random.randint', side_effect=[15, 15, 5]):
         res = await execute_grapple_or_shove.ainvoke({"attacker_name": "Orc", "target_name": "Bard", "action_type": "shove", "shove_type": "away"}, config=config)
@@ -380,11 +381,11 @@ async def test_system_throw_breaks_grapple_and_knocks_prone():
     
     import os
     from vault_io import get_journals_dir
-    j_dir = get_journals_dir("dummy")
+    j_dir = get_journals_dir("default")
     with open(os.path.join(j_dir, "Bard.md"), "w") as f:
         f.write("---\nname: Bard\nactive_conditions: []\n---\n")
         
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     
     # 1. Attacker successfully grapples Target
     with patch('random.randint', side_effect=[15, 15, 5]):
@@ -488,7 +489,7 @@ async def test_system_trigger_environmental_hazard():
     spatial_service.sync_entity(fighter)
     spatial_service.sync_entity(wizard)
     
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     
     # Trigger a Poison Gas Trap at (5, 0) with a 20ft radius
     # DC 15 Dex save, 4d6 poison, applies 'Poisoned'
@@ -524,7 +525,7 @@ async def test_system_trap_interaction_fail():
     """Tests that failing to pick a trapped lock natively explodes in the PC's face."""
     rogue = Creature(name="Rogue", x=0, y=0, hp=ModifiableValue(base_value=30), ac=ModifiableValue(base_value=15), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=5))
     spatial_service.sync_entity(rogue)
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     
     # 1. Setup Wall and Trap
     wall = Wall(label="Chest", start=(5, 5), end=(5, 5), is_locked=True, interact_dc=20)
@@ -561,7 +562,7 @@ async def test_system_trap_stealth_perception_hook():
     spatial_service.sync_entity(guard_far)
     spatial_service.sync_entity(guard_near)
     
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     
     # Trigger Trap
     with patch('random.randint', return_value=10):
@@ -581,11 +582,11 @@ async def test_system_trap_movement_trigger():
     """Tests that moving through a trapped terrain natively calculates the damage."""
     fighter = Creature(name="Fighter", x=0, y=0, hp=ModifiableValue(base_value=30), ac=ModifiableValue(base_value=18), strength_mod=ModifiableValue(base_value=4), dexterity_mod=ModifiableValue(base_value=-1), speed=30, movement_remaining=30)
     spatial_service.sync_entity(fighter)
-    config = {"configurable": {"thread_id": "dummy"}}
+    config = {"configurable": {"thread_id": "default"}}
     
     # 1. Setup Terrain Zone and Trap
     zone = TerrainZone(label="Suspicious Floor", points=[(5, -5), (15, -5), (15, 5), (5, 5)], is_difficult=False)
-    spatial_service.map_data.terrain.append(zone)
+    spatial_service.add_terrain(zone)
     
     await manage_map_trap.ainvoke({"target_label": "Suspicious Floor", "hazard_name": "Fire Rune", "trigger_on_move": True, "save_required": "dexterity", "save_dc": 15, "damage_dice": "2d6", "damage_type": "fire"}, config=config)
     

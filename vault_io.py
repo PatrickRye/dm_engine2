@@ -2,13 +2,14 @@ import os
 import re
 import yaml
 import math
+import asyncio
 import aiofiles
 import aiofiles.os as aios
 from filelock.asyncio import AsyncSoftFileLock
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool, InjectedToolArg
-from typing import Annotated
+from typing import Annotated, Optional
 from contextlib import asynccontextmanager
 import glob
 from dnd_rules_engine import BaseGameEntity, Creature, ModifiableValue, MeleeWeapon, NumericalModifier, ModifierPriority, ActiveCondition, parse_duration_to_seconds
@@ -88,101 +89,128 @@ async def auto_ingest_maps_from_vault(vault_path: str):
                     print(f"Loaded {os.path.basename(filepath)} into active spatial memory.")
                 except Exception: pass
 
+async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Creature]:
+    """Parses a specific markdown file and hydrates it into the engine registry."""
+    try:
+        yaml_data, _ = await read_markdown_entity_no_lock(filepath)
+        if not yaml_data: return None
+        
+        tags = yaml_data.get("tags", [])
+        # Only load entities that have stats
+        if not any(t in tags for t in ["pc", "npc", "monster", "creature"]):
+            return None
+            
+        entity = Creature(
+            vault_path=vault_path,
+            name=yaml_data.get("name", os.path.basename(filepath).replace(".md", "")),
+            x=float(yaml_data.get("x", 0.0)),
+            y=float(yaml_data.get("y", 0.0)),
+            z=float(yaml_data.get("z", 0.0)),
+            icon_url=yaml_data.get("icon_url", ""),
+            height=float(yaml_data.get("height", yaml_data.get("size", 5.0))),
+            max_hp=int(yaml_data.get("max_hp", yaml_data.get("hp", 10))),
+            hp=ModifiableValue(base_value=yaml_data.get("hp", 10)),
+            ac=ModifiableValue(base_value=yaml_data.get("ac", 10)),
+            strength_mod=ModifiableValue(base_value=yaml_data.get("strength_mod", math.floor((yaml_data.get("strength", yaml_data.get("str", 10)) - 10) / 2))),
+            dexterity_mod=ModifiableValue(base_value=yaml_data.get("dexterity_mod", math.floor((yaml_data.get("dexterity", yaml_data.get("dex", 10)) - 10) / 2))),
+            constitution_mod=ModifiableValue(base_value=yaml_data.get("constitution_mod", math.floor((yaml_data.get("constitution", yaml_data.get("con", 10)) - 10) / 2))),
+            intelligence_mod=ModifiableValue(base_value=yaml_data.get("intelligence_mod", math.floor((yaml_data.get("intelligence", yaml_data.get("int", 10)) - 10) / 2))),
+            wisdom_mod=ModifiableValue(base_value=yaml_data.get("wisdom_mod", math.floor((yaml_data.get("wisdom", yaml_data.get("wis", 10)) - 10) / 2))),
+            charisma_mod=ModifiableValue(base_value=yaml_data.get("charisma_mod", math.floor((yaml_data.get("charisma", yaml_data.get("cha", 10)) - 10) / 2))),
+            spell_save_dc=ModifiableValue(base_value=yaml_data.get("spell_save_dc", 10)),
+            spell_attack_bonus=ModifiableValue(base_value=int(str(yaml_data.get("spell_atk", "0")).replace('+', ''))),
+            active_mechanics=yaml_data.get("active_mechanics", []),
+            resources=yaml_data.get("resources", {}),
+            active_conditions=[ActiveCondition(**c) for c in yaml_data.get("active_conditions", [])] if isinstance(yaml_data.get("active_conditions", []), list) else [],
+            concentrating_on=yaml_data.get("concentrating_on", ""),
+            reaction_used=bool(yaml_data.get("reaction_used", False)),
+            legendary_actions_max=int(yaml_data.get("legendary_actions_max", yaml_data.get("legendary_actions", 0))),
+            legendary_actions_current=int(yaml_data.get("legendary_actions_current", yaml_data.get("legendary_actions", 0))),
+            speed=int(yaml_data.get("speed", 30)),
+            movement_remaining=int(yaml_data.get("movement_remaining", yaml_data.get("speed", 30))),
+            tags=yaml_data.get("tags", [])
+        )
+        
+        # Bridge: Initialize and Equip the Object-Oriented Weapon
+        equipment = yaml_data.get("equipment", {})
+        main_hand = equipment.get("main_hand", "Unarmed")
+        
+        dmg_dice = "1d4" if "Unarmed" in main_hand else "1d8"
+        dmg_type = "bludgeoning" if "Unarmed" in main_hand else "slashing"
+        
+        weapon = MeleeWeapon(name=main_hand, damage_dice=dmg_dice, damage_type=dmg_type, vault_path=vault_path)
+        entity.equipped_weapon_uuid = weapon.entity_uuid
+        
+        for mechanic_name in entity.active_mechanics:
+            entry = await CompendiumManager.get_entry(vault_path, mechanic_name)
+            if entry and entry.mechanics:
+                entity.tags.extend(entry.mechanics.granted_tags)
+                for mod_data in entry.mechanics.modifiers:
+                    target_stat = mod_data.get("stat")
+                    duration_secs = parse_duration_to_seconds(mod_data.get("duration", "-1"))
+                            
+                    if hasattr(entity, target_stat):
+                        stat_obj = getattr(entity, target_stat)
+                        if isinstance(stat_obj, ModifiableValue):
+                            stat_obj.add_modifier(NumericalModifier(
+                                priority=ModifierPriority.ADDITIVE,
+                                value=int(mod_data.get("value", 0)),
+                                source_name=mechanic_name,
+                                duration_seconds=duration_secs
+                            ))
+
+        entity._filepath = filepath 
+        print(f"Loaded to Engine: {entity.name} (HP: {entity.hp.base_value})")
+        
+        spatial_service.sync_entity(entity)
+        return entity
+    except Exception as e:
+        print(f"Failed to load entity {filepath}: {e}")
+        return None
+
 async def initialize_engine_from_vault(vault_path: str):
-    """Reads characters and monsters from the vault into the Deterministic Engine."""
-    
-    # 1. Process Maps
+    """Reads characters and active combatants from the vault into the Deterministic Engine. Employs lazy hydration for everything else."""
     await auto_ingest_maps_from_vault(vault_path)
     
-    print("Loading entities into Deterministic Engine...")
+    print("Loading core entities into Deterministic Engine...")
     clear_registry() # Reset memory for the new turn
     
-    search_pattern = os.path.join(vault_path, "**", "*.md")
-    for filepath in glob.glob(search_pattern, recursive=True):
-        if "Rules" in filepath: continue
-        
+    j_dir = get_journals_dir(vault_path)
+    if not os.path.exists(j_dir): return
+    
+    # 1. Determine active combatants to eagerly load
+    active_combatants = set()
+    combat_file = os.path.join(j_dir, "ACTIVE_COMBAT.md")
+    if os.path.exists(combat_file):
         try:
-            yaml_data, _ = await read_markdown_entity_no_lock(filepath)
-            if not yaml_data: continue
+            yaml_data, _ = await read_markdown_entity_no_lock(combat_file)
+            for c in yaml_data.get("combatants", []):
+                active_combatants.add(c.get("name", "").lower())
+        except Exception: pass
+
+    # 2. Quick scan of Journals to load PCs and active combatants
+    for filename in os.listdir(j_dir):
+        if not filename.endswith(".md"): continue
+        if filename in ["ACTIVE_COMBAT.md", "CAMPAIGN_MASTER.md", "DM_CONFIG.md"]: continue
+        
+        filepath = os.path.join(j_dir, filename)
+        entity_name = filename[:-3].lower()
+        
+        if entity_name in active_combatants:
+            await load_entity_into_engine(filepath, vault_path)
+            continue
             
-            tags = yaml_data.get("tags", [])
-            # Only load entities that have stats
-            if any(t in tags for t in ["pc", "npc", "monster", "creature"]):
-                entity = Creature(
-                    name=yaml_data.get("name", os.path.basename(filepath).replace(".md", "")),
-                    x=float(yaml_data.get("x", 0.0)),
-                    y=float(yaml_data.get("y", 0.0)),
-                    z=float(yaml_data.get("z", 0.0)),
-                    icon_url=yaml_data.get("icon_url", ""),
-                    height=float(yaml_data.get("height", yaml_data.get("size", 5.0))),
-                    max_hp=int(yaml_data.get("max_hp", yaml_data.get("hp", 10))),
-                    hp=ModifiableValue(base_value=yaml_data.get("hp", 10)),
-                    ac=ModifiableValue(base_value=yaml_data.get("ac", 10)),
-                    strength_mod=ModifiableValue(base_value=yaml_data.get("strength_mod", math.floor((yaml_data.get("strength", yaml_data.get("str", 10)) - 10) / 2))),
-                    dexterity_mod=ModifiableValue(base_value=yaml_data.get("dexterity_mod", math.floor((yaml_data.get("dexterity", yaml_data.get("dex", 10)) - 10) / 2))),
-                    constitution_mod=ModifiableValue(base_value=yaml_data.get("constitution_mod", math.floor((yaml_data.get("constitution", yaml_data.get("con", 10)) - 10) / 2))),
-                    intelligence_mod=ModifiableValue(base_value=yaml_data.get("intelligence_mod", math.floor((yaml_data.get("intelligence", yaml_data.get("int", 10)) - 10) / 2))),
-                    wisdom_mod=ModifiableValue(base_value=yaml_data.get("wisdom_mod", math.floor((yaml_data.get("wisdom", yaml_data.get("wis", 10)) - 10) / 2))),
-                    charisma_mod=ModifiableValue(base_value=yaml_data.get("charisma_mod", math.floor((yaml_data.get("charisma", yaml_data.get("cha", 10)) - 10) / 2))),
-                    spell_save_dc=ModifiableValue(base_value=yaml_data.get("spell_save_dc", 10)),
-                    spell_attack_bonus=ModifiableValue(base_value=int(str(yaml_data.get("spell_atk", "0")).replace('+', ''))),
-                    active_mechanics=yaml_data.get("active_mechanics", []),
-                    resources=yaml_data.get("resources", {}),
-                    active_conditions=[ActiveCondition(**c) for c in yaml_data.get("active_conditions", [])] if isinstance(yaml_data.get("active_conditions", []), list) else [],
-                    concentrating_on=yaml_data.get("concentrating_on", ""),
-                    reaction_used=bool(yaml_data.get("reaction_used", False)),
-                    legendary_actions_max=int(yaml_data.get("legendary_actions_max", yaml_data.get("legendary_actions", 0))),
-                    legendary_actions_current=int(yaml_data.get("legendary_actions_current", yaml_data.get("legendary_actions", 0))),
-                    speed=int(yaml_data.get("speed", 30)),
-                    movement_remaining=int(yaml_data.get("movement_remaining", yaml_data.get("speed", 30))),
-                    tags=yaml_data.get("tags", [])
-                )
-                
-                # Bridge: Initialize and Equip the Object-Oriented Weapon
-                equipment = yaml_data.get("equipment", {})
-                main_hand = equipment.get("main_hand", "Unarmed")
-                
-                # Fallback heuristic until compendium item lookup is fully implemented
-                dmg_dice = "1d4" if "Unarmed" in main_hand else "1d8"
-                dmg_type = "bludgeoning" if "Unarmed" in main_hand else "slashing"
-                
-                weapon = MeleeWeapon(name=main_hand, damage_dice=dmg_dice, damage_type=dmg_type)
-                entity.equipped_weapon_uuid = weapon.entity_uuid
-                
-                # Bridge: Hydrate Active Mechanics (Feats/Items) into Modifiers and Tags
-                for mechanic_name in entity.active_mechanics:
-                    entry = await CompendiumManager.get_entry(vault_path, mechanic_name)
-                    if entry and entry.mechanics:
-                        # Apply qualitative tags
-                        entity.tags.extend(entry.mechanics.granted_tags)
-                        
-                        # Apply quantitative modifiers
-                        for mod_data in entry.mechanics.modifiers:
-                            target_stat = mod_data.get("stat")
-                            duration_secs = parse_duration_to_seconds(mod_data.get("duration", "-1"))
-                                    
-                            if hasattr(entity, target_stat):
-                                stat_obj = getattr(entity, target_stat)
-                                if isinstance(stat_obj, ModifiableValue):
-                                    stat_obj.add_modifier(NumericalModifier(
-                                        priority=ModifierPriority.ADDITIVE,
-                                        value=int(mod_data.get("value", 0)),
-                                        source_name=mechanic_name,
-                                        duration_seconds=duration_secs
-                                    ))
+        try:
+            async with aiofiles.open(filepath, 'r', encoding='utf-8') as f:
+                content = await f.read(250) # Just enough to grab tags
+                if "tags:" in content and ("pc" in content.lower() or "player" in content.lower()):
+                    await load_entity_into_engine(filepath, vault_path)
+        except Exception: pass
 
-                # Monkey-patch the filepath onto the object so we know where to save it later
-                entity._filepath = filepath 
-                print(f"Loaded to Engine: {entity.name} (HP: {entity.hp.base_value})")
-                
-                spatial_service.sync_entity(entity)
-        except Exception as e:
-            continue # Skip files that aren't formatted correctly
-
-async def sync_engine_to_vault():
+async def sync_engine_to_vault(vault_path: str):
     """Writes current Engine state (HP, etc.) back to the Obsidian files."""
     print("Syncing Engine state back to Vault...")
-    for uid, entity in get_all_entities().items():
+    for uid, entity in get_all_entities(vault_path).items():
         if not hasattr(entity, '_filepath'): continue
         
         filepath = entity._filepath
@@ -213,7 +241,7 @@ async def sync_engine_to_vault():
             yaml_data["movement_remaining"] = entity.movement_remaining
                 
             # Reconstruct the file
-            new_yaml_str = yaml.dump(yaml_data, sort_keys=False)
+            new_yaml_str = await asyncio.to_thread(yaml.dump, yaml_data, sort_keys=False)
             new_content = f"---\n{new_yaml_str}---\n{markdown_body}"
             
             async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
@@ -240,7 +268,7 @@ async def read_markdown_entity_no_lock(file_path: str) -> tuple[dict, str]:
         parts = content.split("---", 2)
         if len(parts) >= 3:
             try:
-                yaml_data = yaml.safe_load(parts[1]) or {}
+                yaml_data = await asyncio.to_thread(yaml.safe_load, parts[1]) or {}
                 return yaml_data, parts[2]
             except yaml.YAMLError as e:
                 raise ValueError(f"Error: YAML syntax issue in {os.path.basename(file_path)}.") from e
@@ -248,7 +276,7 @@ async def read_markdown_entity_no_lock(file_path: str) -> tuple[dict, str]:
 
 async def write_markdown_entity_no_lock(file_path: str, yaml_data: dict, body_text: str):
     """Writes a markdown file with YAML frontmatter. Must be called within an AsyncSoftFileLock."""
-    new_yaml_str = yaml.dump(yaml_data, sort_keys=False, default_flow_style=False)
+    new_yaml_str = await asyncio.to_thread(yaml.dump, yaml_data, sort_keys=False, default_flow_style=False)
     if body_text.startswith('\n'): 
         body_text = body_text[1:]
     new_content = f"---\n{new_yaml_str}---\n{body_text}"

@@ -22,7 +22,47 @@ import event_handlers
 from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
 from item_system import WeaponItem, ArmorItem, WondrousItem, ItemCompendium
 
-from registry import get_all_entities, register_entity
+from registry import get_all_entities, register_entity, get_entity
+
+class VaultCache:
+    def __init__(self):
+        self.bestiary_cache = {} # vault_path -> [ (filename, content) ]
+        self.chunk_cache = {} # vault_path -> category -> [ (filename, chunk) ]
+        self.indexed_vaults = set()
+        
+    def build_index(self, vault_path: str):
+        if vault_path in self.indexed_vaults: return
+        
+        self.bestiary_cache[vault_path] = []
+        self.chunk_cache[vault_path] = {"rules": [], "modules": [], "bestiary": []}
+        
+        for cat in ["bestiary", "rules", "modules"]:
+            dirs = _get_config_dirs(vault_path, cat)
+            for d in dirs:
+                for root, _, files in os.walk(d):
+                    for file in files:
+                        if file.endswith(".md"):
+                            try:
+                                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
+                                    content = f.read().replace('\r\n', '\n')
+                                    if cat == "bestiary":
+                                        self.bestiary_cache[vault_path].append((file, content))
+                                    
+                                    # Pre-chunk for keyword search
+                                    body = content
+                                    if body.startswith("---"):
+                                        parts = body.split("---", 2)
+                                        if len(parts) >= 3: body = parts[2]
+                                        
+                                    chunks = re.split(r'\n(?=#+ )', body)
+                                    for chunk in chunks:
+                                        if chunk.strip():
+                                            self.chunk_cache[vault_path][cat].append((file, chunk.strip()))
+                                            
+                            except Exception: pass
+        self.indexed_vaults.add(vault_path)
+
+_VAULT_CACHE = VaultCache()
 
 _CHARACTER_AUTOMATIONS = {}
 
@@ -32,11 +72,37 @@ def update_roll_automations(character_name: str, automations: dict):
 def get_roll_automations(character_name: str) -> dict:
     return _CHARACTER_AUTOMATIONS.get(character_name, {"hidden_rolls": True, "saving_throws": True, "skill_checks": True, "attack_rolls": True})
 
-def _get_entity_by_name(name: str) -> Optional[BaseGameEntity]:
-    """Helper to find an active entity in the engine's memory by name."""
-    for uid, entity in get_all_entities().items():
-       if name.lower() in entity.name.lower() or entity.name.lower() in name.lower():
+async def _get_entity_by_name(name: str, vault_path: str) -> Optional[BaseGameEntity]:
+    """Helper to find an active entity in the engine's memory by name, with JIT lazy loading."""
+    from registry import _NAME_INDEX
+    from vault_io import load_entity_into_engine, get_journals_dir
+    
+    name_lower = name.lower().strip()
+    
+    # 1. Check Memory (Fast Path)
+    if vault_path in _NAME_INDEX and name_lower in _NAME_INDEX[vault_path]:
+        return get_entity(_NAME_INDEX[vault_path][name_lower], vault_path)
+        
+    for uid, entity in get_all_entities(vault_path).items():
+        ent_name_lower = entity.name.lower()
+        if name_lower in ent_name_lower or ent_name_lower in name_lower:
             return entity
+            
+    # 2. Just-In-Time (JIT) Hydration (Lazy Load)
+    j_dir = get_journals_dir(vault_path)
+    exact_path = os.path.join(j_dir, f"{name}.md")
+    if os.path.exists(exact_path):
+        ent = await load_entity_into_engine(exact_path, vault_path)
+        if ent: return ent
+        
+    if os.path.exists(j_dir):
+        for filename in os.listdir(j_dir):
+            if filename.endswith(".md"):
+                file_base = filename[:-3].lower()
+                if name_lower in file_base or file_base in name_lower:
+                    ent = await load_entity_into_engine(os.path.join(j_dir, filename), vault_path)
+                    if ent: return ent
+                    
     return None
 
 def _calculate_reach(entity: BaseGameEntity, is_active_turn: bool = False) -> float:
@@ -162,6 +228,7 @@ def _build_pc_template(title: str, details: dict, x: float = 0.0, y: float = 0.0
             f"level: 1\nmax_hp: 10\nac: 10\ngold: 0\ncurrency:\n  cp: 0\n  sp: 0\n  ep: 0\n  gp: 0\n  pp: 0\n"
             f"str: {s_str}\ndex: {s_dex}\ncon: {s_con}\nint: {s_int}\nwis: {s_wis}\ncha: {s_cha}\n"
         f"attunement_slots: 0/3\nattuned_items: []\n"
+            f"attunement_slots: 0/3\nattuned_items: []\n"
             f"equipment:\n"
             f"  armor: Unarmored\n"
             f"  shield: None\n"
@@ -228,8 +295,9 @@ async def execute_melee_attack(attacker_name: str, target_name: str, advantage: 
     Do NOT hallucinate dice rolls or damage. The engine will calculate hit/miss and exact damage.
     Set is_reaction=True for Reactions or Readied Actions. Set is_opportunity_attack=True for Opportunity Attacks. Set is_legendary_action=True for Legendary Actions.
     """
-    attacker = _get_entity_by_name(attacker_name)
-    target = _get_entity_by_name(target_name)
+    vault_path = config["configurable"].get("thread_id")
+    attacker = await _get_entity_by_name(attacker_name, vault_path)
+    target = await _get_entity_by_name(target_name, vault_path)
     
     if not attacker:
         return f"SYSTEM ERROR: Attacker '{attacker_name}' not found in active combat memory."
@@ -237,7 +305,7 @@ async def execute_melee_attack(attacker_name: str, target_name: str, advantage: 
         return f"SYSTEM ERROR: Target '{target_name}' not found in active combat memory."
         
     # --- NEW RANGE VALIDATION ---
-    dist = spatial_service.calculate_distance(attacker.x, attacker.y, attacker.z, target.x, target.y, target.z)
+    dist = spatial_service.calculate_distance(attacker.x, attacker.y, attacker.z, target.x, target.y, target.z, vault_path)
     is_active_turn = not (is_reaction or is_opportunity_attack or is_legendary_action)
     base_reach = _calculate_reach(attacker, is_active_turn=is_active_turn)
     eff_reach = base_reach + max(0, (attacker.size - 5.0) / 2.0) + max(0, (target.size - 5.0) / 2.0)
@@ -267,6 +335,7 @@ async def execute_melee_attack(attacker_name: str, target_name: str, advantage: 
         event_type="MeleeAttack",
         source_uuid=attacker.entity_uuid,
         target_uuid=target.entity_uuid,
+        vault_path=vault_path,
         payload={"advantage": advantage, "disadvantage": disadvantage, "current_initiative": current_init, "is_opportunity_attack": is_opportunity_attack, "manual_roll_total": manual_roll_total, "is_critical": is_critical}
     )
     
@@ -290,13 +359,14 @@ async def execute_melee_attack(attacker_name: str, target_name: str, advantage: 
     return base_msg
 
 @tool
-def modify_health(target_name: str, hp_change: int, reason: str, damage_type: str = "untyped", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def modify_health(target_name: str, hp_change: int, reason: str, damage_type: str = "untyped", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """
     Use this tool to apply guaranteed damage (traps, falling, auto-hit spells) or healing (potions, healing spells).
     Provide a negative hp_change for damage, positive for healing.
     Specify damage_type (e.g., 'fire', 'bludgeoning', 'falling') so the engine can check resistances.
     """
-    target = _get_entity_by_name(target_name)
+    vault_path = config["configurable"].get("thread_id")
+    target = await _get_entity_by_name(target_name, vault_path)
     if not target:
         return f"SYSTEM ERROR: Target '{target_name}' not found."
         
@@ -664,19 +734,19 @@ async def equip_item(character_name: str, item_name: str, item_slot: str, attune
         old_item = await ItemCompendium.load_item(vault_path, old_item_name)
 
     # Sync OO Engine state dynamically if the entity is active in memory
-    engine_creature = _get_entity_by_name(character_name)
+    engine_creature = await _get_entity_by_name(character_name, vault_path)
     if engine_creature and isinstance(engine_creature, Creature):
         if target_slot == "main_hand":
             dmg_dice = "1d4" if "Unarmed" in item_name else "1d8"
             dmg_type = "bludgeoning" if "Unarmed" in item_name else "slashing"
-            new_weapon = MeleeWeapon(name=item_name, damage_dice=dmg_dice, damage_type=dmg_type)
+            new_weapon = MeleeWeapon(name=item_name, damage_dice=dmg_dice, damage_type=dmg_type, vault_path=vault_path)
             if item and isinstance(item, WeaponItem):
-                new_weapon = MeleeWeapon(name=item.name, damage_dice=item.damage_dice, damage_type=item.damage_type)
+                new_weapon = MeleeWeapon(name=item.name, damage_dice=item.damage_dice, damage_type=item.damage_type, vault_path=vault_path)
                 if hasattr(item, 'magic_bonus'): new_weapon.magic_bonus = item.magic_bonus
             else:
                 dmg_dice = "1d4" if "Unarmed" in item_name else "1d8"
                 dmg_type = "bludgeoning" if "Unarmed" in item_name else "slashing"
-                new_weapon = MeleeWeapon(name=item_name, damage_dice=dmg_dice, damage_type=dmg_type)
+                new_weapon = MeleeWeapon(name=item_name, damage_dice=dmg_dice, damage_type=dmg_type, vault_path=vault_path)
             register_entity(new_weapon)
             engine_creature.equipped_weapon_uuid = new_weapon.entity_uuid
         if new_ac_value is not None:
@@ -765,7 +835,7 @@ async def attune_item(character_name: str, item_name: str, action: str = "attune
     except Exception as e:
         return str(e)
         
-    engine_creature = _get_entity_by_name(character_name)
+    engine_creature = await _get_entity_by_name(character_name, vault_path)
     if engine_creature and isinstance(engine_creature, Creature):
         for mod in getattr(item, "modifiers", []):
             if hasattr(engine_creature, mod.stat):
@@ -831,7 +901,7 @@ async def use_expendable_resource(character_name: str, resource_name: str, amoun
 
     # 2. LOCK RELEASED: Safely call the next tool
     # Sync OO Engine state dynamically if the entity is active in memory
-    engine_creature = _get_entity_by_name(character_name)
+    engine_creature = await _get_entity_by_name(character_name, vault_path)
     if engine_creature and isinstance(engine_creature, Creature):
         engine_creature.resources[target_key] = f"{new_val}/{max_val}"
 
@@ -876,7 +946,7 @@ async def level_up_character(character_name: str, class_name: str, hp_increase: 
             new_max_hp = pc_details.hp + hp_increase
             pc_details.hp = new_max_hp
             
-            creature = _get_entity_by_name(character_name)
+            creature = await _get_entity_by_name(character_name, vault_path)
             if not creature or not isinstance(creature, Creature):
                 state["save"] = False
                 return f"Error: Creature '{character_name}' not found in the deterministic engine."
@@ -1047,7 +1117,7 @@ async def perform_ability_check_or_save(character_name: str, skill_or_stat_name:
     base_stat = skill_map.get(clean_skill, clean_skill)
     
     stat_mod = 0
-    engine_creature = _get_entity_by_name(character_name)
+    engine_creature = await _get_entity_by_name(character_name, vault_path)
     
     if engine_creature and isinstance(engine_creature, Creature) and base_stat != "none":
         # 1. PREFERRED: Read from OO Engine to capture live buffs/debuffs
@@ -1282,7 +1352,7 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
         await f.write(f"---\n{yaml_str}---\n\n{dataview_js}")
         
     # Update engine memory
-    spatial_service.active_combatants = [c["name"] for c in combatants]
+    spatial_service.active_combatants[vault_path] = [c["name"] for c in combatants]
     return f"Combat started! {combatants[0]['name']} goes first."
 
 
@@ -1315,7 +1385,7 @@ async def update_combat_state(combatant_name: str = None, hp_change: int = 0, ad
                 interrupts = []
                 for c in combatants:
                     if c["name"] == current_combatant["name"] or c["hp"] <= 0: continue
-                    eng_ent = _get_entity_by_name(c["name"])
+                    eng_ent = await _get_entity_by_name(c["name"], vault_path)
                     if eng_ent and isinstance(eng_ent, Creature) and eng_ent.legendary_actions_current > 0:
                         interrupts.append(f"{c['name']} ({eng_ent.legendary_actions_current} LA left)")
                 
@@ -1337,7 +1407,7 @@ async def update_combat_state(combatant_name: str = None, hp_change: int = 0, ad
                 log_msg.append(f"Turn advanced to {combatants[yaml_data['current_turn_index']]['name']}.")
                 
                 # Reset reactions and legendary actions for the character whose turn is starting
-                new_turn_ent = _get_entity_by_name(combatants[yaml_data['current_turn_index']]['name'])
+                new_turn_ent = await _get_entity_by_name(combatants[yaml_data['current_turn_index']]['name'], vault_path)
                 if new_turn_ent and isinstance(new_turn_ent, Creature):
                     new_turn_ent.reaction_used = False
                     new_turn_ent.legendary_actions_current = new_turn_ent.legendary_actions_max
@@ -1373,13 +1443,14 @@ async def end_combat(*, config: Annotated[RunnableConfig, InjectedToolArg]) -> s
             await update_character_status.ainvoke({"character_name": c["name"], "hp": str(c["hp"]), "resources": "Update Manually", "conditions": conds, "fatigue": "None"}, config)
             
         # Flush in-memory combat states
-        ent = _get_entity_by_name(c["name"])
+        ent = await _get_entity_by_name(c["name"], vault_path)
         if ent and isinstance(ent, Creature):
             ent.reaction_used = False
             ent.legendary_actions_current = getattr(ent, 'legendary_actions_max', 0)
             ent.movement_remaining = ent.speed
             
-    spatial_service.active_combatants.clear()
+    if vault_path in spatial_service.active_combatants:
+        del spatial_service.active_combatants[vault_path]
     os.remove(file_path)
     return "Combat ended successfully. ACTIVE_COMBAT.md removed."
 
@@ -1389,19 +1460,19 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
     Valid movement_type values: 'walk', 'jump', 'climb', 'fly', 'teleport', 'crawl', 'disengage', 'forced', 'fall', 'travel'.
     'walk' and 'crawl' will be blocked by solid walls in a straight line."""
     vault_path = config["configurable"].get("thread_id")
-    entity = _get_entity_by_name(entity_name)
+    entity = await _get_entity_by_name(entity_name, vault_path)
     if not entity: return f"SYSTEM ERROR: Entity '{entity_name}' not found in active memory."
     
     if target_z is None: target_z = entity.z
     old_x, old_y, old_z = entity.x, entity.y, entity.z
     
     dz = target_z - old_z
-    dist_3d = spatial_service.calculate_distance(old_x, old_y, old_z, target_x, target_y, target_z)
+    dist_3d = spatial_service.calculate_distance(old_x, old_y, old_z, target_x, target_y, target_z, vault_path)
     
     # --- Identify Dragged Entities ---
     dragged_entities = []
     if movement_type.lower() not in ["teleport", "fall", "forced"]:
-        for uid, ent in get_all_entities().items():
+        for uid, ent in get_all_entities(vault_path).items():
             if isinstance(ent, Creature):
                 for cond in ent.active_conditions:
                     if cond.name.lower() == "grappled" and cond.source_uuid == entity.entity_uuid:
@@ -1410,7 +1481,7 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
     # --- Check for Wall Collisions ---
     if movement_type.lower() in ["walk", "crawl", "disengage"]:
         if dz > 1.5: return "SYSTEM ERROR: Cannot walk up vertical distances. Use 'jump', 'climb', or 'fly'."
-        blocking_wall = spatial_service.check_path_collision(old_x, old_y, old_z, target_x, target_y, target_z, entity.height)
+        blocking_wall = spatial_service.check_path_collision(old_x, old_y, old_z, target_x, target_y, target_z, entity.height, vault_path=vault_path)
         if blocking_wall:
             str_score = (entity.strength_mod.total * 2) + 10
             run_jump, stand_jump = str_score, str_score // 2
@@ -1429,12 +1500,14 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
             return f"SYSTEM ERROR: Jump exceeds physical limits. Max running long-jump: {str_score}ft. Max running high-jump: {run_high}ft. Call perform_ability_check_or_save for Athletics to push limits."
 
     # --- Determine if in active combat to enforce budget (Paradigm check) ---
-    in_combat = any(c.lower() == entity_name.lower() for c in spatial_service.active_combatants)
+    active_list = spatial_service.active_combatants.get(vault_path, [])
+    in_combat = any(c.lower() == entity_name.lower() for c in active_list)
 
     # --- NEW: Check for Opportunity Attacks via EventBus ---
     event = GameEvent(
         event_type="Movement",
         source_uuid=entity.entity_uuid,
+        vault_path=vault_path,
         payload={"target_x": target_x, "target_y": target_y, "target_z": target_z, "movement_type": movement_type, "dragged_uuids": [e.entity_uuid for e in dragged_entities], "ignore_budget": not in_combat}
     )
     result = EventBus.dispatch(event)
@@ -1492,14 +1565,14 @@ async def move_entity(entity_name: str, target_x: float, target_y: float, target
     # Fallback to alert DM of spatial triggers even if the engine suppressed them (e.g. reaction_used = True)
     # execute_melee_attack will strictly enforce the reaction limits if they try to attack.
     if movement_type.lower() not in ["teleport", "forced", "fall", "disengage"]:
-        for other_entity in get_all_entities().values():
+        for other_entity in get_all_entities(vault_path).values():
             if other_entity.entity_uuid != entity.entity_uuid and hasattr(other_entity, 'hp') and getattr(other_entity.hp, 'base_value', 0) > 0:
                 if other_entity.name not in attackers:
                     base_reach = _calculate_reach(other_entity, is_active_turn=False)
                     eff_reach = base_reach + max(0, (other_entity.size - 5.0) / 2.0) + max(0, (entity.size - 5.0) / 2.0)
                     
-                    dist_before = spatial_service.calculate_distance(old_x, old_y, old_z, other_entity.x, other_entity.y, other_entity.z)
-                    dist_after = spatial_service.calculate_distance(target_x, target_y, target_z, other_entity.x, other_entity.y, other_entity.z)
+                    dist_before = spatial_service.calculate_distance(old_x, old_y, old_z, other_entity.x, other_entity.y, other_entity.z, vault_path)
+                    dist_after = spatial_service.calculate_distance(target_x, target_y, target_z, other_entity.x, other_entity.y, other_entity.z, vault_path)
                     if dist_before <= eff_reach and dist_after > eff_reach:
                         attackers.append(other_entity.name)
 
@@ -1545,29 +1618,21 @@ def _get_config_dirs(vault_path: str, key: str) -> list[str]:
         print(f"Error reading DM_CONFIG.md: {e}")
     return []
 
-def _search_markdown_for_keywords(target_dirs: list[str], query: str, top_n: int = 3) -> str:
-    """Scans all .md files in multiple directories, chunks by headers, and returns the most relevant sections."""
+def _search_markdown_for_keywords(vault_path: str, category: str, query: str, top_n: int = 3) -> str:
+    """Scans in-memory chunks for the most relevant sections."""
+    _VAULT_CACHE.build_index(vault_path)
     keywords = set([w.lower() for w in query.replace(",", "").split() if len(w) > 3])
     if not keywords: keywords = set([query.lower()])
         
     best_chunks = []
+    chunks = _VAULT_CACHE.chunk_cache.get(vault_path, {}).get(category, [])
     
-    for target_dir in target_dirs:
-        for root, _, files in os.walk(target_dir):
-            for file in files:
-                if file.endswith(".md"):
-                    with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if content.startswith("---"):
-                            parts = content.split("---", 2)
-                            if len(parts) >= 3: content = parts[2]
-                                
-                        chunks = re.split(r'\n(?=#+ )', content)
-                        
-                        for chunk in chunks:
-                            score = sum(1 for k in keywords if k in chunk.lower())
-                            if any(k in file.lower() for k in keywords): score += 2 
-                            if score > 0: best_chunks.append((score, file, chunk.strip()))
+    for file, chunk in chunks:
+        chunk_lower = chunk.lower()
+        file_lower = file.lower()
+        score = sum(1 for k in keywords if k in chunk_lower)
+        if any(k in file_lower for k in keywords): score += 2 
+        if score > 0: best_chunks.append((score, file, chunk))
     
     if not best_chunks:
         return f"Cache Miss: No relevant information found for '{query}'."
@@ -1588,73 +1653,66 @@ def query_bestiary(creature_name: str, specific_section: str = "", *, config: An
     Optional `specific_section` (e.g., 'Legendary Actions', 'Lair Actions') focuses the output on that specific block.
     """
     vault_path = config["configurable"].get("thread_id")
-    target_dirs = _get_config_dirs(vault_path, "bestiary")
-    if not target_dirs: return "Error: Bestiary directory not configured in DM_CONFIG.md."
+    _VAULT_CACHE.build_index(vault_path)
     
     search_name = creature_name.lower().strip()
+    files_content = _VAULT_CACHE.bestiary_cache.get(vault_path, [])
     
-    for target_dir in target_dirs:
-        for root, _, files in os.walk(target_dir):
-            for file in files:
-                if not file.endswith(".md"): continue
-                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                    content = f.read().replace('\r\n', '\n')
+    if not files_content:
+        return "Error: Bestiary directory not configured in DM_CONFIG.md."
+        
+    for file, content in files_content:
+        header_pattern = rf"^(#+)\s+.*?(?:\[.*?\]\(.*?\))?.*?{re.escape(search_name)}.*?$"
+        match = re.search(header_pattern, content, re.IGNORECASE | re.MULTILINE)
+        
+        if match:
+            header_level = len(match.group(1))
+            tail = content[match.start():]
+            
+            # Negative lookahead ensures we don't truncate early if Lair/Legendary actions are sibling headers
+            next_header_pattern = re.compile(rf"^#{{1,{header_level}}}\s+(?!.*(?:Lair|Legendary|Mythic|Reactions)).*$", re.MULTILINE | re.IGNORECASE)
+            next_match = next_header_pattern.search(tail, pos=len(match.group(0)))
+            
+            if next_match: body = tail[:next_match.start()].strip()
+            else: body = tail.strip()
+            
+            if specific_section:
+                section_pattern = rf"^(#+)\s+.*?{re.escape(specific_section)}.*?$"
+                sec_match = re.search(section_pattern, body, re.IGNORECASE | re.MULTILINE)
+                if not sec_match:
+                    sec_match = re.search(section_pattern, content, re.IGNORECASE | re.MULTILINE)
+                    if sec_match:
+                        body = content
                 
-                header_pattern = rf"^(#+)\s+.*?(?:\[.*?\]\(.*?\))?.*?{re.escape(search_name)}.*?$"
-                match = re.search(header_pattern, content, re.IGNORECASE | re.MULTILINE)
-                
-                if match:
-                    header_level = len(match.group(1))
-                    tail = content[match.start():]
-                    
-                    # Negative lookahead ensures we don't truncate early if Lair/Legendary actions are sibling headers
-                    next_header_pattern = re.compile(rf"^#{{1,{header_level}}}\s+(?!.*(?:Lair|Legendary|Mythic|Reactions)).*$", re.MULTILINE | re.IGNORECASE)
-                    next_match = next_header_pattern.search(tail, pos=len(match.group(0)))
-                    
-                    if next_match: body = tail[:next_match.start()].strip()
-                    else: body = tail.strip()
-                    
-                    if specific_section:
-                        section_pattern = rf"^(#+)\s+.*?{re.escape(specific_section)}.*?$"
-                        sec_match = re.search(section_pattern, body, re.IGNORECASE | re.MULTILINE)
-                        if not sec_match:
-                            sec_match = re.search(section_pattern, content, re.IGNORECASE | re.MULTILINE)
-                            if sec_match:
-                                body = content
-                        
-                        if sec_match:
-                            sec_level = len(sec_match.group(1))
-                            sec_tail = body[sec_match.start():]
-                            next_sec_pattern = re.compile(rf"^#{{1,{sec_level}}}\s+", re.MULTILINE)
-                            next_sec_match = next_sec_pattern.search(sec_tail, pos=len(sec_match.group(0)))
-                            if next_sec_match:
-                                return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{sec_tail[:next_sec_match.start()].strip()}"[:4000]
-                            else:
-                                return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{sec_tail.strip()}"[:4000]
-                        else:
-                            return f"Cache Miss: '{specific_section}' not found for {creature_name}."
+                if sec_match:
+                    sec_level = len(sec_match.group(1))
+                    sec_tail = body[sec_match.start():]
+                    next_sec_pattern = re.compile(rf"^#{{1,{sec_level}}}\s+", re.MULTILINE)
+                    next_sec_match = next_sec_pattern.search(sec_tail, pos=len(sec_match.group(0)))
+                    if next_sec_match:
+                        return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{sec_tail[:next_sec_match.start()].strip()}"[:4000]
+                    else:
+                        return f"--- {specific_section.upper()} FOR {creature_name.upper()} ---\n{sec_tail.strip()}"[:4000]
+                else:
+                    return f"Cache Miss: '{specific_section}' not found for {creature_name}."
 
-                    return f"--- BESTIARY ENTRY FROM {file} ---\n{body}"[:6000]
+            return f"--- BESTIARY ENTRY FROM {file} ---\n{body}"[:6000]
 
-    return _search_markdown_for_keywords(target_dirs, f"{creature_name} {specific_section}".strip(), top_n=1)
+    return _search_markdown_for_keywords(vault_path, "bestiary", f"{creature_name} {specific_section}".strip(), top_n=1)
 
 @tool
 def query_rulebook(topic: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Searches the local D&D rules directories for game mechanics, spells, and systems."""
     vault_path = config["configurable"].get("thread_id")
-    target_dirs = _get_config_dirs(vault_path, "rules")
-    if not target_dirs: return "Error: Rules directory not configured in DM_CONFIG.md."
-    return _search_markdown_for_keywords(target_dirs, topic, top_n=2)
+    return _search_markdown_for_keywords(vault_path, "rules", topic, top_n=2)
 
 @tool
 def query_campaign_module(search_terms: list[str], current_chapter_context: str = "", *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Searches pre-written campaign modules, lore bibles, and published adventure notes.
     Pass a list of unique nouns and aliases (e.g. ["Strahd", "Zarovich", "Devil"]) to ensure broad coverage."""
     vault_path = config["configurable"].get("thread_id")
-    target_dirs = _get_config_dirs(vault_path, "modules")
-    if not target_dirs: return "Error: Modules directory not configured in DM_CONFIG.md."
     query = f"{current_chapter_context} " + " ".join(search_terms)
-    return _search_markdown_for_keywords(target_dirs, query, top_n=3)
+    return _search_markdown_for_keywords(vault_path, "modules", query, top_n=3)
 
 
 
@@ -1664,7 +1722,7 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
     If the spell is an Area of Effect (AoE) and coordinates are provided, pass target_x, target_y, aoe_shape, and aoe_size. 
     The engine will override 'target_names' and compute the true targets and structural damage using line-of-effect raycasting."""
     vault_path = config["configurable"].get("thread_id")
-    caster = _get_entity_by_name(caster_name)
+    caster = await _get_entity_by_name(caster_name, vault_path)
     if not caster: return f"SYSTEM ERROR: Caster '{caster_name}' not found."
 
     spell_def = await SpellCompendium.load_spell(vault_path, ability_name)
@@ -1718,14 +1776,14 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
             oz = caster.z
             if tz is None: tz = caster.z
             
-        hits, walls, terrains = spatial_service.get_aoe_targets(shape, aoe_size, ox, oy, tx, ty, origin_z=oz, target_z=tz, ignore_walls=ignore_walls, penetrates_destructible=penetrates)
+        hits, walls, terrains = spatial_service.get_aoe_targets(shape, aoe_size, ox, oy, tx, ty, origin_z=oz, target_z=tz, ignore_walls=ignore_walls, penetrates_destructible=penetrates, vault_path=vault_path)
         target_uuids.extend(hits)
         target_wall_ids.extend(walls)
         target_terrain_ids.extend(terrains)
         target_string = f"{aoe_size}ft {shape} at coordinates ({target_x}, {target_y})"
     else:
         for name in (target_names or []):
-            ent = _get_entity_by_name(name)
+            ent = await _get_entity_by_name(name, vault_path)
             if ent: target_uuids.append(ent.entity_uuid)
         target_string = ", ".join(target_names or []) or "themselves"
     
@@ -1740,7 +1798,7 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
     if save_required:
         missing_saves = []
         for t_uid in target_uuids:
-            ent = _get_entity_by_name(next((e.name for e in get_all_entities().values() if e.entity_uuid == t_uid), ""))
+            ent = get_entity(t_uid, vault_path)
             if ent and any(tag in ent.tags for tag in ["pc", "player"]):
                 auto_settings = get_roll_automations(ent.name)
                 if not auto_settings.get("saving_throws", True) and ent.name not in manual_saves and not force_auto_roll:
@@ -1752,6 +1810,7 @@ async def use_ability_or_spell(caster_name: str, ability_name: str, target_names
     event = GameEvent(
         event_type="SpellCast",
         source_uuid=caster.entity_uuid,
+        vault_path=vault_path,
         payload={
             "ability_name": ability_name,
             "mechanics": mechanics_dump,
@@ -1871,13 +1930,14 @@ async def take_rest(character_names: list[str], rest_type: str, *, config: Annot
     
     uuids = []
     for name in character_names:
-        entity = _get_entity_by_name(name)
+        entity = await _get_entity_by_name(name, config["configurable"].get("thread_id"))
         if entity: uuids.append(entity.entity_uuid)
         
     if uuids:
         event = GameEvent(
             event_type="Rest",
             source_uuid=uuids[0], 
+            vault_path=config["configurable"].get("thread_id"),
             payload={"rest_type": rest_type.lower(), "target_uuids": uuids}
         )
         EventBus.dispatch(event)
@@ -1887,7 +1947,8 @@ async def take_rest(character_names: list[str], rest_type: str, *, config: Annot
 @tool
 async def drop_concentration(character_name: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Use this tool to drop a character's concentration on a spell voluntarily or after a failed Constitution save."""
-    entity = _get_entity_by_name(character_name)
+    vault_path = config["configurable"].get("thread_id")
+    entity = await _get_entity_by_name(character_name, vault_path)
     if not entity or not isinstance(entity, Creature):
         return f"SYSTEM ERROR: '{character_name}' not found."
         
@@ -1898,7 +1959,8 @@ async def drop_concentration(character_name: str, *, config: Annotated[RunnableC
     
     event = GameEvent(
         event_type="DropConcentration",
-        source_uuid=entity.entity_uuid
+        source_uuid=entity.entity_uuid,
+        vault_path=vault_path
     )
     EventBus.dispatch(event)
     
@@ -1946,7 +2008,8 @@ async def clear_readied_action(character_name: str, *, config: Annotated[Runnabl
 @tool
 async def use_dash_action(entity_name: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Allows an entity to use their action to double their movement speed for the turn."""
-    entity = _get_entity_by_name(entity_name)
+    vault_path = config["configurable"].get("thread_id")
+    entity = await _get_entity_by_name(entity_name, vault_path)
     if not entity or not isinstance(entity, Creature):
         return f"SYSTEM ERROR: Entity '{entity_name}' not found."
         
@@ -1960,7 +2023,8 @@ async def manage_light_sources(action: str, label: str, x: float = 0.0, y: float
         ent_uuid = None
         ent_msg = ""
         if attached_to_entity:
-            entity = _get_entity_by_name(attached_to_entity)
+            vault_path = config["configurable"].get("thread_id")
+            entity = await _get_entity_by_name(attached_to_entity, vault_path)
             if entity:
                 ent_uuid = entity.entity_uuid
                 x, y, z = entity.x, entity.y, entity.z
@@ -1969,12 +2033,14 @@ async def manage_light_sources(action: str, label: str, x: float = 0.0, y: float
                 return f"SYSTEM ERROR: Entity '{attached_to_entity}' not found."
                 
         new_light = LightSource(label=label, x=x, y=y, z=z, bright_radius=bright_radius, dim_radius=dim_radius, attached_to_entity_uuid=ent_uuid)
-        spatial_service.map_data.lights.append(new_light)
+        vp = config["configurable"].get("thread_id", "default")
+        spatial_service.get_map_data(vp).lights.append(new_light)
         return f"MECHANICAL TRUTH: Added light source '{label}' at ({x}, {y}, {z}){ent_msg} with Bright/Dim radii ({bright_radius}/{dim_radius})."
     elif action.lower() == "remove":
-        initial_count = len(spatial_service.map_data.lights)
-        spatial_service.map_data.lights = [l for l in spatial_service.map_data.lights if l.label.lower() != label.lower()]
-        if len(spatial_service.map_data.lights) < initial_count: return f"MECHANICAL TRUTH: Removed light source '{label}'."
+        vp = config["configurable"].get("thread_id", "default")
+        initial_count = len(spatial_service.get_map_data(vp).lights)
+        spatial_service.get_map_data(vp).lights = [l for l in spatial_service.get_map_data(vp).lights if l.label.lower() != label.lower()]
+        if len(spatial_service.get_map_data(vp).lights) < initial_count: return f"MECHANICAL TRUTH: Removed light source '{label}'."
         return f"SYSTEM ERROR: Light source '{label}' not found."
     return "SYSTEM ERROR: Invalid action. Use 'add' or 'remove'."
 
@@ -1985,17 +2051,18 @@ async def interact_with_object(character_name: str, target_label: str, interacti
     - interaction_type: 'lockpick' (uses Dex), 'force' (uses Str), 'disarm' (uses Dex or Int).
     - stat_used: 'dexterity', 'strength', or 'intelligence'.
     """
-    character = _get_entity_by_name(character_name)
+    vault_path = config["configurable"].get("thread_id")
+    character = await _get_entity_by_name(character_name, vault_path)
     if not character: return f"SYSTEM ERROR: Character '{character_name}' not found."
     
-    target_walls = [w for w in spatial_service.map_data.active_walls if target_label.lower() in w.label.lower()]
+    target_walls = [w for w in spatial_service.get_map_data(vault_path).active_walls if target_label.lower() in w.label.lower()]
     if not target_walls:
         return f"SYSTEM ERROR: No object found matching '{target_label}'. Check the map."
         
     target = target_walls[0]
     
     if not target.is_locked and interaction_type in ["lockpick", "force"]:
-        spatial_service.modify_wall(target.wall_id, is_solid=False, is_visible=True)
+        spatial_service.modify_wall(target.wall_id, is_solid=False, is_visible=True, vault_path=vault_path)
         return f"MECHANICAL TRUTH: {target.label} was not locked. {character.name} simply opened it."
         
     if target.interact_dc is None:
@@ -2015,7 +2082,7 @@ async def interact_with_object(character_name: str, target_label: str, interacti
     
     if total >= target.interact_dc:
         if interaction_type in ["lockpick", "force"]:
-            spatial_service.modify_wall(target.wall_id, is_locked=False, is_solid=False, is_visible=True)
+            spatial_service.modify_wall(target.wall_id, is_locked=False, is_solid=False, is_visible=True, vault_path=vault_path)
             if target.trap: target.trap.is_active = False # Bypassed successfully
             return f"MECHANICAL TRUTH: SUCCESS! {log} The {target.label} is now unlocked and opened."
         else:
@@ -2058,16 +2125,17 @@ async def trigger_environmental_hazard(
     You can target specific entities OR an area (using origin_x, origin_y, radius).
     Automatically resolves attack rolls or saving throws, applies damage/conditions, and checks concentration.
     """
+    vault_path = config["configurable"].get("thread_id", "default")
     manual_saves = manual_saves or {}
     if target_names is None: target_names = []
     
     target_uuids = set()
     for name in target_names:
-        ent = _get_entity_by_name(name)
+        ent = await _get_entity_by_name(name, vault_path)
         if ent: target_uuids.add(ent.entity_uuid)
         
     if origin_x is not None and origin_y is not None and radius is not None:
-        spatial_hits = spatial_service.get_targets_in_radius(origin_x, origin_y, radius)
+        spatial_hits = spatial_service.get_targets_in_radius(origin_x, origin_y, radius, vault_path)
         target_uuids.update(spatial_hits)
         
     if not target_uuids:
@@ -2085,6 +2153,7 @@ async def trigger_environmental_hazard(
             return f"SYSTEM ALERT: The following players have manual saving throws enabled: {', '.join(missing_saves)}. Ask them to roll their {save_required} saving throws (including modifiers) and provide the totals. Then call this tool again with `manual_saves={{'PlayerName': 15, ...}}` or `force_auto_roll=True`."
 
     trap_source = Creature(
+        vault_path=vault_path,
         name=hazard_name,
         tags=["trap"],
         spell_save_dc=ModifiableValue(base_value=save_dc),
@@ -2110,6 +2179,7 @@ async def trigger_environmental_hazard(
     event = GameEvent(
         event_type="SpellCast",
         source_uuid=trap_source.entity_uuid,
+        vault_path=vault_path,
         payload={
             "ability_name": hazard_name,
             "mechanics": mechanics,
@@ -2144,21 +2214,23 @@ async def manage_map_geometry(action: str, label: str = "", start_x: float = 0.0
     - is_temporary: True means the wall is a temporary effect and will be cleared on map reset.
     """
     if action.lower() == "add_wall":
+        vp = config["configurable"].get("thread_id", "default")
         new_wall = Wall(label=label, start=(start_x, start_y), end=(end_x, end_y), z=z, height=height, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked, interact_dc=interact_dc, hp=hp, max_hp=hp, ac=ac)
-        spatial_service.add_wall(new_wall, is_temporary=is_temporary)
+        spatial_service.add_wall(new_wall, is_temporary=is_temporary, vault_path=vp)
         return f"MECHANICAL TRUTH: Added new wall '{label}' from ({start_x}, {start_y}) to ({end_x}, {end_y}). Solid: {is_solid}, Visible: {is_visible}."
         
     elif action.lower() in ["remove_wall", "modify_wall"]:
-        target_walls = [w for w in spatial_service.map_data.active_walls if label.lower() in w.label.lower()]
+        vp = config["configurable"].get("thread_id", "default")
+        target_walls = [w for w in spatial_service.get_map_data(vp).active_walls if label.lower() in w.label.lower()]
         if not target_walls:
             return f"SYSTEM ERROR: No wall found matching label '{label}'. Please check the map or provide a broader label."
             
         target = target_walls[0]
         if action.lower() == "remove_wall":
-            spatial_service.remove_wall(target.wall_id)
+            spatial_service.remove_wall(target.wall_id, vp)
             return f"MECHANICAL TRUTH: Removed wall/obstacle '{target.label}'."
         else:
-            spatial_service.modify_wall(target.wall_id, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked)
+            spatial_service.modify_wall(target.wall_id, is_solid=is_solid, is_visible=is_visible, is_locked=is_locked, vault_path=vp)
             return f"MECHANICAL TRUTH: Modified wall/obstacle '{target.label}'. Solid: {is_solid}, Visible: {is_visible}."
             
     return "SYSTEM ERROR: Invalid action. Use 'add_wall', 'remove_wall', or 'modify_wall'."
@@ -2171,6 +2243,7 @@ async def manage_map_terrain(action: str, label: str = "", center_x: float = 0.0
     - tags: Pass elemental descriptors like 'wet', 'frozen', or 'flammable'.
     """
     from spatial_engine import TerrainZone
+    vp = config["configurable"].get("thread_id", "default")
     if action.lower() == "add":
         tags = tags or []
         points = []
@@ -2179,12 +2252,12 @@ async def manage_map_terrain(action: str, label: str = "", center_x: float = 0.0
             points.append((center_x + radius * math.cos(angle), center_y + radius * math.sin(angle)))
             
         tz = TerrainZone(label=label, points=points, is_difficult=is_difficult, tags=tags)
-        spatial_service.add_terrain(tz, is_temporary=is_temporary)
+        spatial_service.add_terrain(tz, is_temporary=is_temporary, vault_path=vp)
         return f"MECHANICAL TRUTH: Added terrain '{label}' at ({center_x}, {center_y}) with radius {radius}ft. Tags: {tags}."
     elif action.lower() == "remove":
-        target_zones = [t for t in spatial_service.map_data.active_terrain if label.lower() in t.label.lower()]
+        target_zones = [t for t in spatial_service.get_map_data(vp).active_terrain if label.lower() in t.label.lower()]
         if not target_zones: return f"SYSTEM ERROR: Terrain '{label}' not found."
-        spatial_service.remove_terrain(target_zones[0].zone_id)
+        spatial_service.remove_terrain(target_zones[0].zone_id, vp)
         return f"MECHANICAL TRUTH: Removed terrain '{target_zones[0].label}'."
     return "SYSTEM ERROR: Invalid action."
 
@@ -2195,14 +2268,15 @@ async def manage_map_trap(target_label: str, hazard_name: str, trigger_on_intera
     The trap will automatically trigger if someone fails to pick the lock/force it, or if someone moves through it.
     """
     from spatial_engine import TrapDefinition
+    vp = config["configurable"].get("thread_id", "default")
     
     target = None
-    for w in spatial_service.map_data.active_walls:
+    for w in spatial_service.get_map_data(vp).active_walls:
         if target_label.lower() in w.label.lower():
             target = w
             break
     if not target:
-        for t in spatial_service.map_data.active_terrain:
+        for t in spatial_service.get_map_data(vp).active_terrain:
             if target_label.lower() in t.label.lower():
                 target = t
                 break
@@ -2224,13 +2298,14 @@ async def manage_map_trap(target_label: str, hazard_name: str, trigger_on_intera
 @tool
 async def discover_trap(target_label: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
     """Marks a trap as 'known_by_players' after it has been successfully detected."""
+    vp = config["configurable"].get("thread_id", "default")
     target = None
-    for w in spatial_service.map_data.active_walls:
+    for w in spatial_service.get_map_data(vp).active_walls:
         if target_label.lower() in w.label.lower():
             target = w
             break
     if not target:
-        for t in spatial_service.map_data.active_terrain:
+        for t in spatial_service.get_map_data(vp).active_terrain:
             if target_label.lower() in t.label.lower():
                 target = t
                 break
@@ -2247,12 +2322,12 @@ async def toggle_condition(character_name: str, condition_name: str, is_active: 
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
     
-    source_ent = _get_entity_by_name(source_character_name) if source_character_name else None
+    source_ent = await _get_entity_by_name(source_character_name, vault_path) if source_character_name else None
     source_uuid = source_ent.entity_uuid if source_ent else None
     source_name = source_ent.name if source_ent else "Manual"
 
     # Update memory
-    engine_creature = _get_entity_by_name(character_name)
+    engine_creature = await _get_entity_by_name(character_name, vault_path)
     if engine_creature and isinstance(engine_creature, Creature):
         if is_active:
             if not any(c.name.lower() == condition_name.lower() for c in engine_creature.active_conditions):
@@ -2375,8 +2450,9 @@ async def execute_grapple_or_shove(attacker_name: str, target_name: str, action_
     Resolves a contested Athletics check for a Grapple, Shove, or Throw. action_type must be 'grapple', 'shove', or 'throw'.
     The engine automatically calculates the correct Modifiers based on the entities' stats.
     """
-    attacker = _get_entity_by_name(attacker_name)
-    target = _get_entity_by_name(target_name)
+    vault_path = config["configurable"].get("thread_id")
+    attacker = await _get_entity_by_name(attacker_name, vault_path)
+    target = await _get_entity_by_name(target_name, vault_path)
     
     if not attacker or not target:
         return "SYSTEM ERROR: Attacker or Target not found in active memory."
@@ -2500,7 +2576,8 @@ async def ingest_battlemap_json(map_json_str: str, *, config: Annotated[Runnable
             
         map_dict = json.loads(clean_json.strip())
         new_map_data = MapData(**map_dict)
-        spatial_service.load_map(new_map_data)
+        vp = config["configurable"].get("thread_id", "default")
+        spatial_service.load_map(new_map_data, vp)
         
         return f"MECHANICAL TRUTH: Successfully ingested battlemap. Loaded {len(new_map_data.walls)} walls, {len(new_map_data.terrain)} terrain zones, and {len(new_map_data.lights)} light sources."
     except Exception as e:

@@ -53,7 +53,7 @@ def resolve_spell_cast_handler(event: GameEvent):
     # 0. Apply Elemental Interactions to Environment BEFORE resolving entities!
     if target_terrain_ids:
         for tz_id in target_terrain_ids:
-            tz = spatial_service.get_terrain_by_id(tz_id)
+            tz = spatial_service.get_terrain_by_id(tz_id, event.vault_path)
             if not tz: continue
             
             # Fire vs Flammable Thorns/Webs
@@ -76,7 +76,7 @@ def resolve_spell_cast_handler(event: GameEvent):
                 
                 # Deal immediate damage to entities currently caught inside the flammable area
                 if tz.polygon:
-                    for uid, ent in get_all_entities().items():
+                    for uid, ent in get_all_entities(event.vault_path).items():
                         if getattr(ent, 'hp', None) and ent.hp.base_value > 0:
                             ent_poly = spatial_service._get_entity_bbox(ent)
                             if ent_poly and tz.polygon.intersects(ent_poly):
@@ -104,7 +104,7 @@ def resolve_spell_cast_handler(event: GameEvent):
             elif damage_type == "lightning" and "wet" in tz.tags:
                 results.append(f"[Environment] The {tz.label} was electrified by lightning!")
                 if tz.polygon:
-                    for uid, ent in get_all_entities().items():
+                    for uid, ent in get_all_entities(event.vault_path).items():
                         if uid not in target_uuids and getattr(ent, 'hp', None) and ent.hp.base_value > 0:
                             ent_poly = spatial_service._get_entity_bbox(ent)
                             if ent_poly and tz.polygon.intersects(ent_poly):
@@ -121,7 +121,7 @@ def resolve_spell_cast_handler(event: GameEvent):
                 if dist > 0:
                     vx, vy = (dx/dist) * 20.0, (dy/dist) * 20.0
                     tz.points = [(p[0] + vx, p[1] + vy) for p in tz.points]
-                    spatial_service.invalidate_cache()
+                    spatial_service.invalidate_cache(event.vault_path)
                     results.append(f"[Environment] The {tz.label} was blown 20 feet away by the wind!")
 
     for t_uuid in target_uuids:
@@ -152,6 +152,16 @@ def resolve_spell_cast_handler(event: GameEvent):
             has_adv = event.payload.get("advantage", False)
             has_disadv = event.payload.get("disadvantage", False)
             
+            # Evaluate Advanced Condition Framework for Saves
+            active_conds = [c.name.lower() for c in target.active_conditions]
+            auto_fail = False
+            
+            if save_required in ["dexterity", "strength"]:
+                if any(cond in active_conds for cond in ["stunned", "paralyzed", "petrified", "unconscious", "incapacitated"]):
+                    auto_fail = True
+            if save_required == "dexterity" and "restrained" in active_conds:
+                has_disadv = True
+            
             roll1 = random.randint(1, 20)
             roll2 = random.randint(1, 20)
             
@@ -162,7 +172,11 @@ def resolve_spell_cast_handler(event: GameEvent):
             else:
                 save_roll = roll1
                 
-            total_save = save_roll + save_mod_val
+            if auto_fail:
+                total_save = -99  # Guaranteed failure
+                save_roll = 1
+            else:
+                total_save = save_roll + save_mod_val
             dc = caster.spell_save_dc.total
             
             is_success = total_save >= dc
@@ -299,7 +313,7 @@ def resolve_spell_cast_handler(event: GameEvent):
                     duration_seconds=dur_secs,
                     applied_initiative=current_init
                 )
-                spatial_service.add_terrain(tz, is_temporary=True)
+                spatial_service.add_terrain(tz, is_temporary=True, vault_path=event.vault_path)
                 results.append(f"[Environment] A {terrain_def.label} effect was created in the area (Duration: {terrain_def.duration}).")
 
     event.payload["results"] = results
@@ -320,7 +334,7 @@ def resolve_attack_handler(event: GameEvent):
     attack_bonus = attack_mod.total + weapon.magic_bonus
     
     # Evaluate Spatial Logic: Range & Cover
-    dist, cover = spatial_service.get_distance_and_cover(attacker.entity_uuid, target.entity_uuid)
+    dist, cover = spatial_service.get_distance_and_cover(attacker.entity_uuid, target.entity_uuid, event.vault_path)
     if cover == "Total":
         print(f"[Engine] {attacker.name} cannot hit {target.name}. Target has TOTAL COVER.")
         event.payload["hit"] = False
@@ -338,7 +352,7 @@ def resolve_attack_handler(event: GameEvent):
             
         # Check for hostile creatures within 5 feet of the attacker's edge
         check_radius = (attacker.size / 2.0) + 5.0
-        nearby_uuids = spatial_service.get_targets_in_radius(attacker.x, attacker.y, check_radius)
+        nearby_uuids = spatial_service.get_targets_in_radius(attacker.x, attacker.y, check_radius, event.vault_path)
         for uid in nearby_uuids:
             if uid == attacker.entity_uuid:
                 continue
@@ -365,8 +379,8 @@ def resolve_attack_handler(event: GameEvent):
             return
             
     # Evaluate Spatial Logic: Illumination & Visibility
-    attacker_illum = spatial_service.get_illumination(attacker.x, attacker.y, attacker.z)
-    target_illum = spatial_service.get_illumination(target.x, target.y, target.z)
+    attacker_illum = spatial_service.get_illumination(attacker.x, attacker.y, attacker.z, event.vault_path)
+    target_illum = spatial_service.get_illumination(target.x, target.y, target.z, event.vault_path)
     
     def can_perceive(observer: Creature, target_ent: Creature, distance: float, target_illumination: str) -> bool:
         def get_sense_range(sense_name: str) -> float:
@@ -398,6 +412,24 @@ def resolve_attack_handler(event: GameEvent):
     if not target_can_see_attacker:
         print(f"[Engine] {attacker.name} is unseen by {target.name}. Applying ADVANTAGE.")
         event.payload["advantage"] = True
+        
+    # Evaluate Advanced Condition Framework for Attacks
+    attacker_conds = [c.name.lower() for c in attacker.active_conditions]
+    target_conds = [c.name.lower() for c in target.active_conditions]
+
+    if any(c in attacker_conds for c in ["restrained", "poisoned", "prone", "frightened"]):
+        print(f"[Engine] {attacker.name} is hampered by a condition. Applying DISADVANTAGE to attack.")
+        event.payload["disadvantage"] = True
+
+    if any(c in target_conds for c in ["restrained", "stunned", "paralyzed", "petrified", "unconscious", "blinded"]):
+        print(f"[Engine] {target.name} has a debilitating condition. Applying ADVANTAGE to attackers.")
+        event.payload["advantage"] = True
+        
+    if "prone" in target_conds:
+        if dist <= 5.0:
+            event.payload["advantage"] = True
+        else:
+            event.payload["disadvantage"] = True
 
     cover_ac_bonus = 2 if cover == "Half" else (5 if cover == "Three-Quarters" else 0)
     target_ac = target.ac.total + cover_ac_bonus
@@ -468,7 +500,7 @@ def resolve_attack_handler(event: GameEvent):
 
     # --- Sentinel / Protector Reaction Check ---
     protectors = []
-    for uid, pot_protector in get_all_entities().items():
+    for uid, pot_protector in get_all_entities(event.vault_path).items():
         if uid == attacker.entity_uuid or uid == target.entity_uuid: continue
         if not isinstance(pot_protector, Creature) or pot_protector.hp.base_value <= 0: continue
         
@@ -484,7 +516,7 @@ def resolve_attack_handler(event: GameEvent):
         if is_attacker_pc == is_protector_pc: continue
         
         # Must be within 5ft of the attacker
-        dist_to_attacker = spatial_service.calculate_distance(pot_protector.x, pot_protector.y, pot_protector.z, attacker.x, attacker.y, attacker.z)
+        dist_to_attacker = spatial_service.calculate_distance(pot_protector.x, pot_protector.y, pot_protector.z, attacker.x, attacker.y, attacker.z, event.vault_path)
         if dist_to_attacker <= 7.5: # 5ft + diagonal allowance
             protectors.append(pot_protector.name)
             
@@ -552,7 +584,7 @@ def handle_advance_time_event(event: GameEvent):
     target_init = event.payload.get("target_initiative", None)
     if seconds_advanced <= 0: return
     
-    for uid, entity in get_all_entities().items():
+    for uid, entity in get_all_entities(event.vault_path).items():
         if isinstance(entity, Creature):
             # Check all ModifiableValue attributes for temporary modifiers
             for field_name in type(entity).model_fields:
@@ -586,14 +618,14 @@ def handle_advance_time_event(event: GameEvent):
 
     # Expire temporary terrain
     expired_terrains = []
-    for tz in spatial_service.map_data.temporary_terrain:
+    for tz in spatial_service.get_map_data(event.vault_path).temporary_terrain:
         if getattr(tz, "duration_seconds", -1) > 0:
             if target_init is None or getattr(tz, "applied_initiative", 0) == target_init:
                 tz.duration_seconds -= seconds_advanced
                 if tz.duration_seconds <= 0:
                     expired_terrains.append(tz)
     for tz in expired_terrains:
-        spatial_service.remove_terrain(tz.zone_id)
+        spatial_service.remove_terrain(tz.zone_id, event.vault_path)
         print(f"[Engine] Temporary terrain '{tz.label}' has expired and faded away.")
 
 def shield_spell_reaction_handler(event: GameEvent):
@@ -635,7 +667,7 @@ def handle_drop_concentration_event(event: GameEvent):
     spell_name = caster.concentrating_on
     print(f"[Engine] {caster.name} lost concentration on {spell_name}.")
     
-    for uid, entity in get_all_entities().items():
+    for uid, entity in get_all_entities(event.vault_path).items():
         if isinstance(entity, Creature):
             for field_name in type(entity).model_fields:
                 stat_val = getattr(entity, field_name)
@@ -653,9 +685,9 @@ def handle_drop_concentration_event(event: GameEvent):
                 print(f"[Engine] {entity.name} is no longer {cond.name} from {spell_name}.")
                 
     # Remove terrain tied to this caster's concentration spell
-    expired_terrains = [tz for tz in spatial_service.map_data.temporary_terrain if getattr(tz, "source_uuid", None) == caster.entity_uuid and getattr(tz, "source_name", "") == spell_name]
+    expired_terrains = [tz for tz in spatial_service.get_map_data(event.vault_path).temporary_terrain if getattr(tz, "source_uuid", None) == caster.entity_uuid and getattr(tz, "source_name", "") == spell_name]
     for tz in expired_terrains:
-        spatial_service.remove_terrain(tz.zone_id)
+        spatial_service.remove_terrain(tz.zone_id, event.vault_path)
         print(f"[Engine] Temporary terrain '{tz.label}' dissipated as {caster.name} dropped concentration.")
 
     caster.concentrating_on = ""
@@ -695,7 +727,7 @@ def validate_movement_handler(event: GameEvent):
     target_y = event.payload.get("target_y")
     target_z = event.payload.get("target_z", entity.z)
     
-    normal_dist, diff_dist = spatial_service.calculate_path_terrain_costs(entity.x, entity.y, entity.z, target_x, target_y, target_z)
+    normal_dist, diff_dist = spatial_service.calculate_path_terrain_costs(entity.x, entity.y, entity.z, target_x, target_y, target_z, event.vault_path)
     
     # Evaluate Character Traits/Feats/Items
     if "ignore_difficult_terrain" in entity.tags:
@@ -733,18 +765,18 @@ def resolve_movement_handler(event: GameEvent):
     for cond in grappled_conds:
         grappler = get_entity(cond.source_uuid)
         if grappler:
-            dist_after = spatial_service.calculate_distance(grappler.x, grappler.y, grappler.z, target_x, target_y, target_z)
+            dist_after = spatial_service.calculate_distance(grappler.x, grappler.y, grappler.z, target_x, target_y, target_z, event.vault_path)
             if dist_after > 7.5:
                 entity.active_conditions.remove(cond)
                 print(f"[Engine] {entity.name} was moved out of {grappler.name}'s reach. The grapple is broken!")
                 
     # 2. Did the moving entity abandon a grapple they were maintaining? (e.g. Teleporting away without dragging)
     dragged_uuids = event.payload.get("dragged_uuids", [])
-    for uid, other_ent in get_all_entities().items():
+    for uid, other_ent in get_all_entities(event.vault_path).items():
         if isinstance(other_ent, Creature) and uid not in dragged_uuids:
             for cond in other_ent.active_conditions:
                 if cond.name.lower() == "grappled" and cond.source_uuid == entity.entity_uuid:
-                    dist_after = spatial_service.calculate_distance(target_x, target_y, target_z, other_ent.x, other_ent.y, other_ent.z)
+                    dist_after = spatial_service.calculate_distance(target_x, target_y, target_z, other_ent.x, other_ent.y, other_ent.z, event.vault_path)
                     if dist_after > 7.5:
                         other_ent.active_conditions.remove(cond)
                         print(f"[Engine] {entity.name} moved away from {other_ent.name}. The grapple is broken!")
@@ -754,7 +786,7 @@ def resolve_movement_handler(event: GameEvent):
         return
     
     opportunity_attackers = []
-    for uid, potential_attacker in get_all_entities().items():
+    for uid, potential_attacker in get_all_entities(event.vault_path).items():
         if uid == entity.entity_uuid: continue
         if not isinstance(potential_attacker, Creature): continue
         if potential_attacker.hp.base_value <= 0: continue
@@ -780,8 +812,8 @@ def resolve_movement_handler(event: GameEvent):
                 reach = 10.0
         reach *= 1.5 # Diagonal allowance
         
-        dist_before = spatial_service.calculate_distance(potential_attacker.x, potential_attacker.y, potential_attacker.z, entity.x, entity.y, entity.z)
-        dist_after = spatial_service.calculate_distance(potential_attacker.x, potential_attacker.y, potential_attacker.z, target_x, target_y, target_z)
+        dist_before = spatial_service.calculate_distance(potential_attacker.x, potential_attacker.y, potential_attacker.z, entity.x, entity.y, entity.z, event.vault_path)
+        dist_after = spatial_service.calculate_distance(potential_attacker.x, potential_attacker.y, potential_attacker.z, target_x, target_y, target_z, event.vault_path)
         
         if dist_before <= reach and dist_after > reach:
             opportunity_attackers.append(potential_attacker.name)
@@ -800,7 +832,7 @@ def resolve_movement_handler(event: GameEvent):
         
         # Only reveal what isn't blocked by walls (simplified to a radius for now, 
         # true raycast FoW clearing is handled client-side in the Canvas)
-        spatial_service.reveal_fog_of_war(target_x, target_y, vision_radius)
+        spatial_service.reveal_fog_of_war(target_x, target_y, vision_radius, event.vault_path)
 
 def consume_movement_handler(event: GameEvent):
     """Deducts movement speed after a successful, un-cancelled move."""
@@ -829,11 +861,11 @@ def trap_movement_handler(event: GameEvent):
     path = LineString([(entity.x, entity.y), (target_x, target_y)])
     traps_triggered = []
     
-    for wall in spatial_service.map_data.active_walls:
+    for wall in spatial_service.get_map_data(event.vault_path).active_walls:
         if wall.trap and wall.trap.is_active and wall.trap.trigger_on_move and path.intersects(wall.line):
             traps_triggered.append((wall.trap, target_x, target_y))
             
-    for zone in spatial_service.map_data.active_terrain:
+    for zone in spatial_service.get_map_data(event.vault_path).active_terrain:
         if zone.trap and zone.trap.is_active and zone.trap.trigger_on_move and path.intersects(zone.polygon):
             traps_triggered.append((zone.trap, target_x, target_y))
             
@@ -844,7 +876,7 @@ def trap_movement_handler(event: GameEvent):
         
         target_uuids = {entity.entity_uuid}
         if trap.radius > 0:
-            spatial_hits = spatial_service.get_targets_in_radius(ox, oy, trap.radius)
+            spatial_hits = spatial_service.get_targets_in_radius(ox, oy, trap.radius, event.vault_path)
             target_uuids.update(spatial_hits)
             
         trap_source = Creature(
@@ -890,14 +922,14 @@ def trap_noise_handler(event: GameEvent):
             event.payload["results"].append(f"[{triggering_pc.name}] lost their 'Hidden' status from triggering the trap.")
 
     alerted_npcs = []
-    for uid, ent in get_all_entities().items():
+    for uid, ent in get_all_entities(event.vault_path).items():
         if isinstance(ent, Creature) and ent.hp.base_value > 0:
             is_pc = any(t in ent.tags for t in ["pc", "player", "party_npc"])
             if is_pc: continue
             
             dist = 0
             if triggering_pc and HAS_GIS:
-                dist = spatial_service.calculate_distance(ent.x, ent.y, ent.z, triggering_pc.x, triggering_pc.y, triggering_pc.z)
+                dist = spatial_service.calculate_distance(ent.x, ent.y, ent.z, triggering_pc.x, triggering_pc.y, triggering_pc.z, event.vault_path)
                 
             # -1 penalty to passive perception for every 10 ft of distance
             distance_penalty = int(dist // 10)

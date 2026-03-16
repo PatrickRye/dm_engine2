@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from dnd_rules_engine import BaseGameEntity, Creature, MeleeWeapon, EventBus
 from vault_io import initialize_engine_from_vault
-from tools import equip_item, execute_melee_attack, modify_health, perform_ability_check_or_save, level_up_character, move_entity, manage_skill_challenge, create_new_entity
+from tools import equip_item, execute_melee_attack, modify_health, perform_ability_check_or_save, level_up_character, move_entity, manage_skill_challenge, create_new_entity, _get_entity_by_name
 from spatial_engine import spatial_service
 from event_handlers import resolve_attack_handler, apply_damage_handler
 from registry import clear_registry, get_all_entities, get_entity
@@ -60,7 +60,7 @@ async def test_vault_to_engine_initialization(mock_entities):
     vault_path, char_name, target_name = mock_entities
     await initialize_engine_from_vault(vault_path)
     
-    entities = [e for e in get_all_entities().values() if e.name == char_name]
+    entities = [e for e in get_all_entities(vault_path).values() if e.name == char_name]
     assert len(entities) == 1
     tharion: Creature = entities[0]
     
@@ -69,7 +69,7 @@ async def test_vault_to_engine_initialization(mock_entities):
     assert tharion.dexterity_mod.base_value == 1
     
     assert tharion.equipped_weapon_uuid is not None
-    weapon = get_entity(tharion.equipped_weapon_uuid)
+    weapon = get_entity(tharion.equipped_weapon_uuid, vault_path)
     assert isinstance(weapon, MeleeWeapon)
     assert weapon.damage_dice == "1d4"
 
@@ -84,11 +84,11 @@ async def test_tool_to_engine_sync(mock_entities):
     
     assert "Success" in result
     
-    entities = [e for e in get_all_entities().values() if e.name == char_name]
+    entities = [e for e in get_all_entities(vault_path).values() if e.name == char_name]
     tharion: Creature = entities[0]
     assert tharion.ac.base_value == 17 
     
-    weapon = get_entity(tharion.equipped_weapon_uuid)
+    weapon = get_entity(tharion.equipped_weapon_uuid, vault_path)
     assert weapon.name == "Silver Longsword"
     assert weapon.damage_dice == "1d8"
     
@@ -129,7 +129,7 @@ async def test_tool_level_up_character(mock_entities):
     assert "level 3 Fighter" in result
     
     # 1. Verify in-memory entity updated
-    entities = [e for e in get_all_entities().values() if e.name == char_name]
+    entities = [e for e in get_all_entities(vault_path).values() if e.name == char_name]
     tharion: Creature = entities[0]
     
     assert tharion.max_hp == 33
@@ -148,7 +148,7 @@ async def test_tool_ability_check_engine_coupling(mock_entities):
     config = {"configurable": {"thread_id": vault_path}}
     
     # Add an active buff directly to the engine
-    entities = [e for e in get_all_entities().values() if e.name == char_name]
+    entities = [e for e in get_all_entities(vault_path).values() if e.name == char_name]
     tharion: Creature = entities[0]
     from dnd_rules_engine import NumericalModifier, ModifierPriority
     
@@ -168,18 +168,18 @@ async def test_tool_modify_health_concentration_coupling(mock_entities):
     await initialize_engine_from_vault(vault_path)
     config = {"configurable": {"thread_id": vault_path}}
     
-    entities = [e for e in get_all_entities().values() if e.name == char_name]
+    entities = [e for e in get_all_entities(vault_path).values() if e.name == char_name]
     tharion: Creature = entities[0]
     tharion.concentrating_on = "Haste"
     
     # Test 1: Damage triggers alert
-    res = modify_health.invoke({"target_name": char_name, "hp_change": -10, "reason": "Falling"}, config=config)
+    res = await modify_health.ainvoke({"target_name": char_name, "hp_change": -10, "reason": "Falling"}, config=config)
     assert "SYSTEM ALERT" in res
     assert "prompt a Constitution saving throw" in res
     assert tharion.concentrating_on == "Haste" # Still concentrating, waiting on roll
     
     # Test 2: Fatal damage auto-drops
-    res2 = modify_health.invoke({"target_name": char_name, "hp_change": -20, "reason": "Falling"}, config=config)
+    res2 = await modify_health.ainvoke({"target_name": char_name, "hp_change": -20, "reason": "Falling"}, config=config)
     assert "dropped to 0 HP and lost concentration" in res2
     assert tharion.concentrating_on == "" # Dropped automatically!
 
@@ -190,12 +190,12 @@ async def test_tool_modify_health_respects_resistances(mock_entities):
     await initialize_engine_from_vault(vault_path)
     config = {"configurable": {"thread_id": vault_path}}
     
-    entities = [e for e in get_all_entities().values() if e.name == char_name]
+    entities = [e for e in get_all_entities(vault_path).values() if e.name == char_name]
     tharion: Creature = entities[0]
     tharion.resistances.append("fire")
     
     # 20 Fire damage should be halved to 10
-    res = modify_health.invoke({"target_name": char_name, "hp_change": -20, "reason": "Lava Pit", "damage_type": "fire"}, config=config)
+    res = await modify_health.ainvoke({"target_name": char_name, "hp_change": -20, "reason": "Lava Pit", "damage_type": "fire"}, config=config)
     assert "took 10 fire HP" in res
     assert tharion.hp.base_value == 15 # 25 base - 10
 
@@ -211,8 +211,8 @@ async def test_tool_opportunity_attack_integration(mock_entities):
     await initialize_engine_from_vault(vault_path)
     config = {"configurable": {"thread_id": vault_path}}
     
-    tharion = [e for e in get_all_entities().values() if e.name == char_name][0]
-    goblin = [e for e in get_all_entities().values() if e.name == target_name][0]
+    tharion = await _get_entity_by_name(char_name, vault_path)
+    goblin = await _get_entity_by_name(target_name, vault_path)
     
     # Setup spatial positioning (adjacent)
     tharion.x, tharion.y = 0.0, 0.0
@@ -287,7 +287,7 @@ async def test_tool_create_entity_legendary_actions_load(mock_obsidian_vault):
     await initialize_engine_from_vault(vault_path)
     
     # 3. Retrieve from memory and verify
-    entities = [e for e in get_all_entities().values() if e.name == "Ancient_Dragon"]
+    entities = [e for e in get_all_entities(vault_path).values() if e.name == "Ancient_Dragon"]
     assert len(entities) == 1
     dragon: Creature = entities[0]
     

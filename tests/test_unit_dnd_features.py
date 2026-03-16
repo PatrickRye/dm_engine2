@@ -41,24 +41,24 @@ def test_spatial_line_of_sight_and_cover():
     spatial_service.sync_entity(target)
 
     # Create a wall that blocks exactly half the target (Y from 0 to 5)
-    spatial_service.invalidate_cache()
     wall = Wall(start=(5, 0), end=(5, 5), z=0, height=10, is_solid=True)
-    spatial_service.map_data.walls.append(wall)
+    spatial_service.add_wall(wall)
 
     dist, cover = spatial_service.get_distance_and_cover(attacker.entity_uuid, target.entity_uuid)
     assert cover == "Half"  # Partial blockage yields Half cover
 
     # Extend wall to block entirely
+    spatial_service.remove_wall(wall.wall_id)
     wall.start = (5, 5)
     wall.end = (5, -5) # Now perfectly spans Y: 5 to -5, completely covering the 5x5 bounding box
-    spatial_service.invalidate_cache()
+    spatial_service.add_wall(wall)
     dist, cover = spatial_service.get_distance_and_cover(attacker.entity_uuid, target.entity_uuid)
     assert cover == "Total"
 
 def test_spatial_difficult_terrain_overlap():
     """Tests pathing through difficult terrain applies double cost only to the overlap."""
     zone = TerrainZone(points=[(5, -5), (15, -5), (15, 5), (5, 5)], is_difficult=True)
-    spatial_service.map_data.terrain.append(zone)
+    spatial_service.add_terrain(zone)
     
     # Moving from x=0 to x=20 straight across the zone.
     # Path: 0->5 (Normal, 5ft) + 5->15 (Difficult, 10ft * 2) + 15->20 (Normal, 5ft) = 30ft
@@ -69,8 +69,7 @@ def test_spatial_difficult_terrain_overlap():
 def test_spatial_movement_blocked_by_wall():
     """Tests that 3D pathing math accurately detects wall collisions, including vertical bounds."""
     wall = Wall(start=(5, -5), end=(5, 5), z=0, height=10, is_solid=True)
-    spatial_service.map_data.walls.append(wall)
-    spatial_service.invalidate_cache()
+    spatial_service.add_wall(wall)
     
     # 1. Straight path through the wall should collide
     assert spatial_service.check_path_collision(0, 0, 0, 10, 0, 0) is not None
@@ -91,8 +90,7 @@ def test_spatial_illumination_and_walls():
     
     # Add wall blocking LoS to the (10,0,0) point
     wall = Wall(start=(5, -5), end=(5, 5), z=0, height=10, is_solid=True)
-    spatial_service.map_data.walls.append(wall)
-    spatial_service.invalidate_cache()
+    spatial_service.add_wall(wall)
     
     # 4. Behind wall should now be pitch black
     assert spatial_service.get_illumination(10, 0, 0) == "darkness"

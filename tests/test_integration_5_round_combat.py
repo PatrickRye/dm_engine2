@@ -37,7 +37,7 @@ def mock_5_round_vault(mock_obsidian_vault):
             tags = "[pc]"
             if name == "Wizard": tags = "[pc, can_cast_shield]"
             if name == "Thief": tags = "[pc, evasion]"
-            f.write(f"---\nname: {name}\ntags: {tags}\nhp: {hp}\nmax_hp: {hp}\nac: {ac}\nstrength_mod: {str_mod}\ndexterity_mod: {dex_mod}\nequipment: {{main_hand: {weapon}}}\n---\n")
+            f.write(f"---\nname: {name}\ntags: {tags}\nhp: {hp}\nmax_hp: {hp}\nac: {ac}\nstrength_mod: {str_mod}\ndexterity_mod: {dex_mod}\nequipment: {{main_hand: {weapon}}}\nx: 0.0\ny: 0.0\n---\n")
 
     # NPCs
     npc_data = [
@@ -48,7 +48,7 @@ def mock_5_round_vault(mock_obsidian_vault):
     ]
     for name, hp, ac, str_mod, dex_mod, weapon, extra in npc_data:
         with open(os.path.join(journals_dir, f"{name}.md"), "w", encoding="utf-8") as f:
-            f.write(f"---\nname: {name}\ntags: [monster]\nhp: {hp}\nmax_hp: {hp}\nac: {ac}\nstrength_mod: {str_mod}\ndexterity_mod: {dex_mod}\nequipment: {{main_hand: {weapon}}}\n{extra}\n---\n")
+            f.write(f"---\nname: {name}\ntags: [monster]\nhp: {hp}\nmax_hp: {hp}\nac: {ac}\nstrength_mod: {str_mod}\ndexterity_mod: {dex_mod}\nequipment: {{main_hand: {weapon}}}\nx: 30.0\ny: 0.0\n{extra}\n---\n")
             
     with open(os.path.join(journals_dir, "CAMPAIGN_MASTER.md"), "w", encoding="utf-8") as f:
         f.write("---\ntags: [campaign]\n---\n# Campaign Master\n\n## Major Milestones (Event Log)\n- Started.\n")
@@ -77,7 +77,7 @@ async def test_5_round_combat_execution(mock_5_round_vault):
     await initialize_engine_from_vault(vault_path)
     
     # Space everyone out (PCs at 0, Enemies at 30ft away)
-    for e in get_all_entities().values():
+    for e in get_all_entities(vault_path).values():
         if e.name in ["Fighter", "Thief", "Monk", "Wizard"]:
             e.x, e.y = 0, 0
         else:
@@ -87,10 +87,10 @@ async def test_5_round_combat_execution(mock_5_round_vault):
     res = await start_combat.ainvoke({
         "pc_names": ["Fighter", "Thief", "Monk", "Wizard"], 
         "enemies": [
-            {"name": "Troll", "hp": 84, "ac": 15, "dex_mod": 1}, 
-            {"name": "Orc1", "hp": 30, "ac": 13, "dex_mod": 1}, 
-            {"name": "Orc2", "hp": 30, "ac": 13, "dex_mod": 1}, 
-            {"name": "Goblin", "hp": 15, "ac": 15, "dex_mod": 2}
+            {"name": "Troll", "hp": 84, "ac": 15, "dex_mod": 1, "x": 30.0, "y": 0.0},
+            {"name": "Orc1", "hp": 30, "ac": 13, "dex_mod": 1, "x": 30.0, "y": -5.0},
+            {"name": "Orc2", "hp": 30, "ac": 13, "dex_mod": 1, "x": 30.0, "y": -10.0},
+            {"name": "Goblin", "hp": 15, "ac": 15, "dex_mod": 2, "x": 30.0, "y": 5.0}
         ]
     }, config=config)
     assert "Combat started!" in res
@@ -113,7 +113,7 @@ async def test_5_round_combat_execution(mock_5_round_vault):
         
         # Orc1 attacks Wizard -> Wizard casts Shield reaction
         res = await execute_melee_attack.ainvoke({"attacker_name": "Orc1", "target_name": "Wizard"}, config=config)
-        wizard = [e for e in get_all_entities().values() if e.name == "Wizard"][0]
+        wizard = [e for e in get_all_entities(vault_path).values() if e.name == "Wizard"][0]
         assert wizard.reaction_used is True
         await update_combat_state.ainvoke({"next_turn": True}, config=config)
         

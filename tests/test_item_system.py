@@ -31,7 +31,7 @@ async def test_unequip_item_removes_override(setup_engine_and_vault):
         f.write("---\nequipment:\n  head: None\nattuned_items: []\n---")
         
     c = Creature(
-        name="TestChar", x=0, y=0,
+        name="TestChar", vault_path=vault_path, x=0, y=0,
         hp=ModifiableValue(base_value=10),
         ac=ModifiableValue(base_value=10),
         strength_mod=ModifiableValue(base_value=0),
@@ -78,7 +78,7 @@ async def test_unattune_item_removes_override(setup_engine_and_vault):
         f.write("---\nequipment:\n  ring1: None\nattuned_items: []\n---")
         
     c = Creature(
-        name="TestChar", x=0, y=0, 
+        name="TestChar", vault_path=vault_path, x=0, y=0, 
         hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), 
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
@@ -112,7 +112,7 @@ async def test_wondrous_item_casts_spell(setup_engine_and_vault):
     vault_path = setup_engine_and_vault
     
     caster = Creature(
-        name="Mage", x=0, y=0, 
+        name="Mage", vault_path=vault_path, x=0, y=0, 
         hp=ModifiableValue(base_value=10), ac=ModifiableValue(base_value=10), 
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
@@ -122,7 +122,7 @@ async def test_wondrous_item_casts_spell(setup_engine_and_vault):
         charisma_mod=ModifiableValue(base_value=0)
     )
     target = Creature(
-        name="Goblin", x=10, y=0, 
+        name="Goblin", vault_path=vault_path, x=10, y=0, 
         hp=ModifiableValue(base_value=30), ac=ModifiableValue(base_value=10), 
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
@@ -163,6 +163,87 @@ async def test_wondrous_item_casts_spell(setup_engine_and_vault):
     assert target.hp.base_value == 0
 
 @pytest.mark.asyncio
+async def test_wondrous_item_charge_variants(setup_engine_and_vault):
+    """
+    Test WondrousItems casting spells with different usage limits:
+    1. Unlimited uses.
+    2. Total limited uses (consumable charges).
+    3. Rechargeable uses.
+    """
+    vault_path = setup_engine_and_vault
+    
+    # 1. Unlimited Uses
+    unlimited_item = WondrousItem(
+        name="Wand of Unlimited Sparks",
+        active_mechanics=SpellMechanics(damage_dice="1d4", damage_type="lightning")
+    )
+    
+    # 2. Total Limited Uses (no recharge)
+    limited_item = WondrousItem(
+        name="Amulet of Limited Power",
+        charges=3,
+        max_charges=3,
+        consume_on_use=True,
+        active_mechanics=SpellMechanics(damage_dice="2d4", damage_type="force")
+    )
+
+    # 3. Rechargeable Uses
+    recharge_item = WondrousItem(
+        name="Staff of the Morning",
+        charges=5,
+        max_charges=5,
+        recharge_condition="Recharges 1d4+1 charges daily at dawn.",
+        active_mechanics=SpellMechanics(damage_dice="8d6", damage_type="radiant")
+    )
+
+    # Save to Compendium
+    await ItemCompendium.save_item(vault_path, unlimited_item)
+    await ItemCompendium.save_item(vault_path, limited_item)
+    await ItemCompendium.save_item(vault_path, recharge_item)
+
+    # Assert correct loading and properties for Unlimited
+    loaded_unlimited = await ItemCompendium.load_item(vault_path, "Wand of Unlimited Sparks")
+    assert loaded_unlimited.charges is None
+    assert loaded_unlimited.recharge_condition == ""
+
+    # Assert correct loading and properties for Total Limited
+    loaded_limited = await ItemCompendium.load_item(vault_path, "Amulet of Limited Power")
+    assert loaded_limited.charges == 3
+    assert loaded_limited.max_charges == 3
+    assert loaded_limited.consume_on_use is True
+    assert loaded_limited.recharge_condition == ""
+
+    # Assert correct loading and properties for Rechargeable
+    loaded_recharge = await ItemCompendium.load_item(vault_path, "Staff of the Morning")
+    assert loaded_recharge.charges == 5
+    assert loaded_recharge.max_charges == 5
+    assert "dawn" in loaded_recharge.recharge_condition
+
+    # Verify they can be used via the standard ability tool natively
+    caster = Creature(name="Mage", vault_path=vault_path, hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    target = Creature(name="Goblin", vault_path=vault_path, hp=ModifiableValue(base_value=50), ac=ModifiableValue(base_value=10), strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0))
+    register_entity(caster)
+    register_entity(target)
+    
+    config = {"configurable": {"thread_id": vault_path}}
+
+    with patch('event_handlers.roll_dice', return_value=10):
+        # Cast Unlimited
+        res1 = await use_ability_or_spell.ainvoke({"caster_name": "Mage", "ability_name": "Wand of Unlimited Sparks", "target_names": ["Goblin"]}, config=config)
+        assert "Wand of Unlimited Sparks" in res1
+        assert target.hp.base_value == 40  # 50 - 10
+        
+        # Cast Limited
+        res2 = await use_ability_or_spell.ainvoke({"caster_name": "Mage", "ability_name": "Amulet of Limited Power", "target_names": ["Goblin"]}, config=config)
+        assert "Amulet of Limited Power" in res2
+        assert target.hp.base_value == 30  # 40 - 10
+        
+        # Cast Rechargeable
+        res3 = await use_ability_or_spell.ainvoke({"caster_name": "Mage", "ability_name": "Staff of the Morning", "target_names": ["Goblin"]}, config=config)
+        assert "Staff of the Morning" in res3
+        assert target.hp.base_value == 20  # 30 - 10
+
+@pytest.mark.asyncio
 async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault):
     """
     Test that equipping a WeaponItem creates a MeleeWeapon entity with the
@@ -176,7 +257,7 @@ async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault):
         f.write("---\nequipment:\n  main_hand: None\n---")
         
     fighter = Creature(
-        name="Fighter", x=0, y=0, 
+        name="Fighter", vault_path=vault_path, x=0, y=0, 
         hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=15), 
         strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0),
         constitution_mod=ModifiableValue(base_value=0),
@@ -185,7 +266,7 @@ async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault):
         charisma_mod=ModifiableValue(base_value=0)
     )
     target = Creature(
-        name="Goblin", x=5, y=0, 
+        name="Goblin", vault_path=vault_path, x=5, y=0, 
         hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=12), 
         strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0),
         constitution_mod=ModifiableValue(base_value=0),
@@ -214,7 +295,7 @@ async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault):
     weapon_uuid = fighter.equipped_weapon_uuid
     assert weapon_uuid is not None
     
-    weapon_entity = get_entity(weapon_uuid)
+    weapon_entity = get_entity(weapon_uuid, vault_path)
     assert isinstance(weapon_entity, MeleeWeapon)
     assert weapon_entity.magic_bonus == 2
     
@@ -245,7 +326,7 @@ async def test_armor_item_restrictions(setup_engine_and_vault):
         f.write("---\nspecies: Elf\nalignment: chaotic neutral\nclasses: [{class_name: Rogue, level: 3}]\ndexterity: 18\nstrength: 8\nequipment:\n  armor: None\nattuned_items: []\n---")
         
     rogue = Creature(
-        name="Rogue", x=0, y=0, 
+        name="Rogue", vault_path=vault_path, x=0, y=0, 
         hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=14), 
         strength_mod=ModifiableValue(base_value=-1), dexterity_mod=ModifiableValue(base_value=4),
         constitution_mod=ModifiableValue(base_value=0),
