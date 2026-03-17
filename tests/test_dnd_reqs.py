@@ -5,7 +5,7 @@ import uuid
 from dnd_rules_engine import Creature, ModifiableValue, GameEvent, EventBus, MeleeWeapon
 from spatial_engine import spatial_service
 from registry import clear_registry, register_entity
-from tools import execute_melee_attack, move_entity
+from tools import execute_melee_attack, move_entity, toggle_condition
 import event_handlers  # Ensure handlers are loaded
 import os
 from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
@@ -190,6 +190,7 @@ async def test_req_edg_012_and_cnd_022_start_of_turn_thp(mock_obsidian_vault):
     """
     vault_path = str(mock_obsidian_vault)
     config = {"configurable": {"thread_id": vault_path}}
+    from tools import toggle_condition
 
     fighter = Creature(
         name="Fighter",
@@ -825,6 +826,102 @@ async def test_req_cnd_021_end_of_turn_saves(mock_obsidian_vault, mock_dice):
 
     assert "succeeded on their end-of-turn wisdom save" in res_succ
     assert not any(c.name == "Frightened" for c in fighter.active_conditions)
+
+
+@pytest.mark.asyncio
+async def test_req_cnd_024_start_of_turn_saves(mock_obsidian_vault, mock_dice):
+    """
+    REQ-CND-024: Repeating Saves (Start of Turn)
+    Entities with conditions like a Vampire's Charm roll to break free at the start of their turn.
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+    from tools import toggle_condition, start_combat, update_combat_state
+
+    fighter = Creature(
+        name="Fighter",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        wisdom_mod=ModifiableValue(base_value=2),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    register_entity(fighter)
+
+    # Apply Charmed with a Wisdom save DC 15 at the START of turn
+    await toggle_condition.ainvoke(
+        {
+            "character_name": "Fighter",
+            "condition_name": "Charmed",
+            "is_active": True,
+            "save_required": "wisdom",
+            "save_dc": 15,
+            "save_timing": "start"
+        },
+        config=config,
+    )
+
+    import os
+    from vault_io import get_journals_dir
+    j_dir = get_journals_dir(vault_path)
+    os.makedirs(j_dir, exist_ok=True)
+    with open(os.path.join(j_dir, "Fighter.md"), "w") as f:
+        f.write("---\nname: Fighter\n---")
+
+    await start_combat.ainvoke({"pc_names": ["Fighter"], "enemies": []}, config=config)
+
+    with mock_dice(default=2):
+        res_fail = await update_combat_state.ainvoke({"next_turn": True}, config=config)
+    assert "failed their start-of-turn wisdom save" in res_fail
+    assert any(c.name == "Charmed" for c in fighter.active_conditions)
+
+    with mock_dice(default=15):
+        res_succ = await update_combat_state.ainvoke({"next_turn": True}, config=config)
+    assert "succeeded on their start-of-turn wisdom save" in res_succ
+    assert not any(c.name == "Charmed" for c in fighter.active_conditions)
+
+
+@pytest.mark.asyncio
+async def test_req_cnd_023_end_of_turn_damage(mock_obsidian_vault, mock_roll_dice):
+    """
+    REQ-CND-023: End of Turn Damage
+    Entities with conditions like Burning take damage automatically at the end of their turn.
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    fighter = Creature(
+        name="Fighter",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    register_entity(fighter)
+
+    # Apply Burning with 1d4 fire damage at the end of turn
+    from tools import toggle_condition
+
+    await toggle_condition.ainvoke(
+        {
+            "character_name": "Fighter",
+            "condition_name": "Burning",
+            "is_active": True,
+            "end_of_turn_damage_dice": "1d4",
+            "end_of_turn_damage_type": "fire",
+        },
+        config=config,
+    )
+
+    # Dispatch EndOfTurn
+    with mock_roll_dice(default=4):  # Force the 1d4 to roll 4
+        eot_event = GameEvent(event_type="EndOfTurn", source_uuid=fighter.entity_uuid, vault_path=vault_path)
+        res = EventBus.dispatch(eot_event)
+
+    assert any("took 4 fire damage from Burning" in r for r in res.payload.get("results", []))
+    assert fighter.hp.base_value == 16
 
 
 @pytest.mark.asyncio

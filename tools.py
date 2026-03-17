@@ -3205,6 +3205,8 @@ async def interact_with_object(
                 target.trap.is_active = False  # Bypassed successfully
             return f"MECHANICAL TRUTH: SUCCESS! {log} The {target.label} is now unlocked and opened."
         else:
+            if target.trap and not target.trap.is_disarmable:
+                return f"MECHANICAL TRUTH: FAILURE! {log} The {target.label} cannot be conventionally disarmed (it may be a magical effect)."
             if target.trap:
                 target.trap.is_active = False
             return f"MECHANICAL TRUTH: SUCCESS! {log} The {target.label} is safely disarmed/resolved."
@@ -3468,6 +3470,7 @@ async def manage_map_trap(
     trigger_on_move: bool = False,
     trigger_on_turn_start: bool = False,
     is_persistent: bool = False,
+    is_disarmable: bool = True,
     requires_attack_roll: bool = False,
     attack_bonus: int = 5,
     save_required: str = "",
@@ -3514,6 +3517,7 @@ async def manage_map_trap(
         trigger_on_move=trigger_on_move,
         trigger_on_turn_start=trigger_on_turn_start,
         is_persistent=is_persistent,
+        is_disarmable=is_disarmable,
         radius=radius,
     )
     return f"MECHANICAL TRUTH: Successfully trapped '{target.label}' with '{hazard_name}'."
@@ -3549,7 +3553,10 @@ async def toggle_condition(  # noqa: C901
     source_character_name: str = None,
     save_required: str = "",
     save_dc: int = 0,
+    save_timing: str = "end",
     start_of_turn_thp: int = 0,
+    end_of_turn_damage_dice: str = "",
+    end_of_turn_damage_type: str = "",
     *,
     config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
@@ -3573,7 +3580,10 @@ async def toggle_condition(  # noqa: C901
                         source_uuid=source_uuid,
                         save_required=save_required.lower(),
                         save_dc=save_dc,
+                        save_timing=save_timing.lower(),
                         start_of_turn_thp=start_of_turn_thp,
+                        end_of_turn_damage_dice=end_of_turn_damage_dice,
+                        end_of_turn_damage_type=end_of_turn_damage_type.lower(),
                     )
                 )
 
@@ -3601,7 +3611,10 @@ async def toggle_condition(  # noqa: C901
                             "applied_initiative": 0,
                             "save_required": save_required.lower(),
                             "save_dc": save_dc,
+                            "save_timing": save_timing.lower(),
                             "start_of_turn_thp": start_of_turn_thp,
+                            "end_of_turn_damage_dice": end_of_turn_damage_dice,
+                            "end_of_turn_damage_type": end_of_turn_damage_type.lower(),
                         }
                         if source_uuid:
                             new_cond["source_uuid"] = str(source_uuid)

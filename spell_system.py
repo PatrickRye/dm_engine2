@@ -9,7 +9,10 @@ class AppliedCondition(BaseModel):
     condition: str
     duration: str = "-1"
     end_of_turn_save: bool = False
+    start_of_turn_save: bool = False
     start_of_turn_thp: int = 0
+    end_of_turn_damage_dice: str = ""
+    end_of_turn_damage_type: str = ""
 
 
 class StatModifier(BaseModel):

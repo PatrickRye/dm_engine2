@@ -228,7 +228,10 @@ class ActiveCondition(BaseModel):
     source_uuid: Optional[uuid.UUID] = None
     save_required: str = ""
     save_dc: int = 0
+    save_timing: str = "end"
     start_of_turn_thp: int = 0
+    end_of_turn_damage_dice: str = ""
+    end_of_turn_damage_type: str = ""
 
 
 class Creature(BaseGameEntity):

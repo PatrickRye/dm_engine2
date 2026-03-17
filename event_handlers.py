@@ -279,7 +279,10 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                 cond_name = cond_data.condition
                 duration_secs = parse_duration_to_seconds(cond_data.duration)
                 eot_save = getattr(cond_data, "end_of_turn_save", False)
+                s_timing = "start" if getattr(cond_data, "start_of_turn_save", False) else "end"
                 sot_thp = getattr(cond_data, "start_of_turn_thp", 0)
+                eot_dmg_dice = getattr(cond_data, "end_of_turn_damage_dice", "")
+                eot_dmg_type = getattr(cond_data, "end_of_turn_damage_type", "")
                 s_req = save_required if eot_save else ""
                 s_dc = dc if eot_save else 0
 
@@ -292,7 +295,10 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                         source_uuid=caster.entity_uuid,
                         save_required=s_req,
                         save_dc=s_dc,
+                        save_timing=s_timing,
                         start_of_turn_thp=sot_thp,
+                        end_of_turn_damage_dice=eot_dmg_dice,
+                        end_of_turn_damage_type=eot_dmg_type.lower(),
                     )
                 )
                 results.append(f"[{target.name}] is now {cond_name}!")
@@ -1435,20 +1441,13 @@ def terrain_condition_sync_handler(event: GameEvent):
             ent.active_conditions.remove(deafened_cond)
 
 
-def end_of_turn_save_handler(event: GameEvent):
-    """Processes repeating saving throws at the end of a creature's turn."""
-    if event.status != EventStatus.EXECUTION:
-        return
-
-    entity = get_entity(event.source_uuid)
-    if not isinstance(entity, Creature):
-        return
-
-    conditions_to_remove = []
+def _evaluate_repeating_saves(entity: Creature, timing: str) -> list:
+    """Calculates all repeating saving throws for a specific timing phase (start/end)."""
     results = []
+    conditions_to_remove = []
 
     for cond in entity.active_conditions:
-        if cond.save_required and cond.save_dc > 0:
+        if cond.save_required and cond.save_dc > 0 and getattr(cond, "save_timing", "end") == timing:
             save_mod = (
                 getattr(entity, f"{cond.save_required}_mod").total if hasattr(entity, f"{cond.save_required}_mod") else 0
             )
@@ -1474,16 +1473,65 @@ def end_of_turn_save_handler(event: GameEvent):
 
             if total_save >= cond.save_dc:
                 conditions_to_remove.append(cond)
-                results.append(
-                    f"[Engine] {entity.name} succeeded on their end-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) and is no longer {cond.name}."
-                )
+                results.append(f"[Engine] {entity.name} succeeded on their {timing}-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) and is no longer {cond.name}.")
             else:
-                results.append(
-                    f"[Engine] {entity.name} failed their end-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) against {cond.name}."
-                )
+                results.append(f"[Engine] {entity.name} failed their {timing}-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) against {cond.name}.")
 
     for cond in conditions_to_remove:
         entity.active_conditions.remove(cond)
+
+    return results
+
+
+def end_of_turn_save_handler(event: GameEvent):
+    """Processes repeating saving throws at the end of a creature's turn."""
+    if event.status != EventStatus.EXECUTION:
+        return
+
+    entity = get_entity(event.source_uuid)
+    if not isinstance(entity, Creature):
+        return
+
+    results = []
+
+    for cond in entity.active_conditions:
+        # 1. Apply End of Turn Damage First
+        if cond.end_of_turn_damage_dice:
+            dmg = roll_dice(cond.end_of_turn_damage_dice)
+            if dmg > 0:
+                dmg_type = cond.end_of_turn_damage_type.lower()
+                is_magically_silenced = any(
+                    c.name.lower() == "silenced" and "silence" in c.source_name.lower() for c in entity.active_conditions
+                )
+                if dmg_type in entity.immunities or (dmg_type == "thunder" and is_magically_silenced):
+                    dmg = 0
+                elif dmg_type in entity.vulnerabilities:
+                    dmg *= 2
+                elif dmg_type in entity.resistances:
+                    dmg //= 2
+
+                if dmg > 0 and entity.temp_hp > 0:
+                    if dmg >= entity.temp_hp:
+                        dmg -= entity.temp_hp
+                        entity.temp_hp = 0
+                    else:
+                        entity.temp_hp -= dmg
+                        dmg = 0
+
+                entity.hp.base_value -= dmg
+                results.append(
+                    f"[Engine] {entity.name} took {dmg} {dmg_type} damage from {cond.name} (HP: {entity.hp.base_value})."
+                )
+
+                if entity.hp.base_value <= 0 and entity.concentrating_on:
+                    EventBus.dispatch(
+                        GameEvent(event_type="DropConcentration", source_uuid=entity.entity_uuid, vault_path=event.vault_path)
+                    )
+
+    # 2. Saving Throws
+    save_results = _evaluate_repeating_saves(entity, "end")
+    if save_results:
+        results.extend(save_results)
 
     if results:
         event.payload.setdefault("results", []).extend(results)
@@ -1559,6 +1607,11 @@ def start_of_turn_handler(event: GameEvent):
                 BaseGameEntity.remove(trap_source.entity_uuid)
                 if "results" in trap_result.payload:
                     results.extend(trap_result.payload["results"])
+
+    # Evaluate Start of Turn Saves
+    save_results = _evaluate_repeating_saves(entity, "start")
+    if save_results:
+        results.extend(save_results)
 
     if results:
         event.payload.setdefault("results", []).extend(results)

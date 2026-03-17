@@ -37,6 +37,7 @@ class TrapDefinition(BaseModel):
     trigger_on_move: bool = False
     trigger_on_turn_start: bool = False
     is_persistent: bool = False
+    is_disarmable: bool = True
     radius: float = 0.0
     is_active: bool = True
     known_by_players: bool = False
