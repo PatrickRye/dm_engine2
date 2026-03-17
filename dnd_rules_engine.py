@@ -122,6 +122,9 @@ class Weapon(BaseGameEntity):
     cost: str = "0 gp"
     weight: float = 0.0
     magic_bonus: int = 0
+    mastery_name: str = ""
+    on_hit_mechanics: Optional[Dict[str, Any]] = None
+    on_miss_mechanics: Optional[Dict[str, Any]] = None
 
     def get_attack_modifier(self, wielder: "Creature") -> ModifiableValue:
         if WeaponProperty.FINESSE in self.properties:
@@ -223,11 +226,15 @@ class ActiveCondition(BaseModel):
     source_name: str = "Unknown"
     applied_initiative: int = 0
     source_uuid: Optional[uuid.UUID] = None
+    save_required: str = ""
+    save_dc: int = 0
+    start_of_turn_thp: int = 0
 
 
 class Creature(BaseGameEntity):
     max_hp: int = 10
     hp: ModifiableValue
+    temp_hp: int = 0
     ac: ModifiableValue
     strength_mod: ModifiableValue
     dexterity_mod: ModifiableValue
@@ -254,6 +261,10 @@ class Creature(BaseGameEntity):
     legendary_actions_current: int = 0
     speed: int = 30
     movement_remaining: int = 30
+    exhaustion_level: int = 0
+    spell_slots_expended_this_turn: int = 0
+    summoned_by_uuid: Optional[uuid.UUID] = None
+    summon_spell: str = ""
 
     @property
     def character_level(self) -> int:
@@ -361,7 +372,15 @@ DICE_REGEX = re.compile(r"(\d+)d(\d+)(?:\s*([+-])\s*(\d+))?")
 
 def roll_dice(notation: str) -> int:
     """Parses and rolls generic D&D dice formulas (e.g., '1d8', '2d6+3')."""
-    match = DICE_REGEX.match(notation.strip().lower())
+    notation = str(notation).strip().lower()
+    if not notation:
+        return 0
+
+    # Support flat integers being passed as dice natively
+    if re.match(r"^[+-]?\d+$", notation):
+        return int(notation)
+
+    match = DICE_REGEX.match(notation)
     if not match:
         return 0
 

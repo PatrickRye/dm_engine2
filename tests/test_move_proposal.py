@@ -62,7 +62,10 @@ def test_propose_valid_move(client):
 
 
 def test_propose_invalid_move_wall_collision(client):
-    """Tests that a move is invalidated if it collides with a wall."""
+    """
+    Tests that a move is invalidated if it collides with a wall.
+    [Mapped: REQ-SPC-001]
+    """
     wall = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=True)
     spatial_service.add_wall(wall)
 
@@ -77,7 +80,10 @@ def test_propose_invalid_move_wall_collision(client):
 
 
 def test_propose_move_triggers_opportunity_attack(client):
-    """Tests that moving away from an adjacent enemy correctly flags an opportunity attack."""
+    """
+    Tests that moving away from an adjacent enemy correctly flags an opportunity attack.
+    [Mapped: REQ-ACT-006]
+    """
     # Position player and enemy next to each other
     player = get_entity_by_name("Player")
     enemy = get_entity_by_name("Enemy")
@@ -99,7 +105,10 @@ def test_propose_move_triggers_opportunity_attack(client):
 
 
 def test_propose_move_within_reach_no_opportunity_attack(client):
-    """Tests that moving around an enemy (staying within reach) does not trigger an opportunity attack."""
+    """
+    Tests that moving around an enemy (staying within reach) does not trigger an opportunity attack.
+    [Mapped: REQ-ACT-006]
+    """
     player = get_entity_by_name("Player")
     enemy = get_entity_by_name("Enemy")
     player.x, player.y = 5.0, 5.0
@@ -124,7 +133,10 @@ def test_propose_move_within_reach_no_opportunity_attack(client):
 
 
 def test_propose_move_with_disengage_condition(client):
-    """Tests that moving away with the Disengage condition suppresses opportunity attacks."""
+    """
+    Tests that moving away with the Disengage condition suppresses opportunity attacks.
+    [Mapped: REQ-CLS-017, REQ-ACT-006]
+    """
     player = get_entity_by_name("Player")
     enemy = get_entity_by_name("Enemy")
     player.x, player.y = 5.0, 5.0
@@ -146,7 +158,10 @@ def test_propose_move_with_disengage_condition(client):
 
 
 def test_propose_move_difficult_terrain_cost(client, tmp_path):
-    """Tests that difficult terrain appropriately increases movement cost and invalidates if it exceeds remaining speed."""
+    """
+    Tests that difficult terrain appropriately increases movement cost and invalidates if it exceeds remaining speed.
+    [Mapped: REQ-COR-003]
+    """
     vault_path = str(tmp_path)
 
     # Set in-memory combat state
@@ -217,7 +232,10 @@ def test_propose_move_difficult_terrain_cost(client, tmp_path):
 
 
 def test_propose_move_unknown_trap_auto_executes(client):
-    """Tests that moving through an unknown trap is considered valid and auto-executes (triggering the trap)."""
+    """
+    Tests that moving through an unknown trap is considered valid and auto-executes (triggering the trap).
+    [Mapped: REQ-EDG-001]
+    """
 
     wall = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=False)
     wall.trap = TrapDefinition(hazard_name="Hidden Pit", known_by_players=False)
@@ -232,7 +250,10 @@ def test_propose_move_unknown_trap_auto_executes(client):
 
 
 def test_propose_move_known_trap_prompts(client):
-    """Tests that moving through a KNOWN trap is valid, but halts execution to ask for confirmation."""
+    """
+    Tests that moving through a KNOWN trap is valid, but halts execution to ask for confirmation.
+    [Mapped: REQ-EDG-001]
+    """
     wall = Wall(start=(5.0, -5.0), end=(5.0, 5.0), is_solid=False)
     wall.trap = TrapDefinition(hazard_name="Spike Trap", known_by_players=True)
     spatial_service.add_wall(wall)
@@ -246,7 +267,10 @@ def test_propose_move_known_trap_prompts(client):
 
 
 def test_movement_interruption_on_oa(client, tmp_path):
-    """Tests that movement budget is exactly deducted up until the interruption point, and tests zero-speed resume logic."""
+    """
+    Tests that movement budget is exactly deducted up until the interruption point, and tests zero-speed resume logic.
+    [Mapped: REQ-ACT-002, REQ-ACT-006]
+    """
     vault_path = str(tmp_path)
 
     spatial_service.active_combatants[vault_path] = ["Player", "Enemy"]

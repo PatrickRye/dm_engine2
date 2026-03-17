@@ -35,6 +35,7 @@ def test_fireball_inner_corner():
     """
     Test a fireball thrown into the inner corner of a large square room
     with infinitely strong walls. The explosion should only be a 90-degree wedge.
+    [Mapped: REQ-SPL-008]
     """
     # Create an L-shaped corner at (0,0) opening into the top-right quadrant (+x, +y)
     wall1 = Wall(label="North Wall", start=(0, 0), end=(50, 0), is_solid=True, hp=9999)
@@ -60,6 +61,7 @@ def test_fireball_convex_corner():
     """
     Test a fireball thrown at the convex corner of a square building made of
     infinitely strong walls. The area should be a 3/4 circle (270 degrees).
+    [Mapped: REQ-SPL-008, REQ-SPL-007]
     """
     # Building occupies the bottom-left quadrant (-X, -Y). The corner is at (0,0).
     wall1 = Wall(label="South Face", start=(0, 0), end=(-50, 0), is_solid=True, hp=9999)
@@ -85,6 +87,7 @@ def test_cone_of_cold_column():
     """
     Test a cone of cold cast at an enemy hiding directly behind a column.
     The hiding enemy is safe, but an exposed enemy is hit.
+    [Mapped: REQ-SPL-010]
     """
     # Small 4ft column at (0, 10) acting as a blockage in front of the target
     col = Wall(label="Stone Column", start=(-2, 10), end=(2, 10), is_solid=True, hp=9999)
@@ -101,10 +104,11 @@ def test_cone_of_cold_column():
     assert c_exposed.entity_uuid in hits, "Enemy beside the column should be hit."
 
 
-def test_fireball_destructible_wall():
+def test_fireball_destructible_wall(mock_roll_dice):
     """
     Test a fireball hitting a 50ft wooden wall made of 10x 5ft sections (10hp each, fire vulnerability).
     The middle 40ft (8 sections) are destroyed, leaving 1 section on each side intact.
+    [Mapped: REQ-OBJ-002]
     """
     wall_ids = []
     # Build a 50ft wall out of 10x 5-foot sections along the X axis from -25 to +25
@@ -132,7 +136,7 @@ def test_fireball_destructible_wall():
     # We must fire a SpellCast event so the engine's resolve_spell_cast_handler natively applies the geometric damage
     mechanics = {"damage_dice": "8d6", "damage_type": "fire", "save_required": "dexterity"}
 
-    with patch("event_handlers.roll_dice", return_value=28):  # 28 * 2 (vulnerability) = 56 fire damage!
+    with mock_roll_dice(default=28):  # 28 * 2 (vulnerability) = 56 fire damage!
         event = GameEvent(
             event_type="SpellCast",
             source_uuid=caster.entity_uuid,
@@ -154,8 +158,11 @@ def test_fireball_destructible_wall():
         assert active_walls[wall_ids[i]].max_hp == 10
 
 
-def test_fireball_destructible_chest():
-    """Test an AoE completely shattering an item sitting on the ground."""
+def test_fireball_destructible_chest(mock_roll_dice):
+    """
+    Test an AoE completely shattering an item sitting on the ground.
+    [Mapped: REQ-OBJ-002]
+    """
     # Create a 5x5 box mimicking a chest
     chest = Wall(label="Wooden Chest", start=(0, 0), end=(5, 0), is_solid=True, hp=15, vulnerabilities=["fire"])
     spatial_service.add_wall(chest)
@@ -165,7 +172,7 @@ def test_fireball_destructible_chest():
     assert chest.wall_id in hit_walls
 
     mechanics = {"damage_dice": "8d6", "damage_type": "fire", "save_required": "dexterity"}
-    with patch("event_handlers.roll_dice", return_value=28):  # 28 * 2 = 56
+    with mock_roll_dice(default=28):  # 28 * 2 = 56
         event = GameEvent(
             event_type="SpellCast",
             source_uuid=caster.entity_uuid,
@@ -178,11 +185,12 @@ def test_fireball_destructible_chest():
     assert active_walls[chest.wall_id].hp <= 0
 
 
-def test_fireball_evasion_mechanics():
+def test_fireball_evasion_mechanics(mock_dice, mock_roll_dice):
     """
     Test dropping a fireball on multiple combatants (one with Evasion, one without)
     to ensure the rules engine correctly halves damage on a failed save, and zeros
     it on a successful save.
+    [Mapped: REQ-SPL-018]
     """
     caster = create_test_creature("Mage", 0, 0)
     caster.spell_save_dc.base_value = 15
@@ -204,7 +212,7 @@ def test_fireball_evasion_mechanics():
     # randint returns 5.
     # Fighter save: 5 + 0 = 5 (Fail). Full damage (30).
     # Rogue save: 5 + 5 = 10 (Fail). Evasion halves damage on fail (15).
-    with patch("event_handlers.roll_dice", return_value=30), patch("random.randint", return_value=5):
+    with mock_roll_dice(default=30), mock_dice(default=5):
         event = GameEvent(
             event_type="SpellCast",
             source_uuid=caster.entity_uuid,
@@ -220,7 +228,7 @@ def test_fireball_evasion_mechanics():
     rogue.hp.base_value = 30
     caster.spell_save_dc.base_value = 10  # Lower DC so they both succeed
 
-    with patch("event_handlers.roll_dice", return_value=30), patch("random.randint", return_value=10):
+    with mock_roll_dice(default=30), mock_dice(default=10):
         EventBus.dispatch(
             GameEvent(
                 event_type="SpellCast",
@@ -237,6 +245,7 @@ def test_aoe_z_axis_sphere():
     """
     Test that a sphere AoE correctly calculates 3D distance and hits/misses
     entities on the Z-axis (e.g. flying creatures).
+    [Mapped: REQ-SPL-008]
     """
     c_ground = create_test_creature("Ground", 20, 0)
     c_ground.z = 0.0
@@ -266,6 +275,7 @@ def test_aoe_z_axis_cylinder():
     """
     Test that a cylinder AoE correctly applies its height on the Z-axis.
     A cylinder goes straight up from the origin to its specified height.
+    [Mapped: REQ-SPL-012]
     """
     c_ground = create_test_creature("Ground", 15, 0)
     c_ground.z = 0.0
@@ -290,6 +300,7 @@ def test_aoe_z_axis_cube():
     """
     Test that a cube AoE properly applies half its size on the Z-axis relative to the origin.
     A 20ft cube from origin_z=10 spans from Z=0 to Z=20.
+    [Mapped: REQ-SPL-009]
     """
     c_ground = create_test_creature("Ground", 0, 0)
     c_ground.z = 0.0  # BB: 0 to 5. Hits cube [0, 20]
@@ -314,6 +325,7 @@ def test_aoe_z_axis_line_lightning_bolt():
     """
     Test that a line AoE correctly calculates 3D distance and hits/misses
     entities on the Z-axis (e.g. Lightning Bolt firing up at a flying target).
+    [Mapped: REQ-SPL-011]
     """
     c_ground = create_test_creature("Ground Enemy", 0, 20)
     c_ground.z = 0.0
@@ -351,6 +363,7 @@ def test_aoe_z_axis_cone_upward():
     """
     Test that a cone AoE aimed diagonally upward hits a flying creature
     in the path but misses ground targets beneath it.
+    [Mapped: REQ-SPL-010]
     """
     # Caster at (0,0,0) aiming at (0, 30, 30)
     c_ground = create_test_creature("Ground Enemy", 0, 20)
@@ -387,6 +400,7 @@ def test_aoe_line_beside_beam():
     """
     Test that a line AoE (like Lightning Bolt) correctly bypasses creatures
     standing directly beside or above the 5ft wide beam.
+    [Mapped: REQ-SPL-011]
     """
     c_ground = create_test_creature("Ground Enemy", 0, 20)
     c_ground.z = 0.0
@@ -414,6 +428,7 @@ def test_aoe_ignore_walls_darkness():
     """
     Test that spells like Darkness and Silence (with ignore_walls=True)
     pass through solid indestructible walls.
+    [Mapped: REQ-EDG-006]
     """
     wall = Wall(label="Solid Stone Wall", start=(0, -20), end=(0, 20), is_solid=True, hp=9999)
     spatial_service.add_wall(wall)
@@ -429,10 +444,11 @@ def test_aoe_ignore_walls_darkness():
     assert c_behind.entity_uuid in hits_penetrate
 
 
-def test_aoe_lightning_bolt_destructible_door():
+def test_aoe_lightning_bolt_destructible_door(mock_dice, mock_roll_dice):
     """
     Test that a line spell like Lightning Bolt (with penetrates_destructible=True)
     hits the destructible door and the entity behind it, whereas an indestructible wall blocks it.
+    [Mapped: REQ-OBJ-002]
     """
     door = Wall(label="Wooden Door", start=(0, -5), end=(0, 5), is_solid=True, hp=10, max_hp=10)
     spatial_service.add_wall(door)
@@ -458,7 +474,7 @@ def test_aoe_lightning_bolt_destructible_door():
     mechanics = {"damage_dice": "8d6", "damage_type": "lightning", "save_required": "dexterity"}
     caster = create_test_creature("Mage", -10, 0)
 
-    with patch("event_handlers.roll_dice", return_value=30), patch("random.randint", return_value=5):
+    with mock_roll_dice(default=30), mock_dice(default=5):
         event = GameEvent(
             event_type="SpellCast",
             source_uuid=caster.entity_uuid,
@@ -477,8 +493,11 @@ def test_aoe_lightning_bolt_destructible_door():
     assert c_behind_door.hp.base_value < 10
 
 
-def test_aoe_elemental_terrain_lightning_water():
-    """Test that lightning extends through a wet terrain zone, hitting targets outside the direct ray."""
+def test_aoe_elemental_terrain_lightning_water(mock_roll_dice):
+    """
+    Test that lightning extends through a wet terrain zone, hitting targets outside the direct ray.
+    [Mapped: REQ-ENV-010]
+    """
     caster = create_test_creature("Mage", 0, 0)
     t_direct = create_test_creature("Direct Target", 0, 20)
     t_water = create_test_creature("Water Target", 15, 20)  # 15ft away from the beam!
@@ -495,11 +514,16 @@ def test_aoe_elemental_terrain_lightning_water():
 
     mechanics = {"damage_dice": "8d6", "damage_type": "lightning"}
 
-    with patch("event_handlers.roll_dice", return_value=30):
+    with mock_roll_dice(default=30):
         event = GameEvent(
             event_type="SpellCast",
             source_uuid=caster.entity_uuid,
-            payload={"ability_name": "Lightning", "mechanics": mechanics, "target_uuids": hits, "target_terrain_ids": terrains},
+            payload={
+                "ability_name": "Lightning",
+                "mechanics": mechanics,
+                "target_uuids": hits,
+                "target_terrain_ids": terrains,
+            },
         )
         EventBus.dispatch(event)
 
@@ -509,8 +533,11 @@ def test_aoe_elemental_terrain_lightning_water():
     assert any("electrified" in res for res in event.payload["results"])
 
 
-def test_aoe_elemental_terrain_fire_thorns():
-    """Test that fire ignites flammable difficult terrain, dealing immediate damage and creating a trap."""
+def test_aoe_elemental_terrain_fire_thorns(mock_roll_dice):
+    """
+    Test that fire ignites flammable difficult terrain, dealing immediate damage and creating a trap.
+    [Mapped: REQ-ENV-010]
+    """
     caster = create_test_creature("Mage", 0, 0)
     target_in_web = create_test_creature("Goblin", 10, 20)
 
@@ -525,7 +552,7 @@ def test_aoe_elemental_terrain_fire_thorns():
     mechanics = {"damage_dice": "8d6", "damage_type": "fire"}
 
     # Mock the 2d4 burn damage to be exactly 5, and the Fireball to be exactly 5 (Total 10 damage)
-    with patch("event_handlers.roll_dice", return_value=5):
+    with mock_roll_dice(default=5):
         event = GameEvent(
             event_type="SpellCast",
             source_uuid=caster.entity_uuid,
@@ -546,7 +573,10 @@ def test_aoe_elemental_terrain_fire_thorns():
 
 
 def test_aoe_elemental_terrain_cold_water_freezes():
-    """Test that cold damage freezes a wet puddle."""
+    """
+    Test that cold damage freezes a wet puddle.
+    [Mapped: REQ-ENV-010]
+    """
     caster = create_test_creature("Mage", 0, 0)
     puddle = TerrainZone(label="Puddle", points=[(-5, 10), (20, 10), (20, 30), (-5, 30)], is_difficult=False, tags=["wet"])
     spatial_service.add_terrain(puddle)
@@ -566,7 +596,10 @@ def test_aoe_elemental_terrain_cold_water_freezes():
 
 
 def test_aoe_elemental_terrain_wind_cloud():
-    """Test that a wind spell physically moves a gaseous terrain zone."""
+    """
+    Test that a wind spell physically moves a gaseous terrain zone.
+    [Mapped: REQ-ENV-010]
+    """
     caster = create_test_creature("Mage", 0, 0)
     cloud = TerrainZone(label="Toxic Cloud", points=[(0.0, 10.0), (10.0, 10.0), (10.0, 20.0), (0.0, 20.0)], tags=["gaseous"])
     spatial_service.add_terrain(cloud)
@@ -599,7 +632,10 @@ def test_aoe_elemental_terrain_wind_cloud():
 
 
 def test_terrain_duration_and_concentration():
-    """Test that dropping concentration completely removes tied terrain effects."""
+    """
+    Test that dropping concentration completely removes tied terrain effects.
+    [Mapped: REQ-CND-017]
+    """
     caster = create_test_creature("Mage", 0, 0)
 
     mechanics = {
@@ -631,7 +667,10 @@ def test_terrain_duration_and_concentration():
 
 
 def test_terrain_duration_expiration():
-    """Test that advancing time naturally expires temporary terrain."""
+    """
+    Test that advancing time naturally expires temporary terrain.
+    [Mapped: REQ-ACT-001]
+    """
     caster = create_test_creature("Mage", 0, 0)
     mechanics = {"terrain_effect": {"label": "Grease", "duration": "1 minute", "is_difficult": True}}
     event = GameEvent(

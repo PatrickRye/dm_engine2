@@ -33,7 +33,7 @@ from vault_io import (
     edit_markdown_entity,
 )
 from compendium_manager import CompendiumManager, CompendiumEntry, MechanicEffect
-from spatial_engine import spatial_service, LightSource, Wall
+from spatial_engine import spatial_service, LightSource, Wall, HAS_GIS
 from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
 from item_system import WeaponItem, ArmorItem, WondrousItem, ItemCompendium
 
@@ -367,6 +367,25 @@ async def execute_melee_attack(
     if not target:
         return f"SYSTEM ERROR: Target '{target_name}' not found in active combat memory."
 
+    # --- VERBAL COMMAND ENFORCEMENT FOR SUMMONS ---
+    if getattr(attacker, "summoned_by_uuid", None) and getattr(attacker, "summon_spell", "").lower() != "find familiar":
+        summoner = get_entity(attacker.summoned_by_uuid, vault_path)
+        if summoner:
+            summoner_conds = [c.name.lower() for c in getattr(summoner, "active_conditions", [])]
+            attacker_conds = [c.name.lower() for c in getattr(attacker, "active_conditions", [])]
+            reason = ""
+            if "silenced" in summoner_conds:
+                reason = f"its summoner ({summoner.name}) is Silenced"
+            elif "confused" in summoner_conds:
+                reason = f"its summoner ({summoner.name}) is Confused"
+            elif "unconscious" in summoner_conds or "incapacitated" in summoner_conds:
+                reason = f"its summoner ({summoner.name}) is Incapacitated"
+            elif "deafened" in attacker_conds:
+                reason = "it is Deafened and cannot hear verbal commands"
+
+            if reason:
+                return f"SYSTEM ERROR: {attacker.name} cannot attack because {reason}. Per 5.5e rules, without verbal commands it must take the Dodge action and use its move to avoid danger."
+
     # --- NEW RANGE VALIDATION ---
     dist = spatial_service.calculate_distance(attacker.x, attacker.y, attacker.z, target.x, target.y, target.z, vault_path)
     is_active_turn = not (is_reaction or is_opportunity_attack or is_legendary_action)
@@ -444,6 +463,9 @@ async def execute_melee_attack(
             f"{', '.join(protectors)}. Ask the player(s) if they want to use their reaction to attack {attacker.name}!"
         )
 
+    if "results" in result.payload and result.payload["results"]:
+        base_msg += "\n" + "\n".join(result.payload["results"])
+
     return base_msg
 
 
@@ -476,6 +498,15 @@ async def modify_health(
             dmg *= 2
         elif dt in target.resistances:
             dmg //= 2
+
+            if dmg > 0 and target.temp_hp > 0:
+                if dmg >= target.temp_hp:
+                    dmg -= target.temp_hp
+                    target.temp_hp = 0
+                else:
+                    target.temp_hp -= dmg
+                    dmg = 0
+
         hp_change = -dmg
 
     target.hp.base_value += hp_change
@@ -939,6 +970,16 @@ async def equip_item(  # noqa: C901
                 )
                 if hasattr(item, "magic_bonus"):
                     new_weapon.magic_bonus = item.magic_bonus
+                if hasattr(item, "mastery_name") and item.mastery_name:
+                    new_weapon.mastery_name = item.mastery_name
+                    if "weapon_mastery" in engine_creature.tags:
+                        mastery_entry = await CompendiumManager.get_entry(vault_path, item.mastery_name)
+                        if mastery_entry and mastery_entry.mechanics:
+                            dumped = mastery_entry.mechanics.model_dump()
+                            if mastery_entry.mechanics.trigger_event == "on_hit":
+                                new_weapon.on_hit_mechanics = dumped
+                            elif mastery_entry.mechanics.trigger_event == "on_miss":
+                                new_weapon.on_miss_mechanics = dumped
             else:
                 dmg_dice = "1d4" if "Unarmed" in item_name else "1d8"
                 dmg_type = "bludgeoning" if "Unarmed" in item_name else "slashing"
@@ -1442,6 +1483,11 @@ async def perform_ability_check_or_save(  # noqa: C901
 
     total_mod = stat_mod + extra_modifier
 
+    if engine_creature and isinstance(engine_creature, Creature):
+        active_conds = [c.name.lower() for c in engine_creature.active_conditions]
+        if "poisoned" in active_conds:
+            disadvantage = True
+
     is_pc = any(t in engine_creature.tags for t in ["pc", "player"]) if engine_creature else False
     if is_pc and not is_passive and not force_auto_roll and manual_roll_total is None:
         auto_settings = get_roll_automations(character_name)
@@ -1499,6 +1545,11 @@ async def perform_ability_check_or_save(  # noqa: C901
             if luck_points_used > 0 and disadvantage:
                 roll_type_str += f" {rolls} (Disadvantage canceled by Luck)"
 
+        if base_roll == 1:
+            roll_type_str += " [NATURAL 1 - CRITICAL FAILURE]"
+        elif base_roll == 20:
+            roll_type_str += " [NATURAL 20 - CRITICAL SUCCESS]"
+
         # --- 3. RESOLVE BONUS DICE (Bless/Bane) ---
         bonus_total = 0
         bonus_str = ""
@@ -1515,21 +1566,52 @@ async def perform_ability_check_or_save(  # noqa: C901
     # Query Environmental Lighting to alert the DM for Stealth and Perception checks
     illum_alert = ""
     if engine_creature and isinstance(engine_creature, Creature):
-        illum = spatial_service.get_illumination(engine_creature.x, engine_creature.y, engine_creature.z)
+        illum = spatial_service.get_illumination(engine_creature.x, engine_creature.y, engine_creature.z, vault_path)
 
         has_enhanced_vision = any(
             s in tag for tag in engine_creature.tags for s in ["darkvision", "blindsight", "truesight", "tremorsense"]
         )
         is_deafened = any(c.name.lower() == "deafened" for c in engine_creature.active_conditions)
+        has_sunlight_sensitivity = "sunlight_sensitivity" in engine_creature.tags
+
+        in_sunlight = False
+        if illum == "bright":
+            for light in spatial_service.get_map_data(vault_path).active_lights:
+                if "sun" in light.label.lower():
+                    dist = spatial_service.calculate_distance(
+                        engine_creature.x, engine_creature.y, engine_creature.z, light.x, light.y, light.z, vault_path
+                    )
+                    if dist <= light.bright_radius:
+                        in_sunlight = True
+                        break
 
         if clean_skill in ["perception", "investigation"]:
-            if illum == "darkness" and not has_enhanced_vision:
-                illum_alert = "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. Sight-based checks automatically fail (Hearing/Smell still work)."
-            elif illum == "dim" and not has_enhanced_vision:
-                illum_alert = "\nSYSTEM ALERT: Character is in DIM LIGHT. Disadvantage (-5 to Passive) on sight-based checks."
+            is_blinded = any(c.name.lower() == "blinded" for c in engine_creature.active_conditions)
+            has_blindsight = any(s in tag for tag in engine_creature.tags for s in ["blindsight", "truesight"])
 
-            if is_deafened:
-                illum_alert += "\nSYSTEM ALERT: Character is DEAFENED. Hearing-based checks automatically fail."
+            in_silence = False
+            if HAS_GIS:
+                ent_poly = spatial_service._get_entity_bbox(engine_creature)
+                if ent_poly:
+                    for tz in spatial_service.get_map_data(vault_path).active_terrain:
+                        if "silence" in [tag.lower() for tag in tz.tags] and tz.polygon and tz.polygon.intersects(ent_poly):
+                            in_silence = True
+                            break
+
+            if in_sunlight and has_sunlight_sensitivity:
+                illum_alert += "\nSYSTEM ALERT: Character has Sunlight Sensitivity and is in direct sunlight. Disadvantage (-5 to Passive) on sight-based checks."
+            elif is_blinded and not has_blindsight:
+                illum_alert += (
+                    "\nSYSTEM ALERT: Character is BLINDED. Sight-based checks automatically fail (Hearing/Smell still work)."
+                )
+            elif illum == "darkness" and not has_enhanced_vision:
+                illum_alert += "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. Sight-based checks automatically fail (Hearing/Smell still work)."
+            elif illum == "dim" and not has_enhanced_vision:
+                illum_alert += "\nSYSTEM ALERT: Character is in DIM LIGHT. Disadvantage (-5 to Passive) on sight-based checks."
+
+            if is_deafened or in_silence:
+                reason = "DEAFENED" if is_deafened else "in a magically SILENCED zone"
+                illum_alert += f"\nSYSTEM ALERT: Character is {reason}. Hearing-based checks automatically fail."
 
         elif clean_skill == "stealth":
             if illum == "bright":
@@ -1558,6 +1640,115 @@ async def perform_ability_check_or_save(  # noqa: C901
 
     await write_audit_log(vault_path, "Rules Engine", "perform_ability_check_or_save Executed", result_str)
     return result_str
+
+
+@tool
+async def evaluate_extreme_weather(
+    character_names: list[str],
+    temperature_f: int,
+    hours_exposed: int = 1,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Evaluates Constitution saving throws for extreme heat (>= 100 F) or extreme cold (<= 0 F).
+    Automatically applies Exhaustion levels for each failed hour of exposure.
+    """
+    vault_path = config["configurable"].get("thread_id")
+    results = []
+
+    if 0 < temperature_f < 100:
+        return f"MECHANICAL TRUTH: Temperature is {temperature_f}°F, which is not extreme. No checks needed."
+
+    for char_name in character_names:
+        ent = await _get_entity_by_name(char_name, vault_path)
+        if not ent or not isinstance(ent, Creature):
+            continue
+
+        # Load YAML for equipment check
+        j_dir = get_journals_dir(vault_path)
+        file_path = os.path.join(j_dir, f"{ent.name}.md")
+        yaml_data = {}
+        if os.path.exists(file_path):
+            try:
+                async with read_markdown_entity(file_path) as (yd, _):
+                    yaml_data = yd
+            except Exception:
+                pass
+
+        is_immune_to_weather = False
+        disadvantage = False
+
+        if temperature_f <= 0:
+            if "cold" in ent.resistances or "cold" in ent.immunities:
+                is_immune_to_weather = True
+
+            inv = yaml_data.get("inventory", [])
+            if any("cold weather gear" in str(i).lower() for i in inv):
+                is_immune_to_weather = True
+            if any("cold_weather_gear" in t.lower() for t in ent.tags):
+                is_immune_to_weather = True
+
+            base_dc = 10
+            dc_increment = 0
+            weather_type = "Extreme Cold"
+
+        elif temperature_f >= 100:
+            if "fire" in ent.resistances or "fire" in ent.immunities:
+                is_immune_to_weather = True
+
+            equipment = yaml_data.get("equipment", {})
+            armor_name = equipment.get("armor", "None")
+            if str(armor_name).strip() not in ["None", "", "Unarmored"]:
+                armor_item = await ItemCompendium.load_item(vault_path, str(armor_name))
+                if armor_item and hasattr(armor_item, "armor_category"):
+                    if armor_item.armor_category.lower() in ["medium", "heavy"]:
+                        disadvantage = True
+                else:
+                    if any(w in str(armor_name).lower() for w in ["plate", "mail", "scale", "splint", "half"]):
+                        disadvantage = True
+
+            base_dc = 5
+            dc_increment = 1
+            weather_type = "Extreme Heat"
+
+        if is_immune_to_weather:
+            results.append(f"[{ent.name}] is naturally adapted or geared for {weather_type} and ignores the effects.")
+            continue
+
+        failures = 0
+        for h in range(hours_exposed):
+            dc = base_dc + (h * dc_increment)
+            roll1 = random.randint(1, 20)
+            roll2 = random.randint(1, 20)
+            save_roll = min(roll1, roll2) if disadvantage else roll1
+            total_save = save_roll + ent.constitution_mod.total
+            if total_save < dc:
+                failures += 1
+
+        if failures > 0:
+            ent.exhaustion_level += failures
+            exhaustion_cond = next((c for c in ent.active_conditions if c.name == "Exhaustion"), None)
+            if not exhaustion_cond:
+                ent.active_conditions.append(ActiveCondition(name="Exhaustion", source_name=weather_type))
+
+            if ent.exhaustion_level >= 6:
+                ent.hp.base_value = 0
+                if not any(c.name == "Dead" for c in ent.active_conditions):
+                    ent.active_conditions.append(ActiveCondition(name="Dead"))
+                results.append(
+                    f"[{ent.name}] failed {failures} CON saves. "
+                    f"Reached Exhaustion Level {ent.exhaustion_level} and is DEAD."
+                )
+            else:
+                results.append(
+                    f"[{ent.name}] failed {failures} CON saves vs {weather_type}. "
+                    f"They gained {failures} levels of Exhaustion (Current Level: {ent.exhaustion_level})."
+                )
+        else:
+            results.append(f"[{ent.name}] succeeded all CON saves vs {weather_type} for {hours_exposed} hours.")
+
+    return f"MECHANICAL TRUTH: Evaluated {hours_exposed} hours of {temperature_f}°F weather.\n" + "\n".join(results)
 
 
 @tool
@@ -1806,6 +1997,21 @@ async def update_combat_state(  # noqa: C901
                     )
 
             if next_turn:
+                current_combatant = combatants[yaml_data.get("current_turn_index", 0)]
+                current_ent = await _get_entity_by_name(current_combatant["name"], vault_path)
+                if current_ent and isinstance(current_ent, Creature):
+                    eot_event = GameEvent(
+                        event_type="EndOfTurn",
+                        source_uuid=current_ent.entity_uuid,
+                        vault_path=vault_path,
+                    )
+                    EventBus.dispatch(eot_event)
+                    if "results" in eot_event.payload and eot_event.payload["results"]:
+                        log_msg.extend(eot_event.payload["results"])
+
+                    # Refresh the conditions column in the whiteboard to show cleared conditions
+                    current_combatant["conditions"] = [c.name for c in current_ent.active_conditions]
+
                 yaml_data["current_turn_index"] = (yaml_data.get("current_turn_index", 0) + 1) % len(combatants)
                 if yaml_data["current_turn_index"] == 0:
                     yaml_data["round"] = yaml_data.get("round", 1) + 1
@@ -1825,6 +2031,16 @@ async def update_combat_state(  # noqa: C901
                     new_turn_ent.reaction_used = False
                     new_turn_ent.legendary_actions_current = new_turn_ent.legendary_actions_max
                     new_turn_ent.movement_remaining = new_turn_ent.speed  # Refresh movement for new turn
+                new_turn_ent.spell_slots_expended_this_turn = 0
+
+                sot_event = GameEvent(
+                    event_type="StartOfTurn",
+                    source_uuid=new_turn_ent.entity_uuid,
+                    vault_path=vault_path,
+                )
+                EventBus.dispatch(sot_event)
+                if "results" in sot_event.payload and sot_event.payload["results"]:
+                    log_msg.extend(sot_event.payload["results"])
     except Exception as e:
         return str(e)
 
@@ -1872,6 +2088,7 @@ async def end_combat(*, config: Annotated[RunnableConfig, InjectedToolArg]) -> s
             ent.reaction_used = False
             ent.legendary_actions_current = getattr(ent, "legendary_actions_max", 0)
             ent.movement_remaining = ent.speed
+            ent.spell_slots_expended_this_turn = 0
 
     if vault_path in spatial_service.active_combatants:
         del spatial_service.active_combatants[vault_path]
@@ -2085,6 +2302,22 @@ def _get_config_tone(vault_path: str) -> str:
     return ""
 
 
+def _get_config_settings(vault_path: str) -> dict:
+    """Reads DM_CONFIG.md to retrieve boolean toggles and settings."""
+    config_path = os.path.join(vault_path, "DM_CONFIG.md")
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if content.startswith("---"):
+            yaml_data = yaml.safe_load(content.split("---", 2)[1]) or {}
+            return yaml_data.get("settings", {})
+    except Exception:
+        pass
+    return {}
+
+
 def _get_config_dirs(vault_path: str, key: str) -> list[str]:
     """Reads DM_CONFIG.md and returns a list of absolute paths for a directory key."""
     config_path = os.path.join(vault_path, "DM_CONFIG.md")
@@ -2238,6 +2471,7 @@ async def use_ability_or_spell(  # noqa: C901
     is_critical: bool = False,
     manual_saves: dict = None,
     force_auto_roll: bool = False,
+    proxy_caster_name: str = None,
     *,
     config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
@@ -2250,6 +2484,36 @@ async def use_ability_or_spell(  # noqa: C901
     if not caster:
         return f"SYSTEM ERROR: Caster '{caster_name}' not found."
 
+    proxy = None
+    if proxy_caster_name:
+        proxy = await _get_entity_by_name(proxy_caster_name, vault_path)
+        if not proxy:
+            return f"SYSTEM ERROR: Proxy caster '{proxy_caster_name}' not found."
+        if getattr(proxy, "reaction_used", False):
+            return f"SYSTEM ERROR: Proxy '{proxy.name}' has already used their reaction this round."
+
+    origin_ent = proxy if proxy else caster
+
+    # --- VERBAL COMMAND ENFORCEMENT FOR SUMMONS ---
+    if getattr(origin_ent, "summoned_by_uuid", None) and getattr(origin_ent, "summon_spell", "").lower() != "find familiar":
+        summoner = get_entity(origin_ent.summoned_by_uuid, vault_path)
+        if summoner:
+            summoner_conds = [c.name.lower() for c in getattr(summoner, "active_conditions", [])]
+            ent_conds = [c.name.lower() for c in getattr(origin_ent, "active_conditions", [])]
+            reason = ""
+            if "silenced" in summoner_conds:
+                reason = f"its summoner ({summoner.name}) is Silenced"
+            elif "confused" in summoner_conds:
+                reason = f"its summoner ({summoner.name}) is Confused"
+            elif "unconscious" in summoner_conds or "incapacitated" in summoner_conds:
+                reason = f"its summoner ({summoner.name}) is Incapacitated"
+            elif "deafened" in ent_conds:
+                reason = "it is Deafened and cannot hear verbal commands"
+
+            if reason:
+                return f"SYSTEM ERROR: {origin_ent.name} cannot execute this action because {reason}. Per 5.5e rules, without verbal commands it must take the Dodge action and use its move to avoid danger."
+
+    mitigation_notes = ""
     spell_def = await SpellCompendium.load_spell(vault_path, ability_name)
     if spell_def:
         mechanics_dump = spell_def.mechanics.model_dump()
@@ -2258,6 +2522,76 @@ async def use_ability_or_spell(  # noqa: C901
         requires_attack_roll = spell_def.mechanics.requires_attack_roll
         save_required = spell_def.mechanics.save_required
         ability_display_name = spell_def.name
+        mitigation_notes = getattr(spell_def, "mitigation_notes", "")
+
+        v_req = any("V" in comp.upper() for comp in spell_def.components)
+        s_req = any("S" in comp.upper() for comp in spell_def.components)
+        m_req = any("M" in comp.upper() for comp in spell_def.components)
+
+        config_settings = _get_config_settings(vault_path)
+        strict_materials = config_settings.get("strict_material_components", False)
+        strict_penalties = config_settings.get("strict_vsm_penalties", False)
+
+        vsm_error = ""
+
+        # REQ-SND-001: Verbal Verification
+        if v_req and any(c.name.lower() in ["silenced", "gagged"] for c in getattr(caster, "active_conditions", [])):
+            vsm_error = f"SYSTEM ERROR: {caster.name} cannot cast '{ability_display_name}' because it requires Verbal (V) components and they are Silenced/Gagged. (REQ-SND-001)"
+
+        # REQ-SPL-014: Bound check
+        if (
+            not vsm_error
+            and (s_req or m_req)
+            and any(c.name.lower() == "bound" for c in getattr(caster, "active_conditions", []))
+        ):
+            vsm_error = f"SYSTEM ERROR: {caster.name} cannot cast '{ability_display_name}' because it requires Somatic/Material components, but their hands are Bound. (REQ-SPL-014)"
+
+        # REQ-SPL-022, REQ-SPL-023: Hands Full Check (War Caster & Strict Materials)
+        if not vsm_error and (s_req or (m_req and strict_materials)):
+            file_path = os.path.join(get_journals_dir(vault_path), f"{caster.name}.md")
+            equipment = {}
+            if os.path.exists(file_path):
+                try:
+                    async with read_markdown_entity(file_path) as (yaml_data, _):
+                        equipment = yaml_data.get("equipment", {})
+                except Exception:
+                    pass
+
+            def is_occupied(slot_val):
+                return str(slot_val).strip() not in ["None", "", "Unarmed"]
+
+            main_hand = equipment.get("main_hand", "None")
+            off_hand = equipment.get("off_hand", "None")
+            shield_slot = equipment.get("shield", "None")
+
+            hands_full = is_occupied(main_hand) and (is_occupied(off_hand) or is_occupied(shield_slot))
+
+            if hands_full:
+                if s_req and "war_caster" not in getattr(caster, "tags", []):
+                    vsm_error = f"SYSTEM ERROR: {caster.name} cannot cast '{ability_display_name}' because it requires Somatic (S) components and both hands are full (missing War Caster feat). (REQ-SPL-022)"
+
+                if not vsm_error and m_req and strict_materials:
+                    has_focus = False
+                    for item_name in [main_hand, off_hand, shield_slot]:
+                        if is_occupied(item_name):
+                            item_def = await ItemCompendium.load_item(vault_path, item_name)
+                            if item_def and any(
+                                t.lower() in ["spellcasting_focus", "holy_symbol"] for t in getattr(item_def, "tags", [])
+                            ):
+                                has_focus = True
+                                break
+                    if not has_focus:
+                        vsm_error = f"SYSTEM ERROR: {caster.name} cannot cast '{ability_display_name}' because it requires Material (M) components, their hands are full, and they do not have a spellcasting focus equipped. (REQ-SPL-023)"
+
+        if vsm_error:
+            if strict_penalties:
+                if spell_def.level > 0 and not is_reaction and not is_legendary_action:
+                    caster.spell_slots_expended_this_turn += 1
+                if is_reaction:
+                    caster.reaction_used = True
+                return f"{vsm_error}\nSTRICT MODE PENALTY: The spell failed but the action/reaction and spell slot were still consumed! (REQ-SPL-024)"
+            else:
+                return vsm_error
     else:
         item_def = await ItemCompendium.load_item(vault_path, ability_name)
         if item_def and getattr(item_def, "active_mechanics", None):
@@ -2267,6 +2601,7 @@ async def use_ability_or_spell(  # noqa: C901
             requires_attack_roll = item_def.active_mechanics.requires_attack_roll
             save_required = item_def.active_mechanics.save_required
             ability_display_name = item_def.name
+            mitigation_notes = getattr(item_def, "mitigation_notes", "")
         else:
             entry = await CompendiumManager.get_entry(vault_path, ability_name)
             if not entry:
@@ -2281,6 +2616,7 @@ async def use_ability_or_spell(  # noqa: C901
             requires_attack_roll = getattr(entry.mechanics, "requires_attack_roll", False)
             save_required = getattr(entry.mechanics, "save_required", "")
             ability_display_name = entry.name
+            mitigation_notes = getattr(entry, "mitigation_notes", "")
 
     target_uuids = []
     target_wall_ids = []
@@ -2288,6 +2624,18 @@ async def use_ability_or_spell(  # noqa: C901
 
     ignore_walls = "ignore_walls" in granted_tags
     penetrates = "penetrates_destructible" in granted_tags
+
+    is_spell = False
+    requires_slot = False
+    if spell_def:
+        is_spell = True
+        if spell_def.level > 0:
+            requires_slot = True
+
+    # REQ-SPL-001 & REQ-SPL-003: Spell Slot Limit & Magic Items
+    if is_spell and requires_slot and not is_reaction and not is_legendary_action:
+        if caster.spell_slots_expended_this_turn > 0:
+            return f"SYSTEM ERROR: {caster.name} has already expended a spell slot this turn. (REQ-SPL-001)"
 
     ox, oy, oz, tx, ty, tz = None, None, None, None, None, None
     if aoe_shape and aoe_size and target_x is not None and target_y is not None:
@@ -2297,10 +2645,10 @@ async def use_ability_or_spell(  # noqa: C901
             ox, oy, tx, ty = target_x, target_y, target_x, target_y
             oz = target_z if target_z is not None else 0.0
         else:  # cone, line originate from the caster
-            ox, oy, tx, ty = caster.x, caster.y, target_x, target_y
-            oz = caster.z
+            ox, oy, tx, ty = origin_ent.x, origin_ent.y, target_x, target_y
+            oz = origin_ent.z
             if tz is None:
-                tz = caster.z
+                tz = origin_ent.z
 
         hits, walls, terrains = spatial_service.get_aoe_targets(
             shape,
@@ -2323,6 +2671,21 @@ async def use_ability_or_spell(  # noqa: C901
         for name in target_names or []:
             ent = await _get_entity_by_name(name, vault_path)
             if ent:
+                if hasattr(spatial_service, "check_path_collision") and not ignore_walls:
+                    collision = spatial_service.check_path_collision(
+                        origin_ent.x,
+                        origin_ent.y,
+                        origin_ent.z,
+                        ent.x,
+                        ent.y,
+                        ent.z,
+                        entity_height=getattr(ent, "height", 5.0),
+                        check_vision=False,
+                        vault_path=vault_path,
+                    )
+                    if collision and collision.is_solid:
+                        return f"SYSTEM ERROR: Target '{ent.name}' has Total Cover (blocked by '{collision.label}'). Spells require an unbroken line of effect. (REQ-SPL-005)"
+
                 target_uuids.append(ent.entity_uuid)
         target_string = ", ".join(target_names or []) or "themselves"
 
@@ -2382,11 +2745,22 @@ async def use_ability_or_spell(  # noqa: C901
     result = EventBus.dispatch(event)
 
     results_list = result.payload.get("results", [])
+
+    if is_spell and requires_slot and not is_reaction and not is_legendary_action and result.status != EventStatus.CANCELLED:
+        caster.spell_slots_expended_this_turn += 1
+
+    if proxy and result.status != EventStatus.CANCELLED:
+        proxy.reaction_used = True
+
     if results_list:
         res_msg = "\n".join(results_list)
-        return f"MECHANICAL TRUTH: {caster.name} cast {ability_display_name} on {target_string}.\n{res_msg}"
+        ret = f"MECHANICAL TRUTH: {caster.name} cast {ability_display_name} on {target_string}.\n{res_msg}"
+    else:
+        ret = f"MECHANICAL TRUTH: {caster.name} used {ability_display_name} on {target_string}. Effect: {description}"
 
-    return f"MECHANICAL TRUTH: {caster.name} used {ability_display_name} on {target_string}. Effect: {description}"
+    if mitigation_notes:
+        ret += f"\nDM DIRECTIVE (Mitigation/Counter): {mitigation_notes}"
+    return ret
 
 
 @tool
@@ -2395,6 +2769,9 @@ async def encode_new_compendium_entry(
     category: str = Field(..., description="'spell', 'feature', 'feat', 'item', 'weapon', or 'armor'"),
     action_type: str = Field(..., description="'Action', 'Bonus Action', 'Reaction', or 'Passive'"),
     description: str = Field(..., description="A concise summary of the mechanical rules."),
+    mitigation_notes: str = Field(
+        "", description="Explain how to counter/thwart this ability (e.g. 'Defeated by Silence' for echolocation)."
+    ),
     source_reference: str = Field(..., description="Name of the rulebook and page number."),
     damage_dice: str = Field("", description="e.g., '8d6'. Leave empty string if no damage."),
     damage_type: str = Field("", description="e.g., 'fire'."),
@@ -2420,15 +2797,26 @@ async def encode_new_compendium_entry(
             damage_type=damage_type,
             granted_tags=granted_tags,
         )
-        spell_def = SpellDefinition(name=name, casting_time=action_type, description=description, mechanics=spell_mech)
+        spell_def = SpellDefinition(
+            name=name,
+            casting_time=action_type,
+            description=description,
+            mitigation_notes=mitigation_notes,
+            mechanics=spell_mech,
+        )
         filepath = await SpellCompendium.save_spell(vault_path, spell_def)
     elif category.lower() in ["item", "weapon", "armor"]:
         if category.lower() == "weapon" or action_type.lower() == "attack":
             item_def = WeaponItem(
-                name=name, description=description, damage_dice=damage_dice, damage_type=damage_type, tags=granted_tags
+                name=name,
+                description=description,
+                mitigation_notes=mitigation_notes,
+                damage_dice=damage_dice,
+                damage_type=damage_type,
+                tags=granted_tags,
             )
         elif category.lower() == "armor":
-            item_def = ArmorItem(name=name, description=description, tags=granted_tags)
+            item_def = ArmorItem(name=name, description=description, mitigation_notes=mitigation_notes, tags=granted_tags)
         else:
             mech = (
                 SpellMechanics(
@@ -2437,7 +2825,9 @@ async def encode_new_compendium_entry(
                 if (save_required or damage_dice)
                 else None
             )
-            item_def = WondrousItem(name=name, description=description, tags=granted_tags, active_mechanics=mech)
+            item_def = WondrousItem(
+                name=name, description=description, mitigation_notes=mitigation_notes, tags=granted_tags, active_mechanics=mech
+            )
         filepath = await ItemCompendium.save_item(vault_path, item_def)
     else:
         mechanics = MechanicEffect(
@@ -2449,6 +2839,7 @@ async def encode_new_compendium_entry(
             category=category,
             action_type=action_type,
             description=description,
+            mitigation_notes=mitigation_notes,
             references=[source_reference],
             mechanics=mechanics,
         )
@@ -2464,6 +2855,112 @@ async def encode_new_compendium_entry(
         f"SUCCESS: '{name}' encoded to {filepath}. The engine now understands this ability."
         f"{warning} Proceed with your action."
     )
+
+
+@tool
+async def spawn_summon(
+    summoner_name: str,
+    summon_name: str,
+    summon_type: str = "tasha",
+    hp: int = 10,
+    ac: int = 10,
+    x: float = 0.0,
+    y: float = 0.0,
+    requires_concentration: bool = False,
+    spell_name: str = "",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Spawns a summoned creature or familiar into the active combat tracker and spatial map.
+    - summon_type="tasha": Acts immediately after the summoner (Initiative - 0.01).
+    - summon_type="familiar": Rolls its own independent initiative.
+    """
+    vault_path = config["configurable"].get("thread_id")
+
+    ent = await _get_entity_by_name(summon_name, vault_path)
+    if not ent:
+        details = NPCDetails(stat_block=f"AC {ac}\nHP {hp}", base_attitude="Friendly to Summoner")
+        await create_new_entity.ainvoke(
+            {
+                "entity_name": summon_name,
+                "entity_type": "NPC",
+                "background_context": f"Summoned by {summoner_name}",
+                "details": details.model_dump(),
+                "x": x,
+                "y": y,
+            },
+            config=config,
+        )
+        ent = await _get_entity_by_name(summon_name, vault_path)
+    else:
+        ent.x = x
+        ent.y = y
+        spatial_service.sync_entity(ent)
+
+    if ent:
+        updates = {"tags": getattr(ent, "tags", [])}
+        if "party_npc" not in updates["tags"]:
+            updates["tags"].append("party_npc")
+            if "party_npc" not in ent.tags:
+                ent.tags.append("party_npc")
+
+        if requires_concentration and spell_name:
+            summoner = await _get_entity_by_name(summoner_name, vault_path)
+            if summoner:
+                ent.summoned_by_uuid = summoner.entity_uuid
+                ent.summon_spell = spell_name
+                updates["summoned_by_uuid"] = str(summoner.entity_uuid)
+                updates["summon_spell"] = spell_name
+
+        await update_yaml_frontmatter.ainvoke({"entity_name": summon_name, "updates": updates}, config=config)
+
+    combat_file = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
+    if not os.path.exists(combat_file):
+        return f"MECHANICAL TRUTH: {summon_name} spawned out of combat at ({x}, {y})."
+
+    new_init = 0.0
+    try:
+        async with edit_markdown_entity(combat_file) as state:
+            yaml_data = state["yaml_data"]
+            combatants = yaml_data.get("combatants", [])
+
+            summoner_init = 0.0
+            for c in combatants:
+                if c["name"].lower() == summoner_name.lower():
+                    summoner_init = float(c.get("init", 0))
+                    break
+
+            if summon_type.lower() == "tasha":
+                new_init = summoner_init - 0.01
+            else:
+                dex_mod = ent.dexterity_mod.total if ent else 0
+                new_init = float(random.randint(1, 20) + dex_mod)
+
+            combatants.append(
+                {
+                    "name": summon_name,
+                    "init": new_init,
+                    "hp": hp,
+                    "max_hp": hp,
+                    "ac": ac,
+                    "conditions": [],
+                    "is_pc": False,
+                    "x": x,
+                    "y": y,
+                    "z": getattr(ent, "z", 0.0),
+                }
+            )
+
+            # Sort highest to lowest initiative
+            yaml_data["combatants"] = sorted(combatants, key=lambda c: float(c["init"]), reverse=True)
+
+            if vault_path in spatial_service.active_combatants:
+                spatial_service.active_combatants[vault_path].append(summon_name)
+    except Exception as e:
+        return str(e)
+
+    return f"MECHANICAL TRUTH: {summon_name} spawned at ({x}, {y}) with Initiative {new_init:.2f}."
 
 
 @tool
@@ -2519,13 +3016,35 @@ async def drop_concentration(character_name: str, *, config: Annotated[RunnableC
 
 @tool
 async def ready_action(
-    character_name: str, action_description: str, trigger_condition: str, *, config: Annotated[RunnableConfig, InjectedToolArg]
+    character_name: str,
+    action_description: str,
+    trigger_condition: str,
+    is_spell: bool = False,
+    spell_name: str = "",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
     """Saves a readied action to the ACTIVE_COMBAT.md whiteboard. The AI Planner will monitor this trigger."""
     vault_path = config["configurable"].get("thread_id")
     file_path = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
 
     try:
+        # REQ-SPL-013: Readying a spell requires concentration and expends the slot
+        if is_spell and spell_name:
+            entity = await _get_entity_by_name(character_name, vault_path)
+            if entity and isinstance(entity, Creature):
+                if entity.spell_slots_expended_this_turn > 0:
+                    return f"SYSTEM ERROR: {character_name} has already expended a spell slot this turn. (REQ-SPL-001)"
+
+                entity.spell_slots_expended_this_turn += 1
+                if entity.concentrating_on:
+                    EventBus.dispatch(
+                        GameEvent(event_type="DropConcentration", source_uuid=entity.entity_uuid, vault_path=vault_path)
+                    )
+
+                entity.concentrating_on = f"Readied: {spell_name}"
+                action_description += f" [Concentrating on {spell_name}]"
+
         async with edit_markdown_entity(file_path) as state:
             yaml_data = state["yaml_data"]
             readied = yaml_data.get("readied_actions", [])
@@ -2947,6 +3466,8 @@ async def manage_map_trap(
     hazard_name: str,
     trigger_on_interact_fail: bool = False,
     trigger_on_move: bool = False,
+    trigger_on_turn_start: bool = False,
+    is_persistent: bool = False,
     requires_attack_roll: bool = False,
     attack_bonus: int = 5,
     save_required: str = "",
@@ -2960,7 +3481,7 @@ async def manage_map_trap(
 ) -> str:
     """
     Attaches a trap or alarm to an existing wall, door, or terrain zone on the spatial map.
-    The trap will automatically trigger if someone fails to pick the lock/force it, or if someone moves through it.
+    It can trigger on interact failures, entering the zone (trigger_on_move), or starting a turn in the zone.
     """
     from spatial_engine import TrapDefinition
 
@@ -2991,6 +3512,8 @@ async def manage_map_trap(
         condition_applied=condition_applied,
         trigger_on_interact_fail=trigger_on_interact_fail,
         trigger_on_move=trigger_on_move,
+        trigger_on_turn_start=trigger_on_turn_start,
+        is_persistent=is_persistent,
         radius=radius,
     )
     return f"MECHANICAL TRUTH: Successfully trapped '{target.label}' with '{hazard_name}'."
@@ -3024,6 +3547,9 @@ async def toggle_condition(  # noqa: C901
     condition_name: str,
     is_active: bool,
     source_character_name: str = None,
+    save_required: str = "",
+    save_dc: int = 0,
+    start_of_turn_thp: int = 0,
     *,
     config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
@@ -3041,7 +3567,14 @@ async def toggle_condition(  # noqa: C901
         if is_active:
             if not any(c.name.lower() == condition_name.lower() for c in engine_creature.active_conditions):
                 engine_creature.active_conditions.append(
-                    ActiveCondition(name=condition_name.capitalize(), source_name=source_name, source_uuid=source_uuid)
+                    ActiveCondition(
+                        name=condition_name.capitalize(),
+                        source_name=source_name,
+                        source_uuid=source_uuid,
+                        save_required=save_required.lower(),
+                        save_dc=save_dc,
+                        start_of_turn_thp=start_of_turn_thp,
+                    )
                 )
 
             # Instant mechanical enforcement for 0-speed conditions
@@ -3066,6 +3599,9 @@ async def toggle_condition(  # noqa: C901
                             "duration_seconds": -1,
                             "source_name": source_name,
                             "applied_initiative": 0,
+                            "save_required": save_required.lower(),
+                            "save_dc": save_dc,
+                            "start_of_turn_thp": start_of_turn_thp,
                         }
                         if source_uuid:
                             new_cond["source_uuid"] = str(source_uuid)

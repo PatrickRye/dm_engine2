@@ -1,5 +1,4 @@
 import pytest
-from unittest.mock import patch
 
 from dnd_rules_engine import (
     Creature,
@@ -36,10 +35,11 @@ def setup_system():
 # ==========================================
 # SCENARIO A: BAROVIAN CHURCH SKIRMISH
 # ==========================================
-def test_system_barovian_church_ranged_combat():
+def test_system_barovian_church_ranged_combat(mock_dice):
     """
     System test covering: Spatial distance, difficult terrain overlaps,
     cover AC bonuses, and executing a ranged attack.
+    [Mapped: REQ-SPC-001, REQ-COR-003]
     """
     # 1. Setup Environment (Church with pews and rubble)
     pew_wall = Wall(start=(15, 0), end=(15, 10), height=3.0, is_solid=True)  # Low wall
@@ -96,7 +96,7 @@ def test_system_barovian_church_ranged_combat():
     # 4. Execution: Ranger shoots Doru behind the pew.
     # Doru is at x=20. Wall is at x=15. Ranger is at x=10.
     # The wall is 3ft high, Doru is 5ft high. This should grant Half Cover (+2 AC).
-    with patch("random.randint", side_effect=[14, 14, 5]):  # Roll 14 + 3 DEX = 17 vs AC 17 (15 + 2 Cover). HIT!
+    with mock_dice(14, 14, 5):  # Roll 14 + 3 DEX = 17 vs AC 17 (15 + 2 Cover). HIT!
         atk_event = GameEvent(event_type="MeleeAttack", source_uuid=ranger.entity_uuid, target_uuid=vampire.entity_uuid)
         EventBus.dispatch(atk_event)
 
@@ -107,10 +107,11 @@ def test_system_barovian_church_ranged_combat():
 # ==========================================
 # SCENARIO B: THE SENTINEL OF BAROVIA
 # ==========================================
-def test_system_sentinel_feat_interaction():
+def test_system_sentinel_feat_interaction(mock_dice):
     """
     System test covering: Feat tag injections overriding default mechanics,
     reaction consumption, and movement halting.
+    [Mapped: REQ-ACT-006]
     """
     fighter = Creature(
         name="Paladin",
@@ -153,7 +154,7 @@ def test_system_sentinel_feat_interaction():
 
     # 2. Simulate AI deciding to use Reaction to attack
     fighter.reaction_used = True
-    with patch("random.randint", side_effect=[15, 15, 6]):  # 15 + 4 = 19 vs AC 12 (Hit). Dmg 6 + 4 = 10.
+    with mock_dice(15, 15, 6):  # 15 + 4 = 19 vs AC 12 (Hit). Dmg 6 + 4 = 10.
         oa_event = GameEvent(event_type="MeleeAttack", source_uuid=fighter.entity_uuid, target_uuid=goblin.entity_uuid)
 
         # In production, main.py intercepts the OA flag and modifies goblin.movement_remaining if hit
@@ -169,7 +170,10 @@ def test_system_sentinel_feat_interaction():
 # SCENARIO C: ADVANCED TRAITS & MOVEMENT
 # ==========================================
 def test_system_feat_ignore_difficult_terrain():
-    """System test covering: Feat tags perfectly bypassing double movement multipliers."""
+    """
+    System test covering: Feat tags perfectly bypassing double movement multipliers.
+    [Mapped: REQ-COR-003]
+    """
     ranger = Creature(
         name="Strider",
         tags=["ignore_difficult_terrain"],
@@ -205,7 +209,10 @@ def test_system_feat_ignore_difficult_terrain():
 # SCENARIO D: LONG REST & RESOURCE RECHARGE
 # ==========================================
 def test_system_long_rest_recharge_and_expiration():
-    """System test covering: Long rest fully heals, recharges resources, and wipes out temporary conditions/buffs."""
+    """
+    System test covering: Long rest fully heals, recharges resources, and wipes out temporary conditions/buffs.
+    [Mapped: REQ-RST-004]
+    """
     wizard = Creature(
         name="Exhausted Wizard",
         max_hp=25,
@@ -251,7 +258,10 @@ def test_system_long_rest_recharge_and_expiration():
 
 
 def test_system_short_rest_mechanics():
-    """System test covering: Short rest does NOT over-heal or recharge long-rest resources, but DOES advance time for conditions."""
+    """
+    System test covering: Short rest does NOT over-heal or recharge long-rest resources, but DOES advance time for conditions.
+    [Mapped: REQ-RST-001]
+    """
     warlock = Creature(
         name="Warlock",
         max_hp=30,
@@ -293,7 +303,10 @@ def test_system_short_rest_mechanics():
 # ==========================================
 @pytest.mark.asyncio
 async def test_system_dynamic_lighting_and_combat():
-    """System test covering: Darkness giving disadvantage, and tools dynamically fixing it."""
+    """
+    System test covering: Darkness giving disadvantage, and tools dynamically fixing it.
+    [Mapped: REQ-VIS-001, REQ-VIS-006]
+    """
     human = Creature(
         name="Human",
         x=0,
@@ -339,7 +352,10 @@ async def test_system_dynamic_lighting_and_combat():
 
 @pytest.mark.asyncio
 async def test_system_dynamic_light_movement_and_static_torches():
-    """Tests that static torches remain in place while attached lights follow entities."""
+    """
+    Tests that static torches remain in place while attached lights follow entities.
+    [Mapped: REQ-VIS-007]
+    """
     pc = Creature(
         name="Lightbringer",
         x=0,
@@ -392,7 +408,10 @@ async def test_system_dynamic_light_movement_and_static_torches():
 
 @pytest.mark.asyncio
 async def test_system_disarm_and_drop_light():
-    """Tests that a dropped or disarmed light source stops following the player."""
+    """
+    Tests that a dropped or disarmed light source stops following the player.
+    [Mapped: REQ-VIS-006]
+    """
     pc = Creature(
         name="Wizard",
         x=0,
@@ -431,7 +450,10 @@ async def test_system_disarm_and_drop_light():
 
 @pytest.mark.asyncio
 async def test_system_snuff_light_source():
-    """Tests that snuffing a light source instantly plunges the area into darkness."""
+    """
+    Tests that snuffing a light source instantly plunges the area into darkness.
+    [Mapped: REQ-VIS-001]
+    """
     config = {"configurable": {"thread_id": "default"}}
     await manage_light_sources.ainvoke(
         {"action": "add", "label": "Campfire", "x": 0, "y": 0, "bright_radius": 15, "dim_radius": 30}, config=config
@@ -444,7 +466,10 @@ async def test_system_snuff_light_source():
 
 @pytest.mark.asyncio
 async def test_system_spell_illumination_areas():
-    """Tests that spells (like Daylight) correctly cast bright and dim light at specific ranges."""
+    """
+    Tests that spells (like Daylight) correctly cast bright and dim light at specific ranges.
+    [Mapped: REQ-VIS-006]
+    """
     config = {"configurable": {"thread_id": "default"}}
     # Daylight spell: 60ft bright, additional 60ft dim (120ft total)
     await manage_light_sources.ainvoke(
@@ -460,7 +485,10 @@ async def test_system_spell_illumination_areas():
 
 @pytest.mark.asyncio
 async def test_system_stealth_and_hidden_combat():
-    """Tests that characters can gain the 'Hidden' condition, gain advantage, and lose it upon attacking."""
+    """
+    Tests that characters can gain the 'Hidden' condition, gain advantage, and lose it upon attacking.
+    [Mapped: REQ-STL-002, REQ-CND-008]
+    """
     rogue = Creature(
         name="Rogue",
         x=5,
@@ -516,8 +544,11 @@ async def test_system_stealth_and_hidden_combat():
 # SCENARIO G: GRAPPLE & SHOVE CONTESTS
 # ==========================================
 @pytest.mark.asyncio
-async def test_system_grapple_contest_success_and_fail():
-    """Tests successful and unsuccessful Grapple contests."""
+async def test_system_grapple_contest_success_and_fail(mock_dice):
+    """
+    Tests successful and unsuccessful Grapple contests.
+    [Mapped: REQ-ACT-007]
+    """
     attacker = Creature(
         name="Orc",
         x=0,
@@ -552,7 +583,7 @@ async def test_system_grapple_contest_success_and_fail():
     config = {"configurable": {"thread_id": "default"}}
 
     # Test 1: Attacker Wins (Roll 15 vs 5)
-    with patch("random.randint", side_effect=[15, 15, 5]):
+    with mock_dice(15, 15, 5):
         res = await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "grapple"}, config=config
         )
@@ -563,7 +594,7 @@ async def test_system_grapple_contest_success_and_fail():
     # Test 2: Defender Wins Tie (Roll 10 vs 12, tying total at 14)
     target.active_conditions = []
     target.movement_remaining = 30
-    with patch("random.randint", side_effect=[10, 10, 12]):
+    with mock_dice(10, 10, 12):
         res = await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "grapple"}, config=config
         )
@@ -573,8 +604,11 @@ async def test_system_grapple_contest_success_and_fail():
 
 
 @pytest.mark.asyncio
-async def test_system_shove_movement_direction():
-    """Tests that a successful shove perfectly calculates the vector and pushes the target backward."""
+async def test_system_shove_movement_direction(mock_dice):
+    """
+    Tests that a successful shove perfectly calculates the vector and pushes the target backward.
+    [Mapped: REQ-ACT-007, REQ-MST-004]
+    """
     attacker = Creature(
         name="Orc",
         x=0,
@@ -609,7 +643,7 @@ async def test_system_shove_movement_direction():
 
     config = {"configurable": {"thread_id": "default"}}
 
-    with patch("random.randint", side_effect=[15, 15, 5]):
+    with mock_dice(15, 15, 5):
         res = await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "shove", "shove_type": "away"}, config=config
         )
@@ -619,8 +653,11 @@ async def test_system_shove_movement_direction():
 
 
 @pytest.mark.asyncio
-async def test_system_throw_breaks_grapple_and_knocks_prone():
-    """Tests that throwing a grappled enemy natively pushes them, knocks them prone, and breaks the grapple."""
+async def test_system_throw_breaks_grapple_and_knocks_prone(mock_dice):
+    """
+    Tests that throwing a grappled enemy natively pushes them, knocks them prone, and breaks the grapple.
+    [Mapped: REQ-ACT-007, REQ-CND-013]
+    """
     attacker = Creature(
         name="Orc",
         x=0,
@@ -655,7 +692,7 @@ async def test_system_throw_breaks_grapple_and_knocks_prone():
     config = {"configurable": {"thread_id": "default"}}
 
     # 1. Attacker successfully grapples Target
-    with patch("random.randint", side_effect=[15, 15, 5]):
+    with mock_dice(15, 15, 5):
         await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "grapple"}, config=config
         )
@@ -664,7 +701,7 @@ async def test_system_throw_breaks_grapple_and_knocks_prone():
     assert target.movement_remaining == 0
 
     # 2. Attacker successfully throws Target 15 feet
-    with patch("random.randint", side_effect=[18, 18, 4]):
+    with mock_dice(18, 18, 4):
         res = await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "throw", "throw_distance": 15.0}, config=config
         )
@@ -682,7 +719,10 @@ async def test_system_throw_breaks_grapple_and_knocks_prone():
 # ==========================================
 @pytest.mark.asyncio
 async def test_system_blindsight_vs_invisibility():
-    """System test: Blindsight ignores invisibility and darkness."""
+    """
+    System test: Blindsight ignores invisibility and darkness.
+    [Mapped: REQ-VIS-003]
+    """
     bat = Creature(
         name="Giant Bat",
         tags=["blindsight_60"],
@@ -722,7 +762,10 @@ async def test_system_blindsight_vs_invisibility():
 
 @pytest.mark.asyncio
 async def test_system_tremorsense_vs_flying():
-    """System test: Tremorsense works in darkness but fails on flying targets."""
+    """
+    System test: Tremorsense works in darkness but fails on flying targets.
+    [Mapped: REQ-VIS-004]
+    """
     bulette = Creature(
         name="Bulette",
         tags=["tremorsense_60"],
@@ -763,7 +806,9 @@ async def test_system_tremorsense_vs_flying():
 
     atk_ground = GameEvent(event_type="MeleeAttack", source_uuid=bulette.entity_uuid, target_uuid=ground_target.entity_uuid)
     EventBus.dispatch(atk_ground)
-    assert atk_ground.payload.get("disadvantage") is not True  # Can sense ground target
+    assert (
+        atk_ground.payload.get("disadvantage") is True
+    )  # Tremorsense does not negate unseen attacker disadvantage (REQ-VIS-004)
 
     atk_flying = GameEvent(event_type="MeleeAttack", source_uuid=bulette.entity_uuid, target_uuid=flying_target.entity_uuid)
     EventBus.dispatch(atk_flying)
@@ -772,7 +817,10 @@ async def test_system_tremorsense_vs_flying():
 
 @pytest.mark.asyncio
 async def test_system_darkvision_range_limit():
-    """System test: Darkvision only works up to its specified range."""
+    """
+    System test: Darkvision only works up to its specified range.
+    [Mapped: REQ-VIS-007]
+    """
     elf = Creature(
         name="Elf",
         tags=["darkvision_60"],
@@ -819,12 +867,181 @@ async def test_system_darkvision_range_limit():
     assert atk_far.payload.get("disadvantage") is True  # 70ft > 60ft Darkvision
 
 
+@pytest.mark.asyncio
+async def test_system_silence_zone_blinds_echolocation():
+    """
+    System test: Moving into a Silence zone dynamically applies the Deafened condition,
+    which blinds an echolocating creature.
+    [Mapped: REQ-ENV-011, REQ-VIS-010]
+    """
+    bat = Creature(
+        name="Giant Bat",
+        tags=["blindsight_60", "echolocation"],
+        x=0,
+        y=0,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    invisible_mage = Creature(
+        name="Mage",
+        tags=["invisible"],
+        x=5,
+        y=0,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    spatial_service.sync_entity(bat)
+    spatial_service.sync_entity(invisible_mage)
+    spatial_service.map_data.lights.clear()
+
+    # Create a silence zone over the bat
+    zone = TerrainZone(label="Silence Sphere", points=[(-5, -5), (5, -5), (5, 5), (-5, 5)], tags=["silence"])
+    spatial_service.add_terrain(zone)
+
+    # Dispatch a dummy event to trigger the sync handler
+    EventBus.dispatch(GameEvent(event_type="AdvanceTime", source_uuid=bat.entity_uuid, payload={"seconds_advanced": 0}))
+
+    assert any(c.name == "Deafened" and c.source_name == "Magical Silence" for c in bat.active_conditions)
+
+    atk_event = GameEvent(event_type="MeleeAttack", source_uuid=bat.entity_uuid, target_uuid=invisible_mage.entity_uuid)
+    EventBus.dispatch(atk_event)
+
+    # Bat is deafened by the zone, echolocation fails, attacks invisible target with Disadvantage
+    assert atk_event.payload.get("disadvantage") is True
+
+
+@pytest.mark.asyncio
+async def test_system_silence_zone_preserves_existing_deafness():
+    """
+    System test: Exiting a Silence zone removes Magical Silence deafness but preserves pre-existing natural deafness.
+    [Mapped: REQ-ENV-011]
+    """
+    old_man = Creature(
+        name="Old Man",
+        x=0,
+        y=0,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        active_conditions=[ActiveCondition(name="Deafened", source_name="Natural Aging")],
+    )
+    spatial_service.sync_entity(old_man)
+
+    zone = TerrainZone(label="Silence Sphere", points=[(-5, -5), (5, -5), (5, 5), (-5, 5)], tags=["silence"])
+    spatial_service.add_terrain(zone)
+
+    # 1. Sync inside the zone
+    EventBus.dispatch(GameEvent(event_type="AdvanceTime", source_uuid=old_man.entity_uuid, payload={"seconds_advanced": 0}))
+    deaf_conds = [c for c in old_man.active_conditions if c.name == "Deafened"]
+    assert len(deaf_conds) == 2  # Has both Natural and Magical Silence
+
+    # 2. Move out of the zone
+    old_man.x = 20
+    spatial_service.sync_entity(old_man)
+    move_event = GameEvent(
+        event_type="Movement",
+        source_uuid=old_man.entity_uuid,
+        payload={"target_x": 20, "target_y": 0, "movement_type": "walk"},
+    )
+    EventBus.dispatch(move_event)
+
+    # 3. Should lose Magical Silence but keep Natural Aging
+    deaf_conds_after = [c for c in old_man.active_conditions if c.name == "Deafened"]
+    assert len(deaf_conds_after) == 1
+    assert deaf_conds_after[0].source_name == "Natural Aging"
+
+
+@pytest.mark.asyncio
+async def test_system_tremorsense_vs_pass_without_trace():
+    """
+    System test: Tremorsense is thwarted by Pass without Trace.
+    [Mapped: REQ-VIS-011]
+    """
+    bulette = Creature(
+        name="Bulette",
+        tags=["tremorsense_60"],
+        x=0,
+        y=0,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    rogue = Creature(
+        name="Rogue",
+        tags=["invisible"],
+        active_conditions=[ActiveCondition(name="Pass_Without_Trace")],
+        x=5,
+        y=0,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    spatial_service.sync_entity(bulette)
+    spatial_service.sync_entity(rogue)
+    spatial_service.map_data.lights.clear()
+
+    atk_event = GameEvent(event_type="MeleeAttack", source_uuid=bulette.entity_uuid, target_uuid=rogue.entity_uuid)
+    EventBus.dispatch(atk_event)
+
+    # Tremorsense is foiled, target is invisible. Bulette attacks with disadvantage.
+    assert atk_event.payload.get("disadvantage") is True
+
+
+@pytest.mark.asyncio
+async def test_system_devils_sight_vs_darkness():
+    """
+    System test: Devil's Sight sees through total darkness perfectly, negating disadvantage.
+    [Mapped: REQ-VIS-009]
+    """
+    warlock = Creature(
+        name="Warlock",
+        tags=["devils_sight_120"],
+        x=0,
+        y=0,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    goblin = Creature(
+        name="Goblin",
+        tags=[],
+        x=5,
+        y=0,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    spatial_service.sync_entity(warlock)
+    spatial_service.sync_entity(goblin)
+    spatial_service.map_data.lights.clear()
+
+    atk_event = GameEvent(event_type="MeleeAttack", source_uuid=warlock.entity_uuid, target_uuid=goblin.entity_uuid)
+    EventBus.dispatch(atk_event)
+
+    # Warlock sees perfectly, so no disadvantage.
+    # Target cannot see the Warlock due to darkness, giving Warlock unseen attacker advantage!
+    assert atk_event.payload.get("disadvantage") is not True
+    assert atk_event.payload.get("advantage") is True
+
+
 # ==========================================
 # SCENARIO H: ENVIRONMENTAL HAZARDS
 # ==========================================
 @pytest.mark.asyncio
-async def test_system_trigger_environmental_hazard():
-    """Tests the trigger_environmental_hazard tool for applying AoE saves, damage, and conditions."""
+async def test_system_trigger_environmental_hazard(mock_dice, mock_roll_dice):
+    """
+    Tests the trigger_environmental_hazard tool for applying AoE saves, damage, and conditions.
+    [Mapped: REQ-EDG-001, REQ-SPL-018]
+    """
     rogue = Creature(
         name="Rogue",
         tags=["evasion"],
@@ -862,7 +1079,7 @@ async def test_system_trigger_environmental_hazard():
 
     # Trigger a Poison Gas Trap at (5, 0) with a 20ft radius
     # DC 15 Dex save, 4d6 poison, applies 'Poisoned'
-    with patch("random.randint", return_value=5):  # Saves roll 5 (Rogue 10 FAIL, Fighter 4 FAIL). Damage rolls 5 (4d6 = 20).
+    with mock_roll_dice(default=20), mock_dice(default=5):  # Saves roll 5 (FAIL). Forced flat Damage rolls 20.
         res = await trigger_environmental_hazard.ainvoke(
             {
                 "hazard_name": "Poison Gas Trap",
@@ -899,8 +1116,11 @@ async def test_system_trigger_environmental_hazard():
 # SCENARIO I: TRAPS & HAZARDS AUTOMATION
 # ==========================================
 @pytest.mark.asyncio
-async def test_system_trap_interaction_fail():
-    """Tests that failing to pick a trapped lock natively explodes in the PC's face."""
+async def test_system_trap_interaction_fail(mock_dice):
+    """
+    Tests that failing to pick a trapped lock natively explodes in the PC's face.
+    [Mapped: REQ-TOL-002]
+    """
     rogue = Creature(
         name="Rogue",
         x=0,
@@ -932,7 +1152,7 @@ async def test_system_trap_interaction_fail():
     )
 
     # 2. Interact - Fail (Roll 5 lockpick + Mod fails DC 20. Then Roll 5 Save fails DC 15. Damage rolls 8)
-    with patch("random.randint", side_effect=[5, 8, 5, 5]):
+    with mock_dice(5, 8, 5, 5):
         res = await interact_with_object.ainvoke(
             {"character_name": "Rogue", "target_label": "Chest", "interaction_type": "lockpick"}, config=config
         )
@@ -944,8 +1164,11 @@ async def test_system_trap_interaction_fail():
 
 
 @pytest.mark.asyncio
-async def test_system_trap_stealth_perception_hook():
-    """Tests that a triggered trap globally alerts NPCs whose distance-modified Passive Perception beats the triggerer's Stealth."""
+async def test_system_trap_stealth_perception_hook(mock_dice):
+    """
+    Tests that a triggered trap globally alerts NPCs whose distance-modified Passive Perception beats the triggerer's Stealth.
+    [Mapped: REQ-STL-001]
+    """
     rogue = Creature(
         name="Sneaky Rogue",
         tags=["pc"],
@@ -989,7 +1212,7 @@ async def test_system_trap_stealth_perception_hook():
     config = {"configurable": {"thread_id": "default"}}
 
     # Trigger Trap
-    with patch("random.randint", return_value=10):
+    with mock_dice(default=10):
         res = await trigger_environmental_hazard.ainvoke(
             {
                 "hazard_name": "Clicking Floorplate",
@@ -1008,8 +1231,11 @@ async def test_system_trap_stealth_perception_hook():
 
 
 @pytest.mark.asyncio
-async def test_system_trap_movement_trigger():
-    """Tests that moving through a trapped terrain natively calculates the damage."""
+async def test_system_trap_movement_trigger(mock_dice):
+    """
+    Tests that moving through a trapped terrain natively calculates the damage.
+    [Mapped: REQ-EDG-001]
+    """
     fighter = Creature(
         name="Fighter",
         x=0,
@@ -1042,7 +1268,7 @@ async def test_system_trap_movement_trigger():
     )
 
     # 2. Move through
-    with patch("random.randint", side_effect=[6, 4, 5, 5]):  # Dmg roll 6 and 4 (Total 10), Save roll 5, 5
+    with mock_dice(6, 4, 5, 5):  # Dmg roll 6 and 4 (Total 10), Save roll 5, 5
         res = await move_entity.ainvoke(
             {"entity_name": "Fighter", "target_x": 20, "target_y": 0, "movement_type": "walk"}, config=config
         )
@@ -1051,8 +1277,54 @@ async def test_system_trap_movement_trigger():
     assert fighter.hp.base_value == 20  # 30 - 10
 
 
-def test_system_concentration_buff_and_debuff_expiration():
-    """Tests that dropping concentration removes stats and conditions across multiple entities."""
+@pytest.mark.asyncio
+async def test_system_start_of_turn_hazard(mock_dice, mock_roll_dice):
+    """
+    Tests that a persistent hazard natively damages entities that start their turn inside of it.
+    [Mapped: REQ-EDG-002]
+    """
+    fighter = Creature(
+        name="Fighter",
+        x=0,
+        y=0,
+        hp=ModifiableValue(base_value=30),
+        ac=ModifiableValue(base_value=18),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    spatial_service.sync_entity(fighter)
+    config = {"configurable": {"thread_id": "default"}}
+
+    zone = TerrainZone(label="Flaming Sphere", points=[(-5, -5), (5, -5), (5, 5), (-5, 5)], is_difficult=False)
+    spatial_service.add_terrain(zone)
+
+    await manage_map_trap.ainvoke(
+        {
+            "target_label": "Flaming Sphere",
+            "hazard_name": "Fire Damage",
+            "trigger_on_turn_start": True,
+            "is_persistent": True,
+            "save_required": "dexterity",
+            "save_dc": 15,
+            "damage_dice": "2d6",
+            "damage_type": "fire",
+        },
+        config=config,
+    )
+
+    with mock_roll_dice(default=10), mock_dice(default=5):  # Dmg 10, Save fails
+        sot_event = GameEvent(event_type="StartOfTurn", source_uuid=fighter.entity_uuid, vault_path="default")
+        res = EventBus.dispatch(sot_event)
+
+    assert any("Fire Damage" in r for r in res.payload.get("results", []))
+    assert fighter.hp.base_value == 20
+
+
+def test_system_concentration_buff_and_debuff_expiration(mock_dice):
+    """
+    Tests that dropping concentration removes stats and conditions across multiple entities.
+    [Mapped: REQ-CND-019]
+    """
     caster = Creature(
         name="Cleric",
         hp=ModifiableValue(base_value=20),
@@ -1136,3 +1408,208 @@ def test_system_concentration_buff_and_debuff_expiration():
     assert caster.concentrating_on == ""
     assert enemy1.dexterity_mod.total == 2  # Back to base
     assert not any(c.name == "Baned" for c in enemy1.active_conditions)
+
+
+@pytest.mark.asyncio
+async def test_system_silence_thunder_immunity():
+    """
+    System test: Magical Silence grants immunity to thunder damage.
+    [Mapped: REQ-SND-004]
+    """
+    bard = Creature(
+        name="Bard",
+        x=0,
+        y=0,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        active_conditions=[ActiveCondition(name="Silenced", source_name="Magical Silence")],
+    )
+    spatial_service.sync_entity(bard)
+
+    # Apply Thunder Damage
+    dmg_event = GameEvent(
+        event_type="MeleeAttack",
+        source_uuid=bard.entity_uuid,
+        target_uuid=bard.entity_uuid,
+        payload={"hit": True, "damage": 15, "damage_type": "thunder"},
+    )
+    dmg_event.status = EventStatus.POST_EVENT
+    EventBus._notify(dmg_event)
+
+    assert bard.hp.base_value == 20  # Immune!
+
+    # Apply Fire Damage (should still work normally)
+    dmg_event_fire = GameEvent(
+        event_type="MeleeAttack",
+        source_uuid=bard.entity_uuid,
+        target_uuid=bard.entity_uuid,
+        payload={"hit": True, "damage": 5, "damage_type": "fire"},
+    )
+    dmg_event_fire.status = EventStatus.POST_EVENT
+    EventBus._notify(dmg_event_fire)
+
+    assert bard.hp.base_value == 15
+
+
+@pytest.mark.asyncio
+async def test_system_bound_blocks_somatic_spells():
+    """
+    System test: A Bound character cannot cast a spell with Somatic/Material components.
+    [Mapped: REQ-SPL-014, REQ-CND-020]
+    """
+    config = {"configurable": {"thread_id": "default"}}
+
+    wizard = Creature(
+        name="Wizard",
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        active_conditions=[ActiveCondition(name="Bound")],
+    )
+    goblin = Creature(
+        name="Goblin",
+        x=5,
+        y=0,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    spatial_service.sync_entity(wizard)
+    spatial_service.sync_entity(goblin)
+
+    from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
+    from tools import use_ability_or_spell
+
+    spell = SpellDefinition(name="Fire Bolt", level=0, components=["V", "S"], mechanics=SpellMechanics())
+    await SpellCompendium.save_spell("default", spell)
+
+    res = await use_ability_or_spell.ainvoke(
+        {"caster_name": "Wizard", "ability_name": "Fire Bolt", "target_names": ["Goblin"]}, config=config
+    )
+    assert "SYSTEM ERROR" in res
+    assert "Somatic/Material" in res
+    assert "Bound" in res
+
+
+@pytest.mark.asyncio
+async def test_war_caster_feat_somatic_override(mock_obsidian_vault, mock_dice):
+    """
+    System test: War Caster allows casting spells with S components even when hands are full.
+    [Mapped: REQ-SPL-022]
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    import os
+    from vault_io import get_journals_dir
+
+    j_dir = get_journals_dir(vault_path)
+    os.makedirs(j_dir, exist_ok=True)
+    with open(os.path.join(j_dir, "Cleric.md"), "w") as f:
+        f.write("---\nname: Cleric\nequipment:\n  main_hand: Mace\n  shield: Heavy Shield\n---")
+
+    cleric = Creature(
+        name="Cleric",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    spatial_service.sync_entity(cleric)
+
+    from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
+
+    spell = SpellDefinition(name="Cure Wounds", level=1, components=["V", "S"], mechanics=SpellMechanics())
+    await SpellCompendium.save_spell(vault_path, spell)
+
+    from tools import use_ability_or_spell
+
+    # 1. Hands full, no feat -> Fails
+    res1 = await use_ability_or_spell.ainvoke(
+        {"caster_name": "Cleric", "ability_name": "Cure Wounds", "target_names": ["Cleric"]}, config=config
+    )
+    assert "SYSTEM ERROR" in res1
+    assert "both hands are full" in res1
+
+    # 2. Add war_caster -> Succeeds
+    cleric.tags.append("war_caster")
+    res2 = await use_ability_or_spell.ainvoke(
+        {"caster_name": "Cleric", "ability_name": "Cure Wounds", "target_names": ["Cleric"]}, config=config
+    )
+    assert "MECHANICAL TRUTH" in res2
+
+
+@pytest.mark.asyncio
+async def test_strict_material_components_and_penalties(mock_obsidian_vault, mock_dice):
+    """
+    System test: Strict Material Config forces M failures when hands are full without a focus.
+    Strict Penalty Config actively consumes the spell slot upon failure.
+    [Mapped: REQ-SPL-023, REQ-SPL-024]
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    import os
+    from vault_io import get_journals_dir
+
+    j_dir = get_journals_dir(vault_path)
+    os.makedirs(j_dir, exist_ok=True)
+    with open(os.path.join(vault_path, "DM_CONFIG.md"), "w") as f:
+        f.write("---\nsettings:\n  strict_material_components: true\n  strict_vsm_penalties: true\n---")
+
+    with open(os.path.join(j_dir, "Wizard.md"), "w") as f:
+        f.write("---\nname: Wizard\nequipment:\n  main_hand: Sword\n  off_hand: Dagger\n---")
+
+    wizard = Creature(
+        name="Wizard",
+        vault_path=vault_path,
+        tags=["war_caster"],
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    spatial_service.sync_entity(wizard)
+
+    from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
+
+    spell = SpellDefinition(name="Fireball", level=3, components=["V", "S", "M"], mechanics=SpellMechanics())
+    await SpellCompendium.save_spell(vault_path, spell)
+
+    from item_system import WeaponItem, ItemCompendium
+
+    sword = WeaponItem(name="Sword")
+    dagger = WeaponItem(name="Dagger")
+    await ItemCompendium.save_item(vault_path, sword)
+    await ItemCompendium.save_item(vault_path, dagger)
+
+    from tools import use_ability_or_spell
+
+    # 1. Hands full with normal weapons, War Caster bypasses S, but Strict Materials catches M.
+    # Strict Penalties will also deduct the spell slot!
+    assert wizard.spell_slots_expended_this_turn == 0
+    res1 = await use_ability_or_spell.ainvoke(
+        {"caster_name": "Wizard", "ability_name": "Fireball", "target_names": ["Wizard"]}, config=config
+    )
+    assert "SYSTEM ERROR" in res1
+    assert "Material (M) components" in res1
+    assert "STRICT MODE PENALTY" in res1
+    assert wizard.spell_slots_expended_this_turn == 1
+
+    # 2. Swap dagger for a Wand (spellcasting_focus)
+    wizard.spell_slots_expended_this_turn = 0
+    with open(os.path.join(j_dir, "Wizard.md"), "w") as f:
+        f.write("---\nname: Wizard\nequipment:\n  main_hand: Sword\n  off_hand: Magic Wand\n---")
+    wand = WeaponItem(name="Magic Wand", tags=["spellcasting_focus"])
+    await ItemCompendium.save_item(vault_path, wand)
+
+    res2 = await use_ability_or_spell.ainvoke(
+        {"caster_name": "Wizard", "ability_name": "Fireball", "target_names": ["Wizard"]}, config=config
+    )
+    assert "MECHANICAL TRUTH" in res2
+    assert wizard.spell_slots_expended_this_turn == 1  # properly expended by success this time

@@ -135,7 +135,10 @@ async def test_tool_to_eventbus_combat(mock_entities):
 
 @pytest.mark.asyncio
 async def test_tool_level_up_character(mock_entities):
-    """Tests that a character levels up, max_hp increases, and JSON compendium features are applied."""
+    """
+    Tests that a character levels up, max_hp increases, and JSON compendium features are applied.
+    [Mapped: REQ-BUI-009]
+    """
     vault_path, char_name, target_name = mock_entities
     await initialize_engine_from_vault(vault_path)
 
@@ -164,7 +167,10 @@ async def test_tool_level_up_character(mock_entities):
 
 @pytest.mark.asyncio
 async def test_tool_ability_check_engine_coupling(mock_entities):
-    """Tests that perform_ability_check_or_save respects live in-memory Engine modifiers, not just static YAML."""
+    """
+    Tests that perform_ability_check_or_save respects live in-memory Engine modifiers, not just static YAML.
+    [Mapped: REQ-SKL-001]
+    """
     vault_path, char_name, target_name = mock_entities
     await initialize_engine_from_vault(vault_path)
     config = {"configurable": {"thread_id": vault_path}}
@@ -190,7 +196,10 @@ async def test_tool_ability_check_engine_coupling(mock_entities):
 
 @pytest.mark.asyncio
 async def test_tool_modify_health_concentration_coupling(mock_entities):
-    """Tests that modify_health successfully alerts the LLM and/or drops concentration when bypassing the EventBus."""
+    """
+    Tests that modify_health successfully alerts the LLM and/or drops concentration when bypassing the EventBus.
+    [Mapped: REQ-CND-017, REQ-CND-018]
+    """
     vault_path, char_name, target_name = mock_entities
     await initialize_engine_from_vault(vault_path)
     config = {"configurable": {"thread_id": vault_path}}
@@ -213,7 +222,10 @@ async def test_tool_modify_health_concentration_coupling(mock_entities):
 
 @pytest.mark.asyncio
 async def test_tool_modify_health_respects_resistances(mock_entities):
-    """Tests that modify_health enforces damage resistances and immunities without hallucinating."""
+    """
+    Tests that modify_health enforces damage resistances and immunities without hallucinating.
+    [Mapped: REQ-DMG-004]
+    """
     vault_path, char_name, target_name = mock_entities
     await initialize_engine_from_vault(vault_path)
     config = {"configurable": {"thread_id": vault_path}}
@@ -232,7 +244,10 @@ async def test_tool_modify_health_respects_resistances(mock_entities):
 
 @pytest.mark.asyncio
 async def test_tool_opportunity_attack_integration(mock_entities):
-    """Tests that moving out of reach triggers an OA alert and execute_melee_attack resolves it as an async task."""
+    """
+    Tests that moving out of reach triggers an OA alert and execute_melee_attack resolves it as an async task.
+    [Mapped: REQ-ACT-006]
+    """
     from main import app
     from fastapi.testclient import TestClient
 
@@ -272,7 +287,10 @@ async def test_tool_opportunity_attack_integration(mock_entities):
 
 @pytest.mark.asyncio
 async def test_tool_manage_skill_challenge(mock_entities):
-    """Tests that a skill challenge creates a whiteboard, tracks stats, and logs completion to the master log."""
+    """
+    Tests that a skill challenge creates a whiteboard, tracks stats, and logs completion to the master log.
+    [Mapped: REQ-ENV-009]
+    """
     vault_path, _, _ = mock_entities
     config = {"configurable": {"thread_id": vault_path}}
 

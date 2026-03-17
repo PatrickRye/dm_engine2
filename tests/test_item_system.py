@@ -23,6 +23,7 @@ async def test_unequip_item_removes_override(setup_engine_and_vault):
     """
     Test that equipping an item with a high StatModifier applies an OVERRIDE priority,
     and that overwriting the slot with 'None' cleanly removes the override from the Creature.
+    [Mapped: REQ-LOT-004]
     """
     vault_path = setup_engine_and_vault
     j_dir = get_journals_dir(vault_path)
@@ -74,6 +75,7 @@ async def test_unattune_item_removes_override(setup_engine_and_vault):
     """
     Test that a magic item requiring attunement won't apply modifiers until attuned,
     and that unattuning correctly removes the OVERRIDE priority modifiers.
+    [Mapped: REQ-LOT-004]
     """
     vault_path = setup_engine_and_vault
     j_dir = get_journals_dir(vault_path)
@@ -120,10 +122,11 @@ async def test_unattune_item_removes_override(setup_engine_and_vault):
 
 
 @pytest.mark.asyncio
-async def test_wondrous_item_casts_spell(setup_engine_and_vault):
+async def test_wondrous_item_casts_spell(setup_engine_and_vault, mock_dice, mock_roll_dice):
     """
     Test that a WondrousItem with an active_mechanics block can be correctly
     loaded and cast using the use_ability_or_spell tool natively.
+    [Mapped: REQ-SPL-003]
     """
     vault_path = setup_engine_and_vault
 
@@ -172,7 +175,7 @@ async def test_wondrous_item_casts_spell(setup_engine_and_vault):
     config = {"configurable": {"thread_id": vault_path}}
 
     # Mock random rolls so the Goblin fails the save and takes exactly 30 damage
-    with patch("event_handlers.roll_dice", return_value=30), patch("random.randint", return_value=5):
+    with mock_roll_dice(default=30), mock_dice(default=5):
         res = await use_ability_or_spell.ainvoke(
             {"caster_name": "Mage", "ability_name": "Wand of Fireballs", "target_names": ["Goblin"]}, config=config
         )
@@ -183,12 +186,13 @@ async def test_wondrous_item_casts_spell(setup_engine_and_vault):
 
 
 @pytest.mark.asyncio
-async def test_wondrous_item_charge_variants(setup_engine_and_vault):
+async def test_wondrous_item_charge_variants(setup_engine_and_vault, mock_roll_dice):
     """
     Test WondrousItems casting spells with different usage limits:
     1. Unlimited uses.
     2. Total limited uses (consumable charges).
     3. Rechargeable uses.
+    [Mapped: REQ-SPL-003]
     """
     vault_path = setup_engine_and_vault
 
@@ -260,7 +264,7 @@ async def test_wondrous_item_charge_variants(setup_engine_and_vault):
 
     config = {"configurable": {"thread_id": vault_path}}
 
-    with patch("event_handlers.roll_dice", return_value=10):
+    with mock_roll_dice(default=10):
         # Cast Unlimited
         res1 = await use_ability_or_spell.ainvoke(
             {"caster_name": "Mage", "ability_name": "Wand of Unlimited Sparks", "target_names": ["Goblin"]}, config=config
@@ -284,10 +288,11 @@ async def test_wondrous_item_charge_variants(setup_engine_and_vault):
 
 
 @pytest.mark.asyncio
-async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault):
+async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault, mock_dice, mock_roll_dice):
     """
     Test that equipping a WeaponItem creates a MeleeWeapon entity with the
     correct magic_bonus, and that the engine natively applies it to attack and damage rolls.
+    [Mapped: REQ-DMG-005]
     """
     vault_path = setup_engine_and_vault
     j_dir = get_journals_dir(vault_path)
@@ -349,7 +354,7 @@ async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault):
     # Verify combat calculations natively apply the +2
     # AC is 12. Roll 10 + 0 STR + 2 Magic = 12 (Hit).
     # Damage: Roll 5 + 0 STR + 2 Magic = 7 damage.
-    with patch("event_handlers.random.randint", return_value=10), patch("event_handlers.roll_dice", return_value=5):
+    with mock_dice(default=10), mock_roll_dice(default=5):
         res = await execute_melee_attack.ainvoke({"attacker_name": "Fighter", "target_name": "Goblin"}, config=config)
 
     assert "HIT!" in res
@@ -361,6 +366,7 @@ async def test_weapon_item_applies_magic_bonus(setup_engine_and_vault):
 async def test_armor_item_restrictions(setup_engine_and_vault):
     """
     Test mapping of ArmorItems with AC max DEX validation, and attunement restrictions.
+    [Mapped: REQ-ARM-001]
     """
     vault_path = setup_engine_and_vault
     j_dir = get_journals_dir(vault_path)
@@ -432,6 +438,7 @@ async def test_armor_item_restrictions(setup_engine_and_vault):
 async def test_attune_item_enforces_restrictions(setup_engine_and_vault):
     """
     Test that the attune_item tool enforces class, species, and alignment restrictions.
+    [Mapped: REQ-LOT-006]
     """
     vault_path = setup_engine_and_vault
     j_dir = get_journals_dir(vault_path)
@@ -514,6 +521,7 @@ async def test_equip_item_slot_management(setup_engine_and_vault):
     Test that the equip_item tool accurately blocks equipping into occupied slots
     (e.g., all ring slots full, boots, armor, and aliases like helmet/necklace/bracers),
     and that it allows for more than one (like rings) when appropriate.
+    [Mapped: REQ-INV-001]
     """
     vault_path = setup_engine_and_vault
     j_dir = get_journals_dir(vault_path)

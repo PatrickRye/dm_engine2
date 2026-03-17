@@ -22,6 +22,7 @@ from dnd_rules_engine import (
 from compendium_manager import CompendiumManager
 from spatial_engine import spatial_service
 from registry import clear_registry, get_all_entities
+from item_system import ItemCompendium, WeaponItem
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from prompts import VISION_MAP_INGESTION_PROMPT
@@ -114,6 +115,10 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
         if not any(t in tags for t in ["pc", "npc", "monster", "creature"]):
             return None
 
+        summoned_by_uuid_str = yaml_data.get("summoned_by_uuid")
+        summoned_by_uuid = uuid.UUID(summoned_by_uuid_str) if summoned_by_uuid_str else None
+        summon_spell = yaml_data.get("summon_spell", "")
+
         entity = Creature(
             vault_path=vault_path,
             name=yaml_data.get("name", os.path.basename(filepath).replace(".md", "")),
@@ -124,6 +129,7 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
             height=float(yaml_data.get("height", yaml_data.get("size", 5.0))),
             max_hp=int(yaml_data.get("max_hp", yaml_data.get("hp", 10))),
             hp=ModifiableValue(base_value=yaml_data.get("hp", 10)),
+            temp_hp=int(yaml_data.get("temp_hp", 0)),
             ac=ModifiableValue(base_value=yaml_data.get("ac", 10)),
             strength_mod=ModifiableValue(
                 base_value=yaml_data.get(
@@ -170,7 +176,10 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
             legendary_actions_current=int(yaml_data.get("legendary_actions_current", yaml_data.get("legendary_actions", 0))),
             speed=int(yaml_data.get("speed", 30)),
             movement_remaining=int(yaml_data.get("movement_remaining", yaml_data.get("speed", 30))),
+            exhaustion_level=int(yaml_data.get("exhaustion_level", 0)),
             tags=yaml_data.get("tags", []),
+            summoned_by_uuid=summoned_by_uuid,
+            summon_spell=summon_spell,
         )
 
         # Bridge: Initialize and Equip the Object-Oriented Weapon
@@ -181,6 +190,23 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
         dmg_type = "bludgeoning" if "Unarmed" in main_hand else "slashing"
 
         weapon = MeleeWeapon(name=main_hand, damage_dice=dmg_dice, damage_type=dmg_type, vault_path=vault_path)
+
+        weapon_item = await ItemCompendium.load_item(vault_path, main_hand)
+        if weapon_item and isinstance(weapon_item, WeaponItem):
+            weapon.damage_dice = weapon_item.damage_dice
+            weapon.damage_type = weapon_item.damage_type
+            weapon.magic_bonus = weapon_item.magic_bonus
+            weapon.mastery_name = getattr(weapon_item, "mastery_name", "")
+
+            if weapon.mastery_name and "weapon_mastery" in entity.tags:
+                mastery_entry = await CompendiumManager.get_entry(vault_path, weapon.mastery_name)
+                if mastery_entry and mastery_entry.mechanics:
+                    dumped = mastery_entry.mechanics.model_dump()
+                    if mastery_entry.mechanics.trigger_event == "on_hit":
+                        weapon.on_hit_mechanics = dumped
+                    elif mastery_entry.mechanics.trigger_event == "on_miss":
+                        weapon.on_miss_mechanics = dumped
+
         entity.equipped_weapon_uuid = weapon.entity_uuid
 
         for mechanic_name in entity.active_mechanics:
@@ -272,6 +298,7 @@ async def sync_engine_to_vault(vault_path: str):
             # Update the YAML with the new deterministic values
             if isinstance(entity, Creature):
                 yaml_data["hp"] = entity.hp.base_value
+                yaml_data["temp_hp"] = entity.temp_hp
                 yaml_data["ac"] = entity.ac.base_value
                 yaml_data["x"] = entity.x
                 yaml_data["y"] = entity.y
@@ -291,6 +318,10 @@ async def sync_engine_to_vault(vault_path: str):
             yaml_data["legendary_actions_current"] = entity.legendary_actions_current
             yaml_data["speed"] = entity.speed
             yaml_data["movement_remaining"] = entity.movement_remaining
+            yaml_data["exhaustion_level"] = entity.exhaustion_level
+            if entity.summoned_by_uuid:
+                yaml_data["summoned_by_uuid"] = str(entity.summoned_by_uuid)
+                yaml_data["summon_spell"] = entity.summon_spell
 
             # Reconstruct the file
             new_yaml_str = await asyncio.to_thread(yaml.dump, yaml_data, sort_keys=False)

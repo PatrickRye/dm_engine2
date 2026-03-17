@@ -54,7 +54,9 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
 
     if mechanics.requires_concentration:
         if caster.concentrating_on:
-            EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=caster.entity_uuid))
+            EventBus.dispatch(
+                GameEvent(event_type="DropConcentration", source_uuid=caster.entity_uuid, vault_path=event.vault_path)
+            )
         caster.concentrating_on = event.payload.get("ability_name", "Unknown")
         print(f"[Engine] {caster.name} is now concentrating on {caster.concentrating_on}.")
 
@@ -148,6 +150,7 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
 
         target_damage = base_damage
         hit_or_save_str = "Auto-hit"
+        dc = caster.spell_save_dc.total if hasattr(caster, "spell_save_dc") else 10
 
         # 1. Spell Attack Roll
         if requires_attack_roll:
@@ -195,7 +198,6 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                 save_roll = 1
             else:
                 total_save = save_roll + save_mod_val
-            dc = caster.spell_save_dc.total
 
             is_success = total_save >= dc
 
@@ -230,17 +232,31 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
         if target_damage > 0:
             event.payload["hit"] = True  # Flag for potential reaction handlers
             # Apply resistances/vulnerabilities
-            if damage_type in target.immunities:
+            is_magically_silenced = any(
+                c.name.lower() == "silenced" and "silence" in c.source_name.lower() for c in target.active_conditions
+            )
+            if damage_type in target.immunities or (damage_type == "thunder" and is_magically_silenced):
                 target_damage = 0
             elif damage_type in target.vulnerabilities:
                 target_damage *= 2
             elif damage_type in target.resistances:
                 target_damage = target_damage // 2
+
+            if target_damage > 0 and target.temp_hp > 0:
+                if target_damage >= target.temp_hp:
+                    target_damage -= target.temp_hp
+                    target.temp_hp = 0
+                else:
+                    target.temp_hp -= target_damage
+                    target_damage = 0
+
             target.hp.base_value -= target_damage
 
             if target.hp.base_value <= 0:
                 if target.concentrating_on:
-                    EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid))
+                    EventBus.dispatch(
+                        GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid, vault_path=event.vault_path)
+                    )
             elif target_damage > 0 and target.concentrating_on:
                 dc = max(10, target_damage // 2)
                 msg = (
@@ -262,6 +278,10 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
             for cond_data in mechanics.conditions_applied:
                 cond_name = cond_data.condition
                 duration_secs = parse_duration_to_seconds(cond_data.duration)
+                eot_save = getattr(cond_data, "end_of_turn_save", False)
+                sot_thp = getattr(cond_data, "start_of_turn_thp", 0)
+                s_req = save_required if eot_save else ""
+                s_dc = dc if eot_save else 0
 
                 target.active_conditions.append(
                     ActiveCondition(
@@ -270,6 +290,9 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                         source_name=event.payload.get("ability_name", "Unknown"),
                         applied_initiative=current_init,
                         source_uuid=caster.entity_uuid,
+                        save_required=s_req,
+                        save_dc=s_dc,
+                        start_of_turn_thp=sot_thp,
                     )
                 )
                 results.append(f"[{target.name}] is now {cond_name}!")
@@ -451,21 +474,36 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
                         return 60.0
             return 0.0
 
+        # 1. Blindsight (Echolocation vs Deafened check)
+        bs_range = get_sense_range("blindsight")
+        if distance <= bs_range:
+            is_echo = any("echolocation" in t.lower() for t in observer.tags)
+            is_deaf = any(c.name.lower() == "deafened" for c in observer.active_conditions)
+            if not (is_echo and is_deaf):
+                return True
+
+        # 2. Blinded Condition
+        if any(c.name.lower() == "blinded" for c in observer.active_conditions):
+            return False
+
+        # 3. Truesight
         if distance <= get_sense_range("truesight"):
             return True
-        if distance <= get_sense_range("blindsight"):
-            return True
-        if distance <= get_sense_range("tremorsense") and "flying" not in target_ent.tags:
-            return True
 
+        # 4. Invisibility / Stealth
         target_invisible = "invisible" in target_ent.tags or any(
             c.name.lower() in ["invisible", "hidden"] for c in target_ent.active_conditions
         )
         if target_invisible:
             return False
 
-        if target_illumination == "darkness" and distance > get_sense_range("darkvision"):
-            return False
+        # 5. Devil's Sight & Standard Illumination
+        if target_illumination == "darkness":
+            ds_range = get_sense_range("devils_sight")
+            if distance <= ds_range:
+                pass  # Devil's sight perfectly penetrates both magical and non-magical darkness
+            elif distance > get_sense_range("darkvision"):
+                return False
 
         return True
 
@@ -479,6 +517,24 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
     if not target_can_see_attacker:
         print(f"[Engine] {attacker.name} is unseen by {target.name}. Applying ADVANTAGE.")
         event.payload["advantage"] = True
+
+    if "sunlight_sensitivity" in attacker.tags:
+        in_sunlight = False
+        if attacker_illum == "bright" or target_illum == "bright":
+            for light in spatial_service.get_map_data(event.vault_path).active_lights:
+                if "sun" in light.label.lower():
+                    d1 = spatial_service.calculate_distance(
+                        attacker.x, attacker.y, attacker.z, light.x, light.y, light.z, event.vault_path
+                    )
+                    d2 = spatial_service.calculate_distance(
+                        target.x, target.y, target.z, light.x, light.y, light.z, event.vault_path
+                    )
+                    if d1 <= light.bright_radius or d2 <= light.bright_radius:
+                        in_sunlight = True
+                        break
+        if in_sunlight:
+            print(f"[Engine] {attacker.name} has Sunlight Sensitivity and is in sunlight. Applying DISADVANTAGE.")
+            event.payload["disadvantage"] = True
 
     # Evaluate Advanced Condition Framework for Attacks
     attacker_conds = [c.name.lower() for c in attacker.active_conditions]
@@ -604,6 +660,39 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
     if protectors:
         event.payload["protector_alerts"] = protectors
 
+    # --- Evaluate Weapon Masteries (Generic Hooks) ---
+    def _trigger_weapon_mastery(
+        attacker_ent: Creature, target_ent: Creature, wpn: Weapon, mech: dict, parent_event: GameEvent
+    ):
+        mod_val = wpn.get_attack_modifier(attacker_ent).total
+        if mech.get("damage_dice") == "ability_mod":
+            mech["damage_dice"] = str(mod_val)
+        if mech.get("damage_type") == "weapon":
+            mech["damage_type"] = wpn.damage_type
+
+        mastery_event = GameEvent(
+            event_type="SpellCast",
+            source_uuid=attacker_ent.entity_uuid,
+            vault_path=parent_event.vault_path,
+            payload={
+                "ability_name": f"{wpn.mastery_name} Mastery",
+                "mechanics": mech,
+                "target_uuids": [target_ent.entity_uuid],
+            },
+        )
+        res = EventBus.dispatch(mastery_event)
+        if "results" in res.payload and res.payload["results"]:
+            if "results" not in parent_event.payload:
+                parent_event.payload["results"] = []
+            parent_event.payload["results"].append(
+                f"[{wpn.mastery_name} Mastery Triggered] " + " ".join(res.payload["results"])
+            )
+
+    if is_hit and weapon.on_hit_mechanics:
+        _trigger_weapon_mastery(attacker, target, weapon, weapon.on_hit_mechanics, event)
+    elif not is_hit and weapon.on_miss_mechanics:
+        _trigger_weapon_mastery(attacker, target, weapon, weapon.on_miss_mechanics, event)
+
 
 def apply_damage_handler(event: GameEvent):
     """Applies final damage to a target, considering immunities, resistances, and vulnerabilities."""
@@ -616,7 +705,10 @@ def apply_damage_handler(event: GameEvent):
 
     if damage > 0:
         # Check for immunities first
-        if damage_type in target.immunities:
+        is_magically_silenced = any(
+            c.name.lower() == "silenced" and "silence" in c.source_name.lower() for c in target.active_conditions
+        )
+        if damage_type in target.immunities or (damage_type == "thunder" and is_magically_silenced):
             damage = 0
             print(f"[Engine] {target.name} is IMMUNE to {damage_type}!")
         else:
@@ -628,12 +720,26 @@ def apply_damage_handler(event: GameEvent):
                 damage = damage // 2  # Halve the damage, rounding down
                 print(f"[Engine] {target.name} is RESISTANT to {damage_type}! Damage is halved.")
 
+        if damage > 0 and target.temp_hp > 0:
+            if damage >= target.temp_hp:
+                print(f"[Engine] {target.name}'s {target.temp_hp} Temporary HP absorbed some of the damage!")
+                damage -= target.temp_hp
+                target.temp_hp = 0
+            else:
+                print(f"[Engine] {target.name}'s Temporary HP completely absorbed the damage!")
+                target.temp_hp -= damage
+                damage = 0
+
         target.hp.base_value -= damage
-        print(f"[Engine] {target.name} takes {damage} {damage_type} damage. HP remaining: {target.hp.base_value}")
+        print(
+            f"[Engine] {target.name} takes {damage} {damage_type} damage. HP remaining: {target.hp.base_value} (THP: {target.temp_hp})"
+        )
 
         if target.hp.base_value <= 0:
             if target.concentrating_on:
-                EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid))
+                EventBus.dispatch(
+                    GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid, vault_path=event.vault_path)
+                )
         elif damage > 0 and target.concentrating_on:
             dc = max(10, damage // 2)
             msg = (
@@ -694,7 +800,9 @@ def handle_advance_time_event(event: GameEvent):  # noqa: C901
                         stat_val.remove_modifier(mod.mod_uuid)
                         if mod.source_name in entity.active_mechanics:
                             entity.active_mechanics.remove(mod.source_name)
-                        print(f"[Engine] {entity.name}'s temporary mechanic '{mod.source_name}' on '{field_name}' has expired.")
+                        print(
+                            f"[Engine] {entity.name}'s temporary mechanic '{mod.source_name}' on '{field_name}' has expired."
+                        )
 
             # Clean up active conditions
             expired_conditions = []
@@ -798,6 +906,18 @@ def handle_drop_concentration_event(event: GameEvent):
     for tz in expired_terrains:
         spatial_service.remove_terrain(tz.zone_id, event.vault_path)
         print(f"[Engine] Temporary terrain '{tz.label}' dissipated as {caster.name} dropped concentration.")
+
+    despawned_entities = []
+    for uid, entity in get_all_entities(event.vault_path).items():
+        if isinstance(entity, Creature):
+            if entity.summoned_by_uuid == caster.entity_uuid and entity.summon_spell == spell_name:
+                despawned_entities.append(entity)
+
+    for ent in despawned_entities:
+        ent.hp.base_value = 0
+        if not any(c.name == "Dead" for c in ent.active_conditions):
+            ent.active_conditions.append(ActiveCondition(name="Dead", source_name="Concentration Dropped"))
+        print(f"[Engine] {ent.name} despawned (concentration dropped).")
 
     caster.concentrating_on = ""
 
@@ -1016,7 +1136,8 @@ def trap_movement_handler(event: GameEvent):
     for trap, ox, oy in traps_triggered:
         if not trap.is_active:
             continue
-        trap.is_active = False  # Deactivate after triggering once
+        if not getattr(trap, "is_persistent", False):
+            trap.is_active = False  # Deactivate standard traps after triggering once
         print(f"[Engine] TRAP TRIGGERED: {trap.hazard_name} during movement!")
 
         target_uuids = {entity.entity_uuid}
@@ -1026,6 +1147,7 @@ def trap_movement_handler(event: GameEvent):
 
         trap_source = Creature(
             name=trap.hazard_name,
+            vault_path=event.vault_path,
             tags=["trap"],
             hp=ModifiableValue(base_value=1),
             ac=ModifiableValue(base_value=10),
@@ -1136,6 +1258,312 @@ def evasion_save_handler(event: GameEvent):
             print(f"[Engine] {target.name} fails the save, but Evasion reduces it to half damage.")
 
 
+def counterspell_reaction_handler(event: GameEvent):  # noqa: C901
+    """Intercepts a spell cast and attempts to counter it (REQ-SPL-015)."""
+    if event.status != EventStatus.PRE_EVENT:
+        return
+
+    caster: Creature = get_entity(event.source_uuid)
+    if not caster:
+        return
+
+    is_caster_pc = any(t in caster.tags for t in ["pc", "player", "party_npc"])
+
+    for uid, pot_counterspeller in get_all_entities(event.vault_path).items():
+        if uid == caster.entity_uuid:
+            continue
+        if not isinstance(pot_counterspeller, Creature) or pot_counterspeller.hp.base_value <= 0:
+            continue
+
+        if "can_cast_counterspell" not in pot_counterspeller.tags:
+            continue
+
+        if pot_counterspeller.reaction_used:
+            continue
+
+        is_counterspeller_pc = any(t in pot_counterspeller.tags for t in ["pc", "player", "party_npc"])
+        if is_caster_pc == is_counterspeller_pc:
+            continue
+
+        if HAS_GIS:
+            dist = spatial_service.calculate_distance(
+                pot_counterspeller.x,
+                pot_counterspeller.y,
+                pot_counterspeller.z,
+                caster.x,
+                caster.y,
+                caster.z,
+                event.vault_path,
+            )
+            if dist > 60.0 or not spatial_service.has_line_of_sight(
+                pot_counterspeller.entity_uuid, caster.entity_uuid, event.vault_path
+            ):
+                continue
+
+        print(f"[Engine] REACTION TRIGGERED: {pot_counterspeller.name} casts Counterspell!")
+        pot_counterspeller.reaction_used = True
+
+        save_mod = caster.constitution_mod.total
+        save_roll = random.randint(1, 20)
+        total_save = save_roll + save_mod
+        dc = pot_counterspeller.spell_save_dc.total
+
+        if total_save < dc:
+            event.status = EventStatus.CANCELLED
+            msg = f"[Engine] {caster.name} failed CON save ({total_save} vs DC {dc}). The spell fails, but the spell slot is preserved."
+            print(msg)
+            if "results" not in event.payload:
+                event.payload["results"] = []
+            event.payload["results"].append(msg)
+        else:
+            msg = f"[Engine] {caster.name} succeeded CON save ({total_save} vs DC {dc}). The Counterspell fails."
+            print(msg)
+            if "results" not in event.payload:
+                event.payload["results"] = []
+            event.payload["results"].append(msg)
+        return  # Only one counterspell attempt allowed per spell
+
+
+def dispel_magic_handler(event: GameEvent):  # noqa: C901
+    """Terminates magical effects. Higher levels require a check (REQ-SPL-016)."""
+    if event.status != EventStatus.EXECUTION:
+        return
+    if event.payload.get("ability_name", "").lower() != "dispel magic":
+        return
+
+    caster: Creature = get_entity(event.source_uuid)
+    target_uuids = event.payload.get("target_uuids", [])
+
+    spell_mod = max(caster.intelligence_mod.total, caster.wisdom_mod.total, caster.charisma_mod.total)
+
+    if "results" not in event.payload:
+        event.payload["results"] = []
+
+    for t_uid in target_uuids:
+        target = get_entity(t_uid)
+        if not isinstance(target, Creature):
+            continue
+
+        # 1. Dispel Conditions
+        conds_to_remove = []
+        for cond in target.active_conditions:
+            if cond.duration_seconds > 0:
+                # Proxy: Effects > 1 hour are mapped to high-level spell tiers (DC 14+)
+                spell_level = 4 if cond.duration_seconds > 3600 else 3
+                if spell_level <= 3:
+                    conds_to_remove.append(cond)
+                    event.payload["results"].append(f"[Engine] {cond.name} on {target.name} was instantly dispelled!")
+                else:
+                    roll = random.randint(1, 20)
+                    total = roll + spell_mod
+                    dc = 10 + spell_level
+                    if total >= dc:
+                        conds_to_remove.append(cond)
+                        event.payload["results"].append(
+                            f"[Engine] Ability check {total} vs DC {dc} SUCCESS. {cond.name} on {target.name} was dispelled!"
+                        )
+                    else:
+                        event.payload["results"].append(
+                            f"[Engine] Ability check {total} vs DC {dc} FAILED. {cond.name} on {target.name} remains."
+                        )
+
+        for c in conds_to_remove:
+            target.active_conditions.remove(c)
+
+        # 2. Dispel Modifiers
+        for field_name in type(target).model_fields:
+            stat_val = getattr(target, field_name)
+            if isinstance(stat_val, ModifiableValue):
+                mods_to_remove = []
+                for mod in stat_val.modifiers:
+                    if mod.duration_seconds > 0:
+                        spell_level = 4 if mod.duration_seconds > 3600 else 3
+                        if spell_level <= 3:
+                            mods_to_remove.append(mod)
+                        else:
+                            roll = random.randint(1, 20)
+                            if roll + spell_mod >= 10 + spell_level:
+                                mods_to_remove.append(mod)
+                for m in mods_to_remove:
+                    stat_val.remove_modifier(m.mod_uuid)
+                    if m.source_name in target.active_mechanics:
+                        target.active_mechanics.remove(m.source_name)
+
+
+def terrain_condition_sync_handler(event: GameEvent):
+    """Synchronizes dynamic conditions (like Deafened in Silence) based on TerrainZone intersections."""
+    if event.status != EventStatus.RESOLVED:
+        return
+
+    # Only run on events that change terrain, positions, or time
+    if event.event_type not in ["Movement", "SpellCast", "AdvanceTime", "DropConcentration"]:
+        return
+
+    if not HAS_GIS:
+        return
+
+    for uid, ent in get_all_entities(event.vault_path).items():
+        if not isinstance(ent, Creature) or getattr(ent.hp, "base_value", 0) <= 0:
+            continue
+
+        ent_poly = spatial_service._get_entity_bbox(ent)
+        if not ent_poly:
+            continue
+
+        in_silence = False
+        for tz in spatial_service.get_map_data(event.vault_path).active_terrain:
+            if "silence" in [t.lower() for t in tz.tags] and tz.polygon and tz.polygon.intersects(ent_poly):
+                in_silence = True
+                break
+
+        # Manage Silenced condition via unique source name to prevent overwriting permanent traits
+        silenced_cond = next(
+            (c for c in ent.active_conditions if c.name.lower() == "silenced" and c.source_name == "Magical Silence"), None
+        )
+        if in_silence and not silenced_cond:
+            ent.active_conditions.append(ActiveCondition(name="Silenced", source_name="Magical Silence"))
+        elif not in_silence and silenced_cond:
+            ent.active_conditions.remove(silenced_cond)
+
+        # Manage Deafened condition
+        deafened_cond = next(
+            (c for c in ent.active_conditions if c.name.lower() == "deafened" and c.source_name == "Magical Silence"), None
+        )
+        if in_silence and not deafened_cond:
+            ent.active_conditions.append(ActiveCondition(name="Deafened", source_name="Magical Silence"))
+        elif not in_silence and deafened_cond:
+            ent.active_conditions.remove(deafened_cond)
+
+
+def end_of_turn_save_handler(event: GameEvent):
+    """Processes repeating saving throws at the end of a creature's turn."""
+    if event.status != EventStatus.EXECUTION:
+        return
+
+    entity = get_entity(event.source_uuid)
+    if not isinstance(entity, Creature):
+        return
+
+    conditions_to_remove = []
+    results = []
+
+    for cond in entity.active_conditions:
+        if cond.save_required and cond.save_dc > 0:
+            save_mod = (
+                getattr(entity, f"{cond.save_required}_mod").total if hasattr(entity, f"{cond.save_required}_mod") else 0
+            )
+
+            auto_fail = False
+            active_conds = [c.name.lower() for c in entity.active_conditions]
+            if cond.save_required in ["dexterity", "strength"]:
+                if any(c in active_conds for c in ["stunned", "paralyzed", "petrified", "unconscious", "incapacitated"]):
+                    auto_fail = True
+
+            has_disadv = False
+            if cond.save_required == "dexterity" and "restrained" in active_conds:
+                has_disadv = True
+
+            roll1, roll2 = random.randint(1, 20), random.randint(1, 20)
+            save_roll = min(roll1, roll2) if has_disadv else roll1
+
+            if auto_fail:
+                save_roll = 1
+                total_save = -99
+            else:
+                total_save = save_roll + save_mod
+
+            if total_save >= cond.save_dc:
+                conditions_to_remove.append(cond)
+                results.append(
+                    f"[Engine] {entity.name} succeeded on their end-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) and is no longer {cond.name}."
+                )
+            else:
+                results.append(
+                    f"[Engine] {entity.name} failed their end-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) against {cond.name}."
+                )
+
+    for cond in conditions_to_remove:
+        entity.active_conditions.remove(cond)
+
+    if results:
+        event.payload.setdefault("results", []).extend(results)
+
+
+def start_of_turn_handler(event: GameEvent):
+    """Processes start of turn effects like repeating THP and environmental hazards."""
+    if event.status != EventStatus.EXECUTION:
+        return
+
+    entity = get_entity(event.source_uuid)
+    if not isinstance(entity, Creature):
+        return
+
+    results = []
+    for cond in entity.active_conditions:
+        if cond.start_of_turn_thp > 0:
+            if cond.start_of_turn_thp > entity.temp_hp:
+                entity.temp_hp = cond.start_of_turn_thp
+                results.append(f"[Engine] {entity.name} gained {cond.start_of_turn_thp} Temporary HP from {cond.name}.")
+
+    # Evaluate Spatial Traps (e.g., Flaming Sphere, Moonbeam)
+    if HAS_GIS:
+        ent_poly = spatial_service._get_entity_bbox(entity)
+        if ent_poly:
+            traps_triggered = []
+            for tz in spatial_service.get_map_data(event.vault_path).active_terrain:
+                if getattr(tz, "trap", None) and tz.trap.is_active and getattr(tz.trap, "trigger_on_turn_start", False):
+                    if tz.polygon and tz.polygon.intersects(ent_poly):
+                        traps_triggered.append(tz.trap)
+
+            for w in spatial_service.get_map_data(event.vault_path).active_walls:
+                if getattr(w, "trap", None) and w.trap.is_active and getattr(w.trap, "trigger_on_turn_start", False):
+                    if w.line and w.line.intersects(ent_poly):
+                        traps_triggered.append(w.trap)
+
+            for trap in traps_triggered:
+                if not getattr(trap, "is_persistent", False):
+                    trap.is_active = False
+
+                print(f"[Engine] HAZARD TRIGGERED: {trap.hazard_name} at start of {entity.name}'s turn!")
+
+                trap_source = Creature(
+                    name=trap.hazard_name,
+                    vault_path=event.vault_path,
+                    tags=["trap"],
+                    hp=ModifiableValue(base_value=1),
+                    ac=ModifiableValue(base_value=10),
+                    spell_save_dc=ModifiableValue(base_value=trap.save_dc),
+                    spell_attack_bonus=ModifiableValue(base_value=trap.attack_bonus),
+                    strength_mod=ModifiableValue(base_value=0),
+                    dexterity_mod=ModifiableValue(base_value=0),
+                )
+
+                mechanics = {
+                    "requires_attack_roll": trap.requires_attack_roll,
+                    "save_required": trap.save_required,
+                    "damage_dice": trap.damage_dice,
+                    "damage_type": trap.damage_type,
+                    "half_damage_on_save": trap.half_damage_on_save,
+                    "conditions_applied": (
+                        [{"condition": trap.condition_applied, "duration": "1 minute"}] if trap.condition_applied else []
+                    ),
+                }
+
+                trap_event = GameEvent(
+                    event_type="SpellCast",
+                    source_uuid=trap_source.entity_uuid,
+                    vault_path=event.vault_path,
+                    payload={"ability_name": trap.hazard_name, "mechanics": mechanics, "target_uuids": [entity.entity_uuid]},
+                )
+                trap_result = EventBus.dispatch(trap_event)
+                BaseGameEntity.remove(trap_source.entity_uuid)
+                if "results" in trap_result.payload:
+                    results.extend(trap_result.payload["results"])
+
+    if results:
+        event.payload.setdefault("results", []).extend(results)
+
+
 def register_core_handlers():
     """Registers all standard handlers to the Event Bus. Can be called to reset state."""
     EventBus._listeners.clear()
@@ -1143,7 +1571,9 @@ def register_core_handlers():
     EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
     EventBus.subscribe("MeleeAttack", apply_damage_handler, priority=100)
     EventBus.subscribe("SpellCast", shield_spell_reaction_handler, priority=1)
+    EventBus.subscribe("SpellCast", counterspell_reaction_handler, priority=1)
     EventBus.subscribe("SpellCast", resolve_spell_cast_handler, priority=10)
+    EventBus.subscribe("SpellCast", dispel_magic_handler, priority=15)
     EventBus.subscribe("SpellCast", trap_noise_handler, priority=100)
     EventBus.subscribe("SavingThrow", evasion_save_handler, priority=10)
     EventBus.subscribe("Rest", handle_rest_event, priority=10)
@@ -1153,6 +1583,12 @@ def register_core_handlers():
     EventBus.subscribe("Movement", resolve_movement_handler, priority=10)
     EventBus.subscribe("Movement", trap_movement_handler, priority=15)
     EventBus.subscribe("Movement", consume_movement_handler, priority=100)
+    EventBus.subscribe("Movement", terrain_condition_sync_handler, priority=200)
+    EventBus.subscribe("SpellCast", terrain_condition_sync_handler, priority=200)
+    EventBus.subscribe("AdvanceTime", terrain_condition_sync_handler, priority=200)
+    EventBus.subscribe("DropConcentration", terrain_condition_sync_handler, priority=200)
+    EventBus.subscribe("EndOfTurn", end_of_turn_save_handler, priority=10)
+    EventBus.subscribe("StartOfTurn", start_of_turn_handler, priority=10)
 
 
 # Register handlers automatically when imported

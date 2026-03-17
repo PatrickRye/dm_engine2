@@ -31,7 +31,10 @@ def reset_engine_state():
 
 
 def test_spatial_chebyshev_vs_euclidean():
-    """Tests standard 5e square grid math vs realistic sphere math."""
+    """
+    Tests standard 5e square grid math vs realistic sphere math.
+    [Mapped: REQ-GEO-015]
+    """
     # 3D diagonal: 30ft X, 40ft Y, 50ft Z
     spatial_service.map_data.distance_metric = "chebyshev"
     dist_cheb = spatial_service.calculate_distance(0, 0, 0, 30, 40, 50)
@@ -43,7 +46,10 @@ def test_spatial_chebyshev_vs_euclidean():
 
 
 def test_spatial_line_of_sight_and_cover():
-    """Tests that bounding box intersections with walls correctly assign cover."""
+    """
+    Tests that bounding box intersections with walls correctly assign cover.
+    [Mapped: REQ-SPC-001]
+    """
     attacker = Creature(
         name="Archer",
         x=0,
@@ -83,7 +89,10 @@ def test_spatial_line_of_sight_and_cover():
 
 
 def test_spatial_difficult_terrain_overlap():
-    """Tests pathing through difficult terrain applies double cost only to the overlap."""
+    """
+    Tests pathing through difficult terrain applies double cost only to the overlap.
+    [Mapped: REQ-COR-003]
+    """
     zone = TerrainZone(points=[(5, -5), (15, -5), (15, 5), (5, 5)], is_difficult=True)
     spatial_service.add_terrain(zone)
 
@@ -95,7 +104,10 @@ def test_spatial_difficult_terrain_overlap():
 
 
 def test_spatial_movement_blocked_by_wall():
-    """Tests that 3D pathing math accurately detects wall collisions, including vertical bounds."""
+    """
+    Tests that 3D pathing math accurately detects wall collisions, including vertical bounds.
+    [Mapped: REQ-GEO-006]
+    """
     wall = Wall(start=(5, -5), end=(5, 5), z=0, height=10, is_solid=True)
     spatial_service.add_wall(wall)
 
@@ -107,7 +119,10 @@ def test_spatial_movement_blocked_by_wall():
 
 
 def test_spatial_illumination_and_walls():
-    """Tests that light sources correctly calculate bright/dim/darkness, obstructed by walls."""
+    """
+    Tests that light sources correctly calculate bright/dim/darkness, obstructed by walls.
+    [Mapped: REQ-VIS-001]
+    """
     spatial_service.map_data.lights.append(LightSource(label="Torch", x=0, y=0, z=0, bright_radius=20, dim_radius=40))
 
     # 1. Point in bright
@@ -131,7 +146,10 @@ def test_spatial_illumination_and_walls():
 
 
 def test_multi_turn_expiration_and_premature_checks():
-    """Tests that buffs/conditions expire dynamically over multiple rounds, and never prematurely."""
+    """
+    Tests that buffs/conditions expire dynamically over multiple rounds, and never prematurely.
+    [Mapped: REQ-ACT-001]
+    """
     pc = Creature(
         name="Wizard",
         hp=ModifiableValue(base_value=10),
@@ -194,7 +212,10 @@ def test_multi_turn_expiration_and_premature_checks():
 
 
 def test_prone_movement_cost():
-    """Tests that a character with the 'Prone' condition is charged half their movement to stand up when attempting a normal walk."""  # noqa: E501
+    """
+    Tests that a character with the 'Prone' condition is charged half their movement to stand up when attempting a normal walk.
+    [Mapped: REQ-COR-003]
+    """  # noqa: E501
     pc = Creature(
         name="Fighter",
         hp=ModifiableValue(base_value=10),
@@ -222,7 +243,10 @@ def test_prone_movement_cost():
 
 
 def test_reaction_limit_enforcement():
-    """Tests that reactions (like Shield) can only trigger once per turn cycle."""
+    """
+    Tests that reactions (like Shield) can only trigger once per turn cycle.
+    [Mapped: REQ-ACT-001]
+    """
     wizard = Creature(
         name="Wizard",
         tags=["can_cast_shield"],
@@ -269,7 +293,10 @@ def test_reaction_limit_enforcement():
 
 
 def test_concentration_auto_drop_on_zero_hp():
-    """Tests that falling unconscious automatically breaks concentration."""
+    """
+    Tests that falling unconscious automatically breaks concentration.
+    [Mapped: REQ-CND-018]
+    """
     pc = Creature(
         name="Cleric",
         hp=ModifiableValue(base_value=5),
@@ -309,7 +336,10 @@ def test_concentration_auto_drop_on_zero_hp():
 
 
 def test_ranged_attack_disadvantage_proximity():
-    """Tests shooting a bow with an enemy at 5ft forces disadvantage."""
+    """
+    Tests shooting a bow with an enemy at 5ft forces disadvantage.
+    [Mapped: REQ-WPN-006]
+    """
     archer = Creature(
         name="Archer",
         tags=["pc"],
@@ -356,7 +386,10 @@ def test_ranged_attack_disadvantage_proximity():
 
 
 def test_opportunity_attack_bypass():
-    """Tests that teleporting out of reach bypasses Opportunity Attack triggers."""
+    """
+    Tests that teleporting out of reach bypasses Opportunity Attack triggers.
+    [Mapped: REQ-MOV-011, REQ-ACT-006]
+    """
     pc = Creature(
         name="PC",
         tags=["pc"],
@@ -401,7 +434,10 @@ def test_opportunity_attack_bypass():
 
 
 def test_evasion_and_concentration_check_prompt():
-    """Tests a Rogue failing a DEX save taking half damage (Evasion) and triggering a Concentration check prompt, without losing concentration automatically."""  # noqa: E501
+    """
+    Tests a Rogue failing a DEX save taking half damage (Evasion) and triggering a Concentration check prompt, without losing concentration automatically.
+    [Mapped: REQ-SPL-018, REQ-CND-017]
+    """  # noqa: E501
     caster = Creature(
         name="Wizard",
         hp=ModifiableValue(base_value=10),

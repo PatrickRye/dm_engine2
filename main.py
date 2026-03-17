@@ -72,8 +72,10 @@ from tools import (
     manage_skill_challenge,
     generate_random_loot,
     ingest_battlemap_json,
+    evaluate_extreme_weather,
     manage_map_terrain,
     update_roll_automations,
+    spawn_summon,
     _get_config_tone,
     _get_entity_by_name,
     _calculate_reach,
@@ -123,7 +125,9 @@ MASTER_TOOLS_LIST = [
     manage_skill_challenge,
     generate_random_loot,
     ingest_battlemap_json,
+    evaluate_extreme_weather,
     manage_map_terrain,
+    spawn_summon,
 ]
 
 # 1. INITIALIZE THE APP FIRST
@@ -188,7 +192,11 @@ async def planner_node(state: DMState, config: RunnableConfig):
             "9. SKILL CHALLENGES: Use `manage_skill_challenge` to track multi-stage progress clocks.\n"
             "10. RANDOM LOOT: Use `generate_random_loot` ONLY when improvising homebrew encounters.\n"
             "11. MAP INGESTION: Use `ingest_battlemap_json` to bulk-load a complete battlemap JSON.\n"
-            "12. ENVIRONMENT: You can cast spells or cause effects that alter the environment. Use `manage_map_terrain`.\n\n"
+            "12. EXTREME WEATHER: Use `evaluate_extreme_weather` for resolving exposure to "
+            "extreme heat (>= 100F) or cold (<= 0F).\n"
+            "13. ENVIRONMENT: You can cast spells or cause effects that alter the environment. Use `manage_map_terrain`.\n"
+            "14. SUMMONS: Use `spawn_summon` to spawn creatures or familiars. "
+            "Use `use_ability_or_spell` with `proxy_caster_name` for familiar touch spells.\n\n"
             "MOVEMENT PARADIGMS:\n"
             "- TRAVEL / TOWN (Out of Combat): Use `move_entity(movement_type='travel')`.\n"
             "- DUNGEON CRAWL (Out of Combat): Use `move_entity(movement_type='walk')`.\n"
@@ -325,6 +333,8 @@ async def qa_node(state: DMState, config: RunnableConfig):
         "9. OBSIDIAN FORMATTING: Did the DM fail to use [[Wikilinks]] for proper nouns? (If yes, REJECT).\n"
         "10. COMPENDIUM AUDIT: If a feat was unsupported, did the DM notify the human player OOC? (If no, REJECT).\n"
         "11. PARADIGMS: Did the DM force movement limits out of combat? (If yes, REJECT).\n"
+        "12. CRITICAL FAILURES: If a knowledge check resulted in a [NATURAL 1 - CRITICAL FAILURE],"
+        " did the DM accurately tell the player the truth? (If yes, REJECT. They MUST confidently narrate dangerously wrong facts).\n"
         + tone_check
         + "\nIf ANY rule is broken, set 'approved' to False and explain exactly what to rewrite. "
         "If the DM applied a mechanic incorrectly, do not just tell them it is wrong. "
@@ -819,7 +829,7 @@ async def list_characters_endpoint(request: VaultRequest):
                                 tags = yaml_data.get("tags", [])
                                 if isinstance(tags, str):
                                     tags = [tags]
-                                if any(t.lower() in ["pc", "player"] for t in tags):
+                                if any(t.lower() in ["pc", "player", "party_npc"] for t in tags):
                                     chars.append(yaml_data.get("name", filename.replace(".md", "")))
                 except Exception:
                     pass
@@ -889,6 +899,11 @@ async def map_state_endpoint(request: VaultRequest):
             if icon_path and not os.path.isabs(icon_path):
                 icon_path = os.path.join(request.vault_path, icon_path)
 
+            is_invisible = "invisible" in getattr(ent, "tags", []) or any(
+                c.name.lower() == "invisible" for c in getattr(ent, "active_conditions", [])
+            )
+            is_hidden = any(c.name.lower() == "hidden" for c in getattr(ent, "active_conditions", []))
+
             entities.append(
                 {
                     "name": ent.name,
@@ -898,6 +913,8 @@ async def map_state_endpoint(request: VaultRequest):
                     "is_pc": is_pc,
                     "hp": ent.hp.base_value if hasattr(ent, "hp") else 0,
                     "icon_url": icon_path,
+                    "is_invisible": is_invisible,
+                    "is_hidden": is_hidden,
                 }
             )
 

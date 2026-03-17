@@ -92,7 +92,7 @@ def test_resolve_spell_cast_catches_invalid_mechanics():
     assert "SYSTEM ERROR: Invalid spell mechanics payload" in event.payload["results"][0]
 
 
-def test_spell_attack_critical_hit():
+def test_spell_attack_critical_hit(mock_dice, mock_roll_dice):
     """Ensure that a natural 20 on a spell attack correctly doubles the base damage dice natively."""
     caster = Creature(
         name="Sorcerer",
@@ -126,7 +126,7 @@ def test_spell_attack_critical_hit():
     mechanics = {"requires_attack_roll": True, "damage_dice": "1d10", "damage_type": "fire"}
 
     # Force a natural 20, and force the 1d10 dice roll to yield 10. (Base 10 + Crit 10 = 20 Damage)
-    with patch("event_handlers.random.randint", return_value=20), patch("event_handlers.roll_dice", return_value=10):
+    with mock_dice(default=20), mock_roll_dice(default=10):
         event = GameEvent(
             event_type="SpellCast",
             source_uuid=caster.entity_uuid,

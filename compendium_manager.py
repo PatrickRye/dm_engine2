@@ -26,6 +26,7 @@ class MechanicEffect(BaseModel):
     )  # e.g., ["ignore_difficult_terrain", "ignore_ranged_melee_disadvantage"]
     requires_concentration: bool = False
     terrain_effect: Optional[Dict[str, Any]] = None
+    trigger_event: str = ""  # e.g., "on_hit", "on_miss"
 
 
 class CompendiumEntry(BaseModel):
@@ -35,6 +36,7 @@ class CompendiumEntry(BaseModel):
     category: str  # "spell", "feature", "feat", "item"
     action_type: str  # "Action", "Bonus Action", "Reaction", "Passive"
     description: str
+    mitigation_notes: str = ""
     references: List[str] = Field(default_factory=list)  # e.g., ["PHB 2024 pg 112", "Homebrew: Strahd's Notes"]
     mechanics: MechanicEffect
 

@@ -3,7 +3,6 @@ import yaml
 import aiofiles
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal, Union
-from vault_io import get_journals_dir
 from spell_system import SpellMechanics, StatModifier
 
 
@@ -12,6 +11,7 @@ class BaseItem(BaseModel):
 
     name: str
     description: str = ""
+    mitigation_notes: str = ""
     weight: float = 0.0
     cost: str = "0 gp"
     rarity: Literal["Common", "Uncommon", "Rare", "Very Rare", "Legendary", "Artifact", "Unknown"] = "Common"
@@ -33,6 +33,7 @@ class WeaponItem(BaseItem):
     normal_range: Optional[int] = None
     long_range: Optional[int] = None
     magic_bonus: int = 0  # Applies natively to attack/damage rolls
+    mastery_name: str = ""
 
 
 class ArmorItem(BaseItem):
@@ -64,6 +65,8 @@ class ItemCompendium:
 
     @staticmethod
     async def save_item(vault_path: str, item: Union[WeaponItem, ArmorItem, WondrousItem]) -> str:
+        from vault_io import get_journals_dir
+
         j_dir = get_journals_dir(vault_path)
         item_dir = os.path.join(j_dir, "Compendium", "Items")
         os.makedirs(item_dir, exist_ok=True)
@@ -79,6 +82,8 @@ class ItemCompendium:
 
     @staticmethod
     async def load_item(vault_path: str, item_name: str) -> Optional[Union[WeaponItem, ArmorItem, WondrousItem]]:
+        from vault_io import get_journals_dir
+
         j_dir = get_journals_dir(vault_path)
         file_path = os.path.join(j_dir, "Compendium", "Items", f"{item_name}.md")
         if not os.path.exists(file_path):

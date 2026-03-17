@@ -3,12 +3,13 @@ import yaml
 import aiofiles
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from vault_io import get_journals_dir
 
 
 class AppliedCondition(BaseModel):
     condition: str
     duration: str = "-1"
+    end_of_turn_save: bool = False
+    start_of_turn_thp: int = 0
 
 
 class StatModifier(BaseModel):
@@ -47,6 +48,7 @@ class SpellDefinition(BaseModel):
     components: List[str] = Field(default_factory=list)
     duration: str = "Instantaneous"
     description: str = ""
+    mitigation_notes: str = ""
     mechanics: SpellMechanics = Field(default_factory=SpellMechanics)
 
 
@@ -55,6 +57,8 @@ class SpellCompendium:
 
     @staticmethod
     async def save_spell(vault_path: str, spell: SpellDefinition) -> str:
+        from vault_io import get_journals_dir
+
         j_dir = get_journals_dir(vault_path)
         spell_dir = os.path.join(j_dir, "Compendium", "Spells")
         os.makedirs(spell_dir, exist_ok=True)
@@ -70,6 +74,8 @@ class SpellCompendium:
 
     @staticmethod
     async def load_spell(vault_path: str, spell_name: str) -> Optional[SpellDefinition]:
+        from vault_io import get_journals_dir
+
         j_dir = get_journals_dir(vault_path)
         file_path = os.path.join(j_dir, "Compendium", "Spells", f"{spell_name}.md")
         if not os.path.exists(file_path):

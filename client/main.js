@@ -6,7 +6,7 @@ class DMEngineClientCore {
     constructor(view, platform) {
         this.view = view;
         this.platform = platform; // "web" or "obsidian"
-        
+
         // State
         this.activeCharacter = "Human DM";
         this.clientId = crypto.randomUUID();
@@ -43,7 +43,7 @@ class DMEngineClientCore {
         if (!this.activePings) return;
         const now = Date.now();
         this.activePings = this.activePings.filter(p => now - p.time < 3000);
-        
+
         if (this.drawSceneRef) {
             this.drawSceneRef();
         }
@@ -62,7 +62,7 @@ class DMEngineClientCore {
         // Sync the dropdown options if it exists
         if (this.view && this.view.ui && this.view.ui.dmFilterContainer) {
             this.view.ui.dmFilterContainer.style.display = (this.activeCharacter === "Human DM") ? "flex" : "none";
-            
+
             if (this.activeCharacter === "Human DM" && this.view.ui.dmFilterSelect) {
                 const currentVal = this.view.ui.dmFilterSelect.value || "ALL_PLAYERS";
                 this.view.ui.dmFilterSelect.innerHTML = `<option value="ALL_PLAYERS">All Players</option>`;
@@ -105,7 +105,7 @@ class DMEngineClientCore {
         }
         styleEl.textContent = css;
     }
-    
+
     async syncState() {
         try {
             const response = await fetch(`${this.serverUrl}/heartbeat`, {
@@ -113,12 +113,12 @@ class DMEngineClientCore {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ client_id: this.clientId, character: this.activeCharacter, roll_automations: this.rollAutomations })
             });
-            
+
             if (response.ok) {
                 const data = await response.json();
                 this.updateRadioUI(data.locked_characters || []);
                 this.setConnectionStatus(true);
-                
+
                 this.fetchCharacterSheet();
                 this.fetchMaps();
             } else {
@@ -151,9 +151,9 @@ class DMEngineClientCore {
                 const data = await res.json();
                 this.renderCharacterSheet(data);
             }
-        } catch(e) {}
+        } catch (e) { }
     }
-    
+
     async fetchMaps() {
         if (this.isMapDragging) return; // Don't interrupt a drag with a background refresh
         try {
@@ -166,22 +166,22 @@ class DMEngineClientCore {
                 this.currentMapData = data.map_data; // Store map data
                 if (!this.isMapDragging) this.renderMaps(data);
             }
-        } catch(e) {}
+        } catch (e) { }
     }
 
     renderCharacterSheet(data) {
         if (!data || data.error) {
-            if(this.view.viewSheet) this.view.viewSheet.innerHTML = `<div style="color:var(--text-error);">${data ? data.error : "Failed to load sheet."}</div>`;
+            if (this.view.viewSheet) this.view.viewSheet.innerHTML = `<div style="color:var(--text-error);">${data ? data.error : "Failed to load sheet."}</div>`;
             return;
         }
         const s = data.sheet;
         const hp = s.hp !== undefined ? s.hp : "?";
         const maxHp = s.max_hp !== undefined ? s.max_hp : "?";
         const conds = s.active_conditions ? s.active_conditions.map(c => c.name).join(", ") : "None";
-        const equip = s.equipment ? Object.entries(s.equipment).map(([k,v]) => `<li><b>${k.replace('_',' ')}</b>: ${v}</li>`).join("") : "None";
-        const res = s.resources ? Object.entries(s.resources).map(([k,v]) => `<li><b>${k}</b>: ${v}</li>`).join("") : "None";
-        
-        if(this.view.viewSheet) this.view.viewSheet.innerHTML = `
+        const equip = s.equipment ? Object.entries(s.equipment).map(([k, v]) => `<li><b>${k.replace('_', ' ')}</b>: ${v}</li>`).join("") : "None";
+        const res = s.resources ? Object.entries(s.resources).map(([k, v]) => `<li><b>${k}</b>: ${v}</li>`).join("") : "None";
+
+        if (this.view.viewSheet) this.view.viewSheet.innerHTML = `
             <h2 style="margin-top:0;">${s.name}</h2>
             <div style="display:flex; gap:10px; margin-bottom:15px;">
                 <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; text-align:center;"><b>HP</b><br><span style="font-size:1.5em; color:var(--text-success);">${hp} / ${maxHp}</span></div>
@@ -197,611 +197,611 @@ class DMEngineClientCore {
 
     renderMaps(data) {
         try {
-        if(!this.view.viewMaps) return;
-        this.view.viewMaps.innerHTML = "";
-        if (!data || !data.map_data || (!data.map_data.walls.length && !data.map_data.dm_map_image_path)) {
-            this.view.viewMaps.innerHTML = "<p style='color:var(--text-muted);'>No active maps loaded in engine.</p>";
-            return;
-        }
-        
-        const mapData = data.map_data;
-        const entities = data.entities || [];
-        const knownTraps = data.known_traps || [];
-        const activePaths = data.active_paths || [];
-
-        // --- NEW AOE TOOLBAR ---
-        const mapToolbar = this.view.viewMaps.createDiv({ cls: "dm-map-toolbar" });
-        mapToolbar.style.display = "flex";
-        mapToolbar.style.gap = "10px";
-        mapToolbar.style.padding = "5px";
-        mapToolbar.style.marginBottom = "5px";
-        mapToolbar.style.background = "var(--background-modifier-form-field)";
-        mapToolbar.style.border = "1px solid var(--background-modifier-border)";
-        mapToolbar.style.borderRadius = "4px";
-        mapToolbar.style.alignItems = "center";
-        mapToolbar.style.flexWrap = "wrap";
-
-        mapToolbar.createSpan({text: "🎯 AoE Template:", style: "font-weight: bold;"});
-
-        const aoeShapeSelect = mapToolbar.createEl("select");
-        ["None", "Circle", "Cone", "Line", "Cube"].forEach(s => {
-            const opt = aoeShapeSelect.createEl("option", {text: s, value: s.toLowerCase()});
-            if (this.aoeMode === s.toLowerCase()) opt.selected = true;
-        });
-
-        mapToolbar.createSpan({text: "Size (ft):"});
-        const sizeInput = mapToolbar.createEl("input", {type: "number", value: this.aoeSize.toString()});
-        sizeInput.style.width = "60px";
-        
-        mapToolbar.createSpan({text: "(Shift+Click map to Ping)", style: "font-size: 0.85em; color: var(--text-muted); margin-left: auto;"});
-
-        const canvasContainer = this.view.viewMaps.createDiv();
-        canvasContainer.style.flex = "1 1 auto";
-        canvasContainer.style.overflow = "auto";
-        canvasContainer.style.position = "relative";
-
-        let imagePath = null;
-        if (this.activeCharacter === "Human DM") {
-            imagePath = mapData.dm_map_image_path || mapData.player_map_image_path;
-        } else {
-            imagePath = mapData.player_map_image_path || mapData.dm_map_image_path;
-        }
-
-        const canvas = document.createElement('canvas');
-        canvas.width = 1600; // Arbitrary bounds, can be scrolled within the tab
-        canvas.height = 1600;
-        canvas.style.backgroundColor = "var(--background-modifier-form-field)";
-        canvas.style.borderRadius = "4px";
-        canvasContainer.appendChild(canvas);
-
-        const ctx = canvas.getContext('2d');
-        const SCALE = 15; // 15 pixels per foot. A 5ft square = 75px.
-
-        let bgImageRef = null;
-        
-        aoeShapeSelect.addEventListener("change", (e) => {
-            this.aoeMode = e.target.value === "none" ? null : e.target.value;
-            if (typeof drawScene === 'function') drawScene(bgImageRef);
-        });
-
-        sizeInput.addEventListener("change", (e) => {
-            this.aoeSize = parseInt(e.target.value) || 20;
-            if (typeof drawScene === 'function') drawScene(bgImageRef);
-        });
-        
-        const drawScene = (bgImg) => {
-            this.drawSceneRef = drawScene;
-            bgImageRef = bgImg || bgImageRef;
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
-            if (bgImageRef) ctx.drawImage(bgImageRef, 0, 0);
-
-            // Draw Grid
-            ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
-            ctx.lineWidth = 1;
-            for (let i = 0; i < canvas.width; i += SCALE * mapData.grid_scale) {
-                ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, canvas.height); ctx.stroke();
-                ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(canvas.width, i); ctx.stroke();
+            if (!this.view.viewMaps) return;
+            this.view.viewMaps.innerHTML = "";
+            if (!data || !data.map_data || (!data.map_data.walls.length && !data.map_data.dm_map_image_path)) {
+                this.view.viewMaps.innerHTML = "<p style='color:var(--text-muted);'>No active maps loaded in engine.</p>";
+                return;
             }
 
-            // Draw Fog of War Mask
-            if (this.activeCharacter !== "Human DM") {
-                ctx.fillStyle = "rgba(0, 0, 0, 0.98)"; // Players see solid black
+            const mapData = data.map_data;
+            const entities = data.entities || [];
+            const knownTraps = data.known_traps || [];
+            const activePaths = data.active_paths || [];
+
+            // --- NEW AOE TOOLBAR ---
+            const mapToolbar = this.view.viewMaps.createDiv({ cls: "dm-map-toolbar" });
+            mapToolbar.style.display = "flex";
+            mapToolbar.style.gap = "10px";
+            mapToolbar.style.padding = "5px";
+            mapToolbar.style.marginBottom = "5px";
+            mapToolbar.style.background = "var(--background-modifier-form-field)";
+            mapToolbar.style.border = "1px solid var(--background-modifier-border)";
+            mapToolbar.style.borderRadius = "4px";
+            mapToolbar.style.alignItems = "center";
+            mapToolbar.style.flexWrap = "wrap";
+
+            mapToolbar.createSpan({ text: "🎯 AoE Template:", style: "font-weight: bold;" });
+
+            const aoeShapeSelect = mapToolbar.createEl("select");
+            ["None", "Circle", "Cone", "Line", "Cube"].forEach(s => {
+                const opt = aoeShapeSelect.createEl("option", { text: s, value: s.toLowerCase() });
+                if (this.aoeMode === s.toLowerCase()) opt.selected = true;
+            });
+
+            mapToolbar.createSpan({ text: "Size (ft):" });
+            const sizeInput = mapToolbar.createEl("input", { type: "number", value: this.aoeSize.toString() });
+            sizeInput.style.width = "60px";
+
+            mapToolbar.createSpan({ text: "(Shift+Click map to Ping)", style: "font-size: 0.85em; color: var(--text-muted); margin-left: auto;" });
+
+            const canvasContainer = this.view.viewMaps.createDiv();
+            canvasContainer.style.flex = "1 1 auto";
+            canvasContainer.style.overflow = "auto";
+            canvasContainer.style.position = "relative";
+
+            let imagePath = null;
+            if (this.activeCharacter === "Human DM") {
+                imagePath = mapData.dm_map_image_path || mapData.player_map_image_path;
             } else {
-                ctx.fillStyle = "rgba(0, 0, 50, 0.4)"; // DM sees a faint blue tint for unexplored areas
+                imagePath = mapData.player_map_image_path || mapData.dm_map_image_path;
             }
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            
-            ctx.globalCompositeOperation = 'destination-out';
-            (mapData.explored_areas || []).forEach(area => {
-                const [x, y, radius] = area;
-                ctx.beginPath();
-                ctx.arc(x * SCALE, y * SCALE, radius * SCALE, 0, Math.PI * 2);
-                ctx.fill(); // Punch a transparent hole through the Fog of War!
-            });
-            ctx.globalCompositeOperation = 'source-over';
 
-            // Draw Walls
-            const activeWalls = [...(mapData.walls || []), ...(mapData.temporary_walls || [])];
-            activeWalls.forEach(wall => {
-                if (!this.is_visible_to_player(wall.start[0], wall.start[1]) && !this.is_visible_to_player(wall.end[0], wall.end[1])) {
-                    return;
+            const canvas = document.createElement('canvas');
+            canvas.width = 1600; // Arbitrary bounds, can be scrolled within the tab
+            canvas.height = 1600;
+            canvas.style.backgroundColor = "var(--background-modifier-form-field)";
+            canvas.style.borderRadius = "4px";
+            canvasContainer.appendChild(canvas);
+
+            const ctx = canvas.getContext('2d');
+            const SCALE = 15; // 15 pixels per foot. A 5ft square = 75px.
+
+            let bgImageRef = null;
+
+            aoeShapeSelect.addEventListener("change", (e) => {
+                this.aoeMode = e.target.value === "none" ? null : e.target.value;
+                if (typeof drawScene === 'function') drawScene(bgImageRef);
+            });
+
+            sizeInput.addEventListener("change", (e) => {
+                this.aoeSize = parseInt(e.target.value) || 20;
+                if (typeof drawScene === 'function') drawScene(bgImageRef);
+            });
+
+            const drawScene = (bgImg) => {
+                this.drawSceneRef = drawScene;
+                bgImageRef = bgImg || bgImageRef;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                if (bgImageRef) ctx.drawImage(bgImageRef, 0, 0);
+
+                // Draw Grid
+                ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+                ctx.lineWidth = 1;
+                for (let i = 0; i < canvas.width; i += SCALE * mapData.grid_scale) {
+                    ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, canvas.height); ctx.stroke();
+                    ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(canvas.width, i); ctx.stroke();
                 }
-                ctx.beginPath();
-                ctx.moveTo(wall.start[0] * SCALE, wall.start[1] * SCALE);
-                ctx.lineTo(wall.end[0] * SCALE, wall.end[1] * SCALE);
-                
-                if (!wall.is_solid && wall.is_visible) {
-                    ctx.strokeStyle = "rgba(40, 167, 69, 0.6)"; // Open door (Green)
-                    ctx.lineWidth = 4;
-                } else if (!wall.is_visible) {
-                    ctx.strokeStyle = "rgba(0, 150, 255, 0.4)"; // Window/Glass (Blue)
-                    ctx.lineWidth = 2;
+
+                // Draw Fog of War Mask
+                if (this.activeCharacter !== "Human DM") {
+                    ctx.fillStyle = "rgba(0, 0, 0, 0.98)"; // Players see solid black
                 } else {
-                    ctx.strokeStyle = "rgba(220, 53, 69, 0.8)"; // Solid wall (Red)
-                    ctx.lineWidth = 3;
+                    ctx.fillStyle = "rgba(0, 0, 50, 0.4)"; // DM sees a faint blue tint for unexplored areas
                 }
-                ctx.stroke();
-            });
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // Draw Entities
-            entities.forEach(ent => {
-                if (ent.hp <= 0) return;
+                ctx.globalCompositeOperation = 'destination-out';
+                (mapData.explored_areas || []).forEach(area => {
+                    const [x, y, radius] = area;
+                    ctx.beginPath();
+                    ctx.arc(x * SCALE, y * SCALE, radius * SCALE, 0, Math.PI * 2);
+                    ctx.fill(); // Punch a transparent hole through the Fog of War!
+                });
+                ctx.globalCompositeOperation = 'source-over';
 
-                const px = ent.x * SCALE;
-                const py = ent.y * SCALE;
-                const pRadius = (ent.size / 2) * SCALE;
-
-                // Enforce FoW visibility for players looking at NPCs
-                if (this.activeCharacter !== "Human DM" && !ent.is_pc) {
-                    let isRevealed = false;
-                    for (const area of mapData.explored_areas || []) {
-                        if (Math.hypot(ent.x - area[0], ent.y - area[1]) <= area[2]) { isRevealed = true; break; }
+                // Draw Walls
+                const activeWalls = [...(mapData.walls || []), ...(mapData.temporary_walls || [])];
+                activeWalls.forEach(wall => {
+                    if (!this.is_visible_to_player(wall.start[0], wall.start[1]) && !this.is_visible_to_player(wall.end[0], wall.end[1])) {
+                        return;
                     }
-                    if (!isRevealed) return; // Do not draw hidden monsters!
-                }
+                    ctx.beginPath();
+                    ctx.moveTo(wall.start[0] * SCALE, wall.start[1] * SCALE);
+                    ctx.lineTo(wall.end[0] * SCALE, wall.end[1] * SCALE);
 
-                ctx.beginPath();
-                ctx.arc(px, py, pRadius, 0, Math.PI * 2);
-                
-                if (ent.icon_url) {
-                    if (this.loadedImages[ent.icon_url] instanceof Image) {
-                        ctx.save();
-                        ctx.clip(); // Mask the image inside the circle
-                        ctx.drawImage(this.loadedImages[ent.icon_url], px - pRadius, py - pRadius, pRadius * 2, pRadius * 2);
-                        ctx.restore();
+                    if (!wall.is_solid && wall.is_visible) {
+                        ctx.strokeStyle = "rgba(40, 167, 69, 0.6)"; // Open door (Green)
+                        ctx.lineWidth = 4;
+                    } else if (!wall.is_visible) {
+                        ctx.strokeStyle = "rgba(0, 150, 255, 0.4)"; // Window/Glass (Blue)
+                        ctx.lineWidth = 2;
                     } else {
-                        if (this.loadedImages[ent.icon_url] === undefined) {
-                            this.loadedImages[ent.icon_url] = "loading";
-                            const img = new Image();
-                            img.onload = () => { this.loadedImages[ent.icon_url] = img; drawScene(bgImageRef); };
-                            img.onerror = () => { this.loadedImages[ent.icon_url] = "failed"; drawScene(bgImageRef); };
-                            img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(ent.icon_url)}`;
+                        ctx.strokeStyle = "rgba(220, 53, 69, 0.8)"; // Solid wall (Red)
+                        ctx.lineWidth = 3;
+                    }
+                    ctx.stroke();
+                });
+
+                // Draw Entities
+                entities.forEach(ent => {
+                    if (ent.hp <= 0) return;
+
+                    const px = ent.x * SCALE;
+                    const py = ent.y * SCALE;
+                    const pRadius = (ent.size / 2) * SCALE;
+
+                    // Enforce FoW visibility for players looking at NPCs
+                    if (this.activeCharacter !== "Human DM" && !ent.is_pc) {
+                        let isRevealed = false;
+                        for (const area of mapData.explored_areas || []) {
+                            if (Math.hypot(ent.x - area[0], ent.y - area[1]) <= area[2]) { isRevealed = true; break; }
                         }
-                        ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; ctx.fill(); // Fallback color while loading
+                        if (!isRevealed) return; // Do not draw hidden monsters!
                     }
-                } else {
-                    ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; // Blue for PCs, Red for Monsters
-                    ctx.fill();
-                }
-                
-                ctx.strokeStyle = "#ffffff";
-                ctx.lineWidth = 2;
-                ctx.stroke();
 
-                ctx.fillStyle = "white";
-                ctx.font = "bold 12px sans-serif";
-                ctx.textAlign = "center";
-                ctx.fillText(ent.name, px, py - pRadius - 5);
-            });
-
-            knownTraps.forEach((trap) => {
-                if (this.is_visible_to_player(trap.x, trap.y)) {
-                    const px = trap.x * SCALE;
-                    const py = trap.y * SCALE;
-                    ctx.fillStyle = "red";
-                    ctx.font = "bold 20px sans-serif";
-                    ctx.textAlign = "center";
-                    ctx.fillText("X", px, py);
-                }
-            });
-
-            // Draw server-synchronized proposed paths
-            activePaths.forEach(p => {
-                if (this.activeCharacter !== "Human DM" && p.entity_name !== this.activeCharacter) return;
-
-                // Draw proposed path (orange if valid but pending confirm, red if invalid)
-                if (p.waypoints && p.waypoints.length > 1) {
                     ctx.beginPath();
-                    ctx.moveTo(p.waypoints[0][0] * SCALE, p.waypoints[0][1] * SCALE);
-                    for (let i = 1; i < p.waypoints.length; i++) {
-                        ctx.lineTo(p.waypoints[i][0] * SCALE, p.waypoints[i][1] * SCALE);
+                    ctx.arc(px, py, pRadius, 0, Math.PI * 2);
+
+                    if (ent.icon_url) {
+                        if (this.loadedImages[ent.icon_url] instanceof Image) {
+                            ctx.save();
+                            ctx.clip(); // Mask the image inside the circle
+                            ctx.drawImage(this.loadedImages[ent.icon_url], px - pRadius, py - pRadius, pRadius * 2, pRadius * 2);
+                            ctx.restore();
+                        } else {
+                            if (this.loadedImages[ent.icon_url] === undefined) {
+                                this.loadedImages[ent.icon_url] = "loading";
+                                const img = new Image();
+                                img.onload = () => { this.loadedImages[ent.icon_url] = img; drawScene(bgImageRef); };
+                                img.onerror = () => { this.loadedImages[ent.icon_url] = "failed"; drawScene(bgImageRef); };
+                                img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(ent.icon_url)}`;
+                            }
+                            ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; ctx.fill(); // Fallback color while loading
+                        }
+                    } else {
+                        ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; // Blue for PCs, Red for Monsters
+                        ctx.fill();
                     }
-                    ctx.strokeStyle = p.is_valid ? "rgba(255, 165, 0, 0.8)" : "rgba(220, 53, 69, 0.8)";
-                    ctx.lineWidth = 3;
-                    ctx.setLineDash([5, 5]);
-                    ctx.stroke();
-                    ctx.setLineDash([]);
-                }
 
-                // Draw alternative path (solid yellow) if invalid
-                if (!p.is_valid && p.alternative_path && p.alternative_path.length > 1) {
-                    ctx.beginPath();
-                    ctx.moveTo(p.alternative_path[0][0] * SCALE, p.alternative_path[0][1] * SCALE);
-                    for (let i = 1; i < p.alternative_path.length; i++) {
-                        ctx.lineTo(p.alternative_path[i][0] * SCALE, p.alternative_path[i][1] * SCALE);
-                    }
-                    ctx.strokeStyle = "rgba(255, 255, 0, 1.0)";
-                    ctx.lineWidth = 4;
-                    ctx.stroke();
-                }
-            });
-            
-            // Draw Drag Path Line
-            if (this.isMapDragging && canvas.draggedEntity && canvas.dragStartX !== undefined && canvas.dragStartY !== undefined) {
-                const startX = canvas.dragStartX * SCALE;
-                const startY = canvas.dragStartY * SCALE;
-                const currentX = canvas.draggedEntity.x * SCALE;
-                const currentY = canvas.draggedEntity.y * SCALE;
-
-                ctx.beginPath();
-                ctx.moveTo(startX, startY);
-                ctx.lineTo(currentX, currentY);
-                ctx.strokeStyle = this.activeCharacter === "Human DM" ? "rgba(255, 200, 0, 0.8)" : "rgba(40, 167, 69, 0.8)";
-                ctx.lineWidth = 4;
-                ctx.setLineDash([8, 6]);
-                ctx.stroke();
-                ctx.setLineDash([]); // Reset line dash for next renders
-
-                // Calculate Chebyshev distance (D&D 5e standard grid distance)
-                const distFt = Math.max(Math.abs(canvas.draggedEntity.x - canvas.dragStartX), Math.abs(canvas.draggedEntity.y - canvas.dragStartY)); 
-                
-                ctx.fillStyle = "white";
-                ctx.font = "bold 14px sans-serif";
-                ctx.textAlign = "center";
-                ctx.fillText(`${Math.round(distFt)} ft`, (startX + currentX) / 2, (startY + currentY) / 2 - 10);
-            }
-            
-            // --- DRAW AOE PREVIEW ---
-            if (this.aoeMode) {
-                ctx.fillStyle = "rgba(255, 100, 0, 0.3)";
-                ctx.strokeStyle = "rgba(255, 100, 0, 0.8)";
-                ctx.lineWidth = 2;
-                const sizePx = this.aoeSize * SCALE;
-                const mx = this.mouseX * SCALE;
-                const my = this.mouseY * SCALE;
-
-                const activeEnt = entities.find(e => e.name === this.activeCharacter);
-                
-                if (activeEnt) {
-                    const ex = activeEnt.x * SCALE;
-                    const ey = activeEnt.y * SCALE;
-                    
-                    ctx.beginPath();
-                    ctx.moveTo(ex, ey);
-                    ctx.lineTo(mx, my);
-                    ctx.strokeStyle = "rgba(255, 255, 255, 0.6)";
+                    ctx.strokeStyle = "#ffffff";
                     ctx.lineWidth = 2;
-                    ctx.setLineDash([4, 4]);
                     ctx.stroke();
-                    ctx.setLineDash([]);
-                    
-                    const distFt = Math.max(Math.abs(this.mouseX - activeEnt.x), Math.abs(this.mouseY - activeEnt.y));
-                    const text = `${Math.round(distFt)} ft`;
-                    const midX = (ex + mx) / 2;
-                    const midY = (ey + my) / 2 - 10;
-                    
+
+                    ctx.fillStyle = "white";
+                    ctx.font = "bold 12px sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.fillText(ent.name, px, py - pRadius - 5);
+                });
+
+                knownTraps.forEach((trap) => {
+                    if (this.is_visible_to_player(trap.x, trap.y)) {
+                        const px = trap.x * SCALE;
+                        const py = trap.y * SCALE;
+                        ctx.fillStyle = "red";
+                        ctx.font = "bold 20px sans-serif";
+                        ctx.textAlign = "center";
+                        ctx.fillText("X", px, py);
+                    }
+                });
+
+                // Draw server-synchronized proposed paths
+                activePaths.forEach(p => {
+                    if (this.activeCharacter !== "Human DM" && p.entity_name !== this.activeCharacter) return;
+
+                    // Draw proposed path (orange if valid but pending confirm, red if invalid)
+                    if (p.waypoints && p.waypoints.length > 1) {
+                        ctx.beginPath();
+                        ctx.moveTo(p.waypoints[0][0] * SCALE, p.waypoints[0][1] * SCALE);
+                        for (let i = 1; i < p.waypoints.length; i++) {
+                            ctx.lineTo(p.waypoints[i][0] * SCALE, p.waypoints[i][1] * SCALE);
+                        }
+                        ctx.strokeStyle = p.is_valid ? "rgba(255, 165, 0, 0.8)" : "rgba(220, 53, 69, 0.8)";
+                        ctx.lineWidth = 3;
+                        ctx.setLineDash([5, 5]);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                    }
+
+                    // Draw alternative path (solid yellow) if invalid
+                    if (!p.is_valid && p.alternative_path && p.alternative_path.length > 1) {
+                        ctx.beginPath();
+                        ctx.moveTo(p.alternative_path[0][0] * SCALE, p.alternative_path[0][1] * SCALE);
+                        for (let i = 1; i < p.alternative_path.length; i++) {
+                            ctx.lineTo(p.alternative_path[i][0] * SCALE, p.alternative_path[i][1] * SCALE);
+                        }
+                        ctx.strokeStyle = "rgba(255, 255, 0, 1.0)";
+                        ctx.lineWidth = 4;
+                        ctx.stroke();
+                    }
+                });
+
+                // Draw Drag Path Line
+                if (this.isMapDragging && canvas.draggedEntity && canvas.dragStartX !== undefined && canvas.dragStartY !== undefined) {
+                    const startX = canvas.dragStartX * SCALE;
+                    const startY = canvas.dragStartY * SCALE;
+                    const currentX = canvas.draggedEntity.x * SCALE;
+                    const currentY = canvas.draggedEntity.y * SCALE;
+
+                    ctx.beginPath();
+                    ctx.moveTo(startX, startY);
+                    ctx.lineTo(currentX, currentY);
+                    ctx.strokeStyle = this.activeCharacter === "Human DM" ? "rgba(255, 200, 0, 0.8)" : "rgba(40, 167, 69, 0.8)";
+                    ctx.lineWidth = 4;
+                    ctx.setLineDash([8, 6]);
+                    ctx.stroke();
+                    ctx.setLineDash([]); // Reset line dash for next renders
+
+                    // Calculate Chebyshev distance (D&D 5e standard grid distance)
+                    const distFt = Math.max(Math.abs(canvas.draggedEntity.x - canvas.dragStartX), Math.abs(canvas.draggedEntity.y - canvas.dragStartY));
+
+                    ctx.fillStyle = "white";
                     ctx.font = "bold 14px sans-serif";
                     ctx.textAlign = "center";
-                    ctx.lineWidth = 3;
-                    ctx.strokeStyle = "black";
-                    ctx.strokeText(text, midX, midY);
-                    ctx.fillStyle = "white";
-                    ctx.fillText(text, midX, midY);
-                    
-                    // Reset fill/stroke for the AoE shape
+                    ctx.fillText(`${Math.round(distFt)} ft`, (startX + currentX) / 2, (startY + currentY) / 2 - 10);
+                }
+
+                // --- DRAW AOE PREVIEW ---
+                if (this.aoeMode) {
                     ctx.fillStyle = "rgba(255, 100, 0, 0.3)";
                     ctx.strokeStyle = "rgba(255, 100, 0, 0.8)";
                     ctx.lineWidth = 2;
-                }
+                    const sizePx = this.aoeSize * SCALE;
+                    const mx = this.mouseX * SCALE;
+                    const my = this.mouseY * SCALE;
 
-                if (this.aoeMode === "circle") {
-                    ctx.beginPath();
-                    ctx.arc(mx, my, sizePx, 0, Math.PI * 2);
-                    ctx.fill(); ctx.stroke();
-                } else if (this.aoeMode === "cube") {
-                    ctx.fillRect(mx - sizePx/2, my - sizePx/2, sizePx, sizePx);
-                    ctx.strokeRect(mx - sizePx/2, my - sizePx/2, sizePx, sizePx);
-                } else if (this.aoeMode === "cone" || this.aoeMode === "line") {
+                    const activeEnt = entities.find(e => e.name === this.activeCharacter);
+
                     if (activeEnt) {
                         const ex = activeEnt.x * SCALE;
                         const ey = activeEnt.y * SCALE;
-                        const angle = Math.atan2(my - ey, mx - ex);
 
                         ctx.beginPath();
                         ctx.moveTo(ex, ey);
-                        if (this.aoeMode === "cone") {
-                            ctx.arc(ex, ey, sizePx, angle - Math.PI/6, angle + Math.PI/6);
-                        } else {
-                            const halfWidth = (5 / 2) * SCALE;
-                            const p1x = ex - halfWidth * Math.sin(angle);
-                            const p1y = ey + halfWidth * Math.cos(angle);
-                            const p2x = ex + halfWidth * Math.sin(angle);
-                            const p2y = ey - halfWidth * Math.cos(angle);
-                            const p3x = p2x + sizePx * Math.cos(angle);
-                            const p3y = p2y + sizePx * Math.sin(angle);
-                            const p4x = p1x + sizePx * Math.cos(angle);
-                            const p4y = p1y + sizePx * Math.sin(angle);
-                            ctx.moveTo(p1x, p1y);
-                            ctx.lineTo(p2x, p2y);
-                            ctx.lineTo(p3x, p3y);
-                            ctx.lineTo(p4x, p4y);
-                        }
-                        ctx.closePath();
-                        ctx.fill(); ctx.stroke();
-                    } else {
-                        ctx.fillStyle = "white";
+                        ctx.lineTo(mx, my);
+                        ctx.strokeStyle = "rgba(255, 255, 255, 0.6)";
+                        ctx.lineWidth = 2;
+                        ctx.setLineDash([4, 4]);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+
+                        const distFt = Math.max(Math.abs(this.mouseX - activeEnt.x), Math.abs(this.mouseY - activeEnt.y));
+                        const text = `${Math.round(distFt)} ft`;
+                        const midX = (ex + mx) / 2;
+                        const midY = (ey + my) / 2 - 10;
+
                         ctx.font = "bold 14px sans-serif";
-                        ctx.fillText("Select your character to project lines/cones", mx, my - 10);
+                        ctx.textAlign = "center";
+                        ctx.lineWidth = 3;
+                        ctx.strokeStyle = "black";
+                        ctx.strokeText(text, midX, midY);
+                        ctx.fillStyle = "white";
+                        ctx.fillText(text, midX, midY);
+
+                        // Reset fill/stroke for the AoE shape
+                        ctx.fillStyle = "rgba(255, 100, 0, 0.3)";
+                        ctx.strokeStyle = "rgba(255, 100, 0, 0.8)";
+                        ctx.lineWidth = 2;
+                    }
+
+                    if (this.aoeMode === "circle") {
+                        ctx.beginPath();
+                        ctx.arc(mx, my, sizePx, 0, Math.PI * 2);
+                        ctx.fill(); ctx.stroke();
+                    } else if (this.aoeMode === "cube") {
+                        ctx.fillRect(mx - sizePx / 2, my - sizePx / 2, sizePx, sizePx);
+                        ctx.strokeRect(mx - sizePx / 2, my - sizePx / 2, sizePx, sizePx);
+                    } else if (this.aoeMode === "cone" || this.aoeMode === "line") {
+                        if (activeEnt) {
+                            const ex = activeEnt.x * SCALE;
+                            const ey = activeEnt.y * SCALE;
+                            const angle = Math.atan2(my - ey, mx - ex);
+
+                            ctx.beginPath();
+                            ctx.moveTo(ex, ey);
+                            if (this.aoeMode === "cone") {
+                                ctx.arc(ex, ey, sizePx, angle - Math.PI / 6, angle + Math.PI / 6);
+                            } else {
+                                const halfWidth = (5 / 2) * SCALE;
+                                const p1x = ex - halfWidth * Math.sin(angle);
+                                const p1y = ey + halfWidth * Math.cos(angle);
+                                const p2x = ex + halfWidth * Math.sin(angle);
+                                const p2y = ey - halfWidth * Math.cos(angle);
+                                const p3x = p2x + sizePx * Math.cos(angle);
+                                const p3y = p2y + sizePx * Math.sin(angle);
+                                const p4x = p1x + sizePx * Math.cos(angle);
+                                const p4y = p1y + sizePx * Math.sin(angle);
+                                ctx.moveTo(p1x, p1y);
+                                ctx.lineTo(p2x, p2y);
+                                ctx.lineTo(p3x, p3y);
+                                ctx.lineTo(p4x, p4y);
+                            }
+                            ctx.closePath();
+                            ctx.fill(); ctx.stroke();
+                        } else {
+                            ctx.fillStyle = "white";
+                            ctx.font = "bold 14px sans-serif";
+                            ctx.fillText("Select your character to project lines/cones", mx, my - 10);
+                        }
                     }
                 }
-            }
-            
-            // --- DRAW PINGS ---
-            if (this.activePings) {
-                const now = Date.now();
-                this.activePings.forEach(p => {
-                    const age = now - p.time;
-                    if (age > 3000) return;
-                    
-                    const maxRadius = 45; 
-                    const progress = age / 1000; 
-                    const pulse = progress % 1; 
-                    const radius = pulse * maxRadius;
-                    const alpha = 1 - pulse;
-                    
-                    const px = p.x * SCALE;
-                    const py = p.y * SCALE;
 
-                    ctx.beginPath(); ctx.arc(px, py, Math.max(0.1, radius), 0, Math.PI * 2);
-                    ctx.strokeStyle = `rgba(220, 53, 69, ${alpha})`; ctx.lineWidth = 3; ctx.stroke();
-                    ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2);
-                    ctx.fillStyle = `rgba(220, 53, 69, ${Math.max(0, 1 - age/3000)})`; ctx.fill();
-                    ctx.fillStyle = `rgba(255, 255, 255, ${Math.max(0, 1 - age/3000)})`;
-                    ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
-                    ctx.fillText(p.character, px, py - 20);
-                });
-            }
-        };
+                // --- DRAW PINGS ---
+                if (this.activePings) {
+                    const now = Date.now();
+                    this.activePings.forEach(p => {
+                        const age = now - p.time;
+                        if (age > 3000) return;
 
-        if (imagePath) {
-            if (this.loadedImages[imagePath] instanceof Image) {
-                drawScene(this.loadedImages[imagePath]);
-            } else if (this.loadedImages[imagePath] === "failed") {
-                drawScene(null);
-            } else if (this.loadedImages[imagePath] === undefined) {
-                this.loadedImages[imagePath] = "loading";
-                const img = new Image();
-                img.onload = () => {
-                    this.loadedImages[imagePath] = img;
-                    drawScene(img);
-                };
-                img.onerror = () => {
-                    console.error("Failed to load map image:", imagePath);
-                    this.loadedImages[imagePath] = "failed";
+                        const maxRadius = 45;
+                        const progress = age / 1000;
+                        const pulse = progress % 1;
+                        const radius = pulse * maxRadius;
+                        const alpha = 1 - pulse;
+
+                        const px = p.x * SCALE;
+                        const py = p.y * SCALE;
+
+                        ctx.beginPath(); ctx.arc(px, py, Math.max(0.1, radius), 0, Math.PI * 2);
+                        ctx.strokeStyle = `rgba(220, 53, 69, ${alpha})`; ctx.lineWidth = 3; ctx.stroke();
+                        ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2);
+                        ctx.fillStyle = `rgba(220, 53, 69, ${Math.max(0, 1 - age / 3000)})`; ctx.fill();
+                        ctx.fillStyle = `rgba(255, 255, 255, ${Math.max(0, 1 - age / 3000)})`;
+                        ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+                        ctx.fillText(p.character, px, py - 20);
+                    });
+                }
+            };
+
+            if (imagePath) {
+                if (this.loadedImages[imagePath] instanceof Image) {
+                    drawScene(this.loadedImages[imagePath]);
+                } else if (this.loadedImages[imagePath] === "failed") {
                     drawScene(null);
-                };
-                img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(imagePath)}`;
+                } else if (this.loadedImages[imagePath] === undefined) {
+                    this.loadedImages[imagePath] = "loading";
+                    const img = new Image();
+                    img.onload = () => {
+                        this.loadedImages[imagePath] = img;
+                        drawScene(img);
+                    };
+                    img.onerror = () => {
+                        console.error("Failed to load map image:", imagePath);
+                        this.loadedImages[imagePath] = "failed";
+                        drawScene(null);
+                    };
+                    img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(imagePath)}`;
+                } else {
+                    drawScene(null); // Waiting for load
+                }
             } else {
-                drawScene(null); // Waiting for load
+                drawScene(null);
             }
-        } else {
-            drawScene(null);
-        }
 
-        // --- DRAG AND DROP LOGIC ---
-        canvas.addEventListener('mousedown', (e) => {
-            if (e.shiftKey) {
+            // --- DRAG AND DROP LOGIC ---
+            canvas.addEventListener('mousedown', (e) => {
+                if (e.shiftKey) {
+                    const rect = canvas.getBoundingClientRect();
+                    let newX = ((e.clientX - rect.left) * (canvas.width / rect.width)) / SCALE;
+                    let newY = ((e.clientY - rect.top) * (canvas.height / rect.width)) / SCALE;
+
+                    if (this.snapToGrid && this.currentMapData) {
+                        const gridSize = this.currentMapData.grid_scale;
+                        newX = Math.round(newX / gridSize) * gridSize;
+                        newY = Math.round(newY / gridSize) * gridSize;
+                    }
+
+                    fetch(`${this.serverUrl}/ping`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            client_id: this.clientId,
+                            character: this.activeCharacter,
+                            vault_path: this.vaultPath,
+                            x: Math.round(newX * 10) / 10,
+                            y: Math.round(newY * 10) / 10
+                        })
+                    }).catch(err => console.error("Ping error:", err));
+                    return;
+                }
+
+                if (this.aoeMode) {
+                    let text = "";
+                    const size = this.aoeSize;
+                    const x = Math.round(this.mouseX * 10) / 10;
+                    const y = Math.round(this.mouseY * 10) / 10;
+
+                    const hitEntities = [];
+                    entities.forEach(ent => {
+                        if (ent.hp <= 0) return;
+                        const dx = ent.x - x;
+                        const dy = ent.y - y;
+                        const dist = Math.hypot(dx, dy);
+                        const r = (ent.size / 2 || 2.5);
+
+                        if (this.aoeMode === "circle") {
+                            if (dist <= size + r) hitEntities.push(ent.name);
+                        } else if (this.aoeMode === "cube") {
+                            const half = size / 2 + r;
+                            if (Math.abs(dx) <= half && Math.abs(dy) <= half) hitEntities.push(ent.name);
+                        } else if (this.aoeMode === "cone" || this.aoeMode === "line") {
+                            const activeEnt = entities.find(ev => ev.name === this.activeCharacter);
+                            if (!activeEnt) return;
+                            const edx = ent.x - activeEnt.x;
+                            const edy = ent.y - activeEnt.y;
+                            const edist = Math.hypot(edx, edy);
+                            const eAngle = Math.atan2(edy, edx);
+                            const castAngle = Math.atan2(y - activeEnt.y, x - activeEnt.x);
+
+                            if (edist <= size + r) {
+                                if (this.aoeMode === "cone") {
+                                    let angleDiff = Math.abs(eAngle - castAngle);
+                                    if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+                                    if (angleDiff <= Math.PI / 6 + 0.1) hitEntities.push(ent.name);
+                                } else if (this.aoeMode === "line") {
+                                    const perpDist = Math.abs((edx) * Math.sin(castAngle) - (edy) * Math.cos(castAngle));
+                                    if (perpDist <= 2.5 + r) hitEntities.push(ent.name);
+                                }
+                            }
+                        }
+                    });
+
+                    if (this.aoeMode === "circle" || this.aoeMode === "cube") {
+                        text = `I center a ${size}ft ${this.aoeMode} at coordinates (${x}, ${y}).`;
+                    } else {
+                        text = `I project a ${size}ft ${this.aoeMode} towards coordinates (${x}, ${y}).`;
+                    }
+
+                    text += hitEntities.length > 0 ? ` This hits: ${hitEntities.join(", ")}.` : ` This hits no one.`;
+
+                    this.view.ui.chatInput.value = this.view.ui.chatInput.value ? this.view.ui.chatInput.value + "\n" + text : text;
+
+                    document.querySelectorAll(".dm-tab-bar button")[0].click();
+                    this.view.ui.chatInput.focus();
+
+                    this.aoeMode = null;
+                    if (aoeShapeSelect) aoeShapeSelect.value = "none";
+                    drawScene(bgImageRef);
+                    return;
+                }
+
+                const rect = canvas.getBoundingClientRect();
+                const mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
+                const mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+                // Check collision backwards (top-most drawn entity selected first)
+                for (let i = entities.length - 1; i >= 0; i--) {
+                    const ent = entities[i];
+                    if (ent.hp <= 0) continue;
+                    if (Math.hypot(mouseX - (ent.x * SCALE), mouseY - (ent.y * SCALE)) <= (ent.size / 2) * SCALE) {
+                        if (this.activeCharacter === "Human DM" || ent.name === this.activeCharacter) {
+                            this.isMapDragging = true;
+                            canvas.draggedEntity = ent;
+                            canvas.dragStartX = ent.x;
+                            canvas.dragStartY = ent.y;
+                            break;
+                        }
+                    }
+                }
+            });
+
+            canvas.addEventListener('mousemove', (e) => {
                 const rect = canvas.getBoundingClientRect();
                 let newX = ((e.clientX - rect.left) * (canvas.width / rect.width)) / SCALE;
                 let newY = ((e.clientY - rect.top) * (canvas.height / rect.width)) / SCALE;
 
                 if (this.snapToGrid && this.currentMapData) {
-                    const gridSize = this.currentMapData.grid_scale;
+                    const gridSize = this.currentMapData.grid_scale; // e.g., 5.0
                     newX = Math.round(newX / gridSize) * gridSize;
                     newY = Math.round(newY / gridSize) * gridSize;
                 }
 
-                fetch(`${this.serverUrl}/ping`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        client_id: this.clientId,
-                        character: this.activeCharacter,
-                        vault_path: this.vaultPath,
-                        x: Math.round(newX * 10) / 10,
-                        y: Math.round(newY * 10) / 10
-                    })
-                }).catch(err => console.error("Ping error:", err));
-                return;
-            }
+                this.mouseX = newX;
+                this.mouseY = newY;
 
-            if (this.aoeMode) {
-                let text = "";
-                const size = this.aoeSize;
-                const x = Math.round(this.mouseX * 10) / 10;
-                const y = Math.round(this.mouseY * 10) / 10;
+                if (this.aoeMode) {
+                    drawScene(bgImageRef);
+                } else if (this.isMapDragging && canvas.draggedEntity) {
+                    canvas.draggedEntity.x = newX;
+                    canvas.draggedEntity.y = newY;
+                    drawScene(bgImageRef); // Live re-render
+                }
+            });
 
-                const hitEntities = [];
-                entities.forEach(ent => {
-                    if (ent.hp <= 0) return;
-                    const dx = ent.x - x;
-                    const dy = ent.y - y;
-                    const dist = Math.hypot(dx, dy);
-                    const r = (ent.size/2 || 2.5);
+            const stopDrag = async () => {
+                if (this.isMapDragging && canvas.draggedEntity) {
+                    const ent = canvas.draggedEntity;
+                    this.isMapDragging = false;
+                    canvas.draggedEntity = null;
 
-                    if (this.aoeMode === "circle") {
-                        if (dist <= size + r) hitEntities.push(ent.name);
-                    } else if (this.aoeMode === "cube") {
-                        const half = size / 2 + r;
-                        if (Math.abs(dx) <= half && Math.abs(dy) <= half) hitEntities.push(ent.name);
-                    } else if (this.aoeMode === "cone" || this.aoeMode === "line") {
-                        const activeEnt = entities.find(ev => ev.name === this.activeCharacter);
-                        if (!activeEnt) return;
-                        const edx = ent.x - activeEnt.x;
-                        const edy = ent.y - activeEnt.y;
-                        const edist = Math.hypot(edx, edy);
-                        const eAngle = Math.atan2(edy, edx);
-                        const castAngle = Math.atan2(y - activeEnt.y, x - activeEnt.x);
+                    if (this.activeCharacter === "Human DM") {
+                        try {
+                            await fetch(`${this.serverUrl}/ooc_move_entity`, {
+                                method: "POST", headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ vault_path: this.vaultPath, entity_name: ent.name, x: ent.x, y: ent.y })
+                            });
+                        } catch (err) { console.error("Failed to move entity", err); }
+                    } else {
+                        const payload = {
+                            vault_path: this.vaultPath,
+                            entity_name: ent.name,
+                            waypoints: [[canvas.dragStartX, canvas.dragStartY], [ent.x, ent.y]],
+                            force_execute: false
+                        };
 
-                        if (edist <= size + r) {
-                            if (this.aoeMode === "cone") {
-                                let angleDiff = Math.abs(eAngle - castAngle);
-                                if (angleDiff > Math.PI) angleDiff = 2*Math.PI - angleDiff;
-                                if (angleDiff <= Math.PI/6 + 0.1) hitEntities.push(ent.name);
-                            } else if (this.aoeMode === "line") {
-                                const perpDist = Math.abs((edx)*Math.sin(castAngle) - (edy)*Math.cos(castAngle));
-                                if (perpDist <= 2.5 + r) hitEntities.push(ent.name);
+                        try {
+                            const res = await fetch(`${this.serverUrl}/propose_move`, {
+                                method: "POST", headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify(payload)
+                            });
+
+                            if (res.ok) {
+                                const processResponse = async (data) => {
+                                    if (!data.is_valid) {
+                                        let msg = `Move Invalid: ${data.invalid_reason}`;
+                                        let takeAlt = false;
+                                        if (data.alternative_path && data.alternative_path.length > 0) {
+                                            msg += `\n\nAn alternative route is shown in yellow. Take it instead?`;
+                                            takeAlt = confirm(msg);
+                                        } else {
+                                            new Notice(msg);
+                                        }
+
+                                        if (takeAlt) {
+                                            payload.waypoints = data.alternative_path;
+                                            payload.force_execute = true;
+                                            const altRes = await fetch(`${this.serverUrl}/propose_move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+                                            if (altRes.ok) processResponse(await altRes.json());
+                                        } else {
+                                            ent.x = canvas.dragStartX; ent.y = canvas.dragStartY;
+                                            await fetch(`${this.serverUrl}/clear_path`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entity_name: ent.name, vault_path: this.vaultPath }) });
+                                            this.fetchMaps();
+                                        }
+                                    } else if (!data.executed) {
+                                        let msg = "⚠️ WARNING: This move will trigger:\n";
+                                        if (data.opportunity_attacks.length > 0) msg += `- Opportunity Attacks from: ${data.opportunity_attacks.join(', ')}\n`;
+                                        if (data.traps_triggered.length > 0) msg += `- Known Traps: ${data.traps_triggered.join(', ')}\n`;
+                                        msg += "\nDo you want to proceed anyway?";
+
+                                        if (confirm(msg)) {
+                                            payload.force_execute = true;
+                                            const fRes = await fetch(`${this.serverUrl}/propose_move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+                                            if (fRes.ok) processResponse(await fRes.json());
+                                        } else {
+                                            ent.x = canvas.dragStartX; ent.y = canvas.dragStartY;
+                                            await fetch(`${this.serverUrl}/clear_path`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entity_name: ent.name, vault_path: this.vaultPath }) });
+                                            this.fetchMaps();
+                                        }
+                                    } else {
+                                        ent.x = data.final_x;
+                                        ent.y = data.final_y;
+                                        this.fetchMaps();
+                                    }
+                                };
+
+                                await this.fetchMaps();
+                                setTimeout(async () => {
+                                    const data = await res.json();
+                                    processResponse(data);
+                                }, 50);
                             }
+                        } catch (err) {
+                            ent.x = canvas.dragStartX; ent.y = canvas.dragStartY;
+                            drawScene(bgImageRef);
                         }
                     }
-                });
-
-                if (this.aoeMode === "circle" || this.aoeMode === "cube") {
-                    text = `I center a ${size}ft ${this.aoeMode} at coordinates (${x}, ${y}).`;
-                } else {
-                    text = `I project a ${size}ft ${this.aoeMode} towards coordinates (${x}, ${y}).`;
                 }
+            };
 
-                text += hitEntities.length > 0 ? ` This hits: ${hitEntities.join(", ")}.` : ` This hits no one.`;
-
-                this.view.ui.chatInput.value = this.view.ui.chatInput.value ? this.view.ui.chatInput.value + "\n" + text : text;
-                
-                document.querySelectorAll(".dm-tab-bar button")[0].click();
-                this.view.ui.chatInput.focus();
-
-                this.aoeMode = null;
-                if (aoeShapeSelect) aoeShapeSelect.value = "none";
-                drawScene(bgImageRef);
-                return;
-            }
-
-            const rect = canvas.getBoundingClientRect();
-            const mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
-            const mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
-
-            // Check collision backwards (top-most drawn entity selected first)
-            for (let i = entities.length - 1; i >= 0; i--) {
-                const ent = entities[i];
-                if (ent.hp <= 0) continue;
-                if (Math.hypot(mouseX - (ent.x * SCALE), mouseY - (ent.y * SCALE)) <= (ent.size / 2) * SCALE) {
-                    if (this.activeCharacter === "Human DM" || ent.name === this.activeCharacter) {
-                        this.isMapDragging = true;
-                        canvas.draggedEntity = ent;
-                        canvas.dragStartX = ent.x;
-                        canvas.dragStartY = ent.y;
-                        break;
-                    }
-                }
-            }
-        });
-
-        canvas.addEventListener('mousemove', (e) => {
-            const rect = canvas.getBoundingClientRect();
-            let newX = ((e.clientX - rect.left) * (canvas.width / rect.width)) / SCALE;
-            let newY = ((e.clientY - rect.top) * (canvas.height / rect.width)) / SCALE;
-
-            if (this.snapToGrid && this.currentMapData) {
-                const gridSize = this.currentMapData.grid_scale; // e.g., 5.0
-                newX = Math.round(newX / gridSize) * gridSize;
-                newY = Math.round(newY / gridSize) * gridSize;
-            }
-            
-            this.mouseX = newX;
-            this.mouseY = newY;
-
-            if (this.aoeMode) {
-                drawScene(bgImageRef);
-            } else if (this.isMapDragging && canvas.draggedEntity) {
-                canvas.draggedEntity.x = newX;
-                canvas.draggedEntity.y = newY;
-                drawScene(bgImageRef); // Live re-render
-            }
-        });
-
-        const stopDrag = async () => {
-            if (this.isMapDragging && canvas.draggedEntity) {
-                const ent = canvas.draggedEntity;
-                this.isMapDragging = false;
-                canvas.draggedEntity = null;
-                
-                if (this.activeCharacter === "Human DM") {
-                    try {
-                        await fetch(`${this.serverUrl}/ooc_move_entity`, {
-                            method: "POST", headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ vault_path: this.vaultPath, entity_name: ent.name, x: ent.x, y: ent.y })
-                        });
-                    } catch(err) { console.error("Failed to move entity", err); }
-                } else {
-                    const payload = { 
-                        vault_path: this.vaultPath, 
-                        entity_name: ent.name, 
-                        waypoints: [[canvas.dragStartX, canvas.dragStartY], [ent.x, ent.y]], 
-                        force_execute: false 
-                    };
-                    
-                    try {
-                        const res = await fetch(`${this.serverUrl}/propose_move`, {
-                            method: "POST", headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify(payload)
-                        });
-                        
-                        if (res.ok) {
-                            const processResponse = async (data) => {
-                                if (!data.is_valid) {
-                                    let msg = `Move Invalid: ${data.invalid_reason}`;
-                                    let takeAlt = false;
-                                    if (data.alternative_path && data.alternative_path.length > 0) {
-                                        msg += `\n\nAn alternative route is shown in yellow. Take it instead?`;
-                                        takeAlt = confirm(msg);
-                                    } else {
-                                        new Notice(msg);
-                                    }
-                                    
-                                    if (takeAlt) {
-                                        payload.waypoints = data.alternative_path;
-                                        payload.force_execute = true;
-                                        const altRes = await fetch(`${this.serverUrl}/propose_move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-                                        if (altRes.ok) processResponse(await altRes.json());
-                                    } else {
-                                        ent.x = canvas.dragStartX; ent.y = canvas.dragStartY;
-                                        await fetch(`${this.serverUrl}/clear_path`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entity_name: ent.name, vault_path: this.vaultPath }) });
-                                        this.fetchMaps();
-                                    }
-                                } else if (!data.executed) {
-                                    let msg = "⚠️ WARNING: This move will trigger:\n";
-                                    if (data.opportunity_attacks.length > 0) msg += `- Opportunity Attacks from: ${data.opportunity_attacks.join(', ')}\n`;
-                                    if (data.traps_triggered.length > 0) msg += `- Known Traps: ${data.traps_triggered.join(', ')}\n`;
-                                    msg += "\nDo you want to proceed anyway?";
-                                    
-                                    if (confirm(msg)) {
-                                        payload.force_execute = true;
-                                        const fRes = await fetch(`${this.serverUrl}/propose_move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-                                        if (fRes.ok) processResponse(await fRes.json());
-                                    } else {
-                                        ent.x = canvas.dragStartX; ent.y = canvas.dragStartY;
-                                        await fetch(`${this.serverUrl}/clear_path`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entity_name: ent.name, vault_path: this.vaultPath }) });
-                                        this.fetchMaps();
-                                    }
-                                } else {
-                                    ent.x = data.final_x;
-                                    ent.y = data.final_y;
-                                    this.fetchMaps();
-                                }
-                            };
-                            
-                            await this.fetchMaps();
-                            setTimeout(async () => {
-                                const data = await res.json();
-                                processResponse(data);
-                            }, 50);
-                        }
-                    } catch (err) {
-                        ent.x = canvas.dragStartX; ent.y = canvas.dragStartY; 
-                        drawScene(bgImageRef);
-                    }
-                }
-            }
-        };
-
-        canvas.addEventListener('mouseup', stopDrag);
-        canvas.addEventListener('mouseout', stopDrag);
+            canvas.addEventListener('mouseup', stopDrag);
+            canvas.addEventListener('mouseout', stopDrag);
         } catch (error) {
             console.error("Engine Render Error:", error);
-            if(this.view.viewMaps) this.view.viewMaps.innerHTML = `<p style='color:var(--text-error);'>Error rendering map: ${error.message}</p>`;
+            if (this.view.viewMaps) this.view.viewMaps.innerHTML = `<p style='color:var(--text-error);'>Error rendering map: ${error.message}</p>`;
         }
     }
-    
+
     async startListening() {
         if (this.listenController) {
             this.listenController.abort();
@@ -812,9 +812,9 @@ class DMEngineClientCore {
                 method: "GET",
                 signal: this.listenController.signal
             });
-            
+
             if (!response.ok) return;
-            
+
             const reader = response.body.getReader();
             const decoder = new TextDecoder("utf-8");
             let buffer = "";
@@ -835,13 +835,13 @@ class DMEngineClientCore {
                     if (part.startsWith("data: ")) {
                         try {
                             const data = JSON.parse(part.substring(6));
-                            
+
                             if (data.type === "ping") {
                                 this.activePings = this.activePings || [];
                                 this.activePings.push({ x: data.x, y: data.y, character: data.character, time: Date.now() });
                                 if (!this.pingAnimationId) this.animatePings();
                             }
-                            
+
                             if (data.status === "streaming" || data.status === "error") {
                                 if (data.reply) {
                                     if (!msgDiv) {
@@ -915,8 +915,8 @@ class DMEngineClientCore {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    message: text, 
-                    character: this.activeCharacter, 
+                    message: text,
+                    character: this.activeCharacter,
                     vault_path: this.vaultPath,
                     client_id: this.clientId,
                     roll_automations: this.rollAutomations
@@ -924,16 +924,16 @@ class DMEngineClientCore {
             });
 
             loadingDiv.remove();
-            
+
             if (!response.ok) {
                 const errorText = await response.text();
                 throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
             }
-            
+
             const msgDiv = this.view.ui.chatHistory.createDiv({ cls: "dm-message" });
             msgDiv.style.marginBottom = "15px";
             msgDiv.style.lineHeight = "1.5";
-            
+
             const senderSpan = msgDiv.createSpan({ text: `DM: ` });
             senderSpan.style.fontWeight = "bold";
             senderSpan.style.color = "var(--text-normal)";
@@ -972,13 +972,13 @@ class DMEngineClientCore {
                 if (needsRender) {
                     contentDiv.empty();
                     await MarkdownRenderer.renderMarkdown(accumulatedText, contentDiv, "", this.view);
-                    
+
                     const paragraphs = contentDiv.querySelectorAll("p");
                     paragraphs.forEach(p => {
                         p.style.marginTop = "0";
                         p.style.marginBottom = "0.5em";
                     });
-                    
+
                     this.view.ui.chatHistory.scrollTop = this.view.ui.chatHistory.scrollHeight;
                 }
             }
@@ -998,14 +998,14 @@ class DMEngineClientCore {
         const msgDiv = this.view.ui.chatHistory.createDiv({ cls: "dm-message" });
         msgDiv.style.marginBottom = "15px";
         msgDiv.style.lineHeight = "1.5";
-        
+
         const senderSpan = msgDiv.createSpan({ text: `${sender}: ` });
         senderSpan.style.fontWeight = "bold";
         senderSpan.style.color = color;
 
         const contentDiv = msgDiv.createDiv({ cls: "dm-message-content" });
         contentDiv.style.marginTop = "5px";
-        
+
         await MarkdownRenderer.renderMarkdown(text, contentDiv, "", this.view);
 
         const paragraphs = contentDiv.querySelectorAll("p");
@@ -1016,7 +1016,7 @@ class DMEngineClientCore {
 
         this.view.ui.chatHistory.scrollTop = this.view.ui.chatHistory.scrollHeight;
     }
-    
+
     updateRadioUI(lockedCharacters) {
         const chars = new Set(["Human DM"]);
         if (this.platform === "obsidian") {
@@ -1025,7 +1025,7 @@ class DMEngineClientCore {
                 const cache = this.view.app.metadataCache.getFileCache(file);
                 if (cache && cache.frontmatter && cache.frontmatter.tags) {
                     const tags = Array.isArray(cache.frontmatter.tags) ? cache.frontmatter.tags : [cache.frontmatter.tags];
-                    if (tags.some(t => String(t).toLowerCase() === 'pc' || String(t).toLowerCase() === 'player')) {
+                    if (tags.some(t => String(t).toLowerCase() === 'pc' || String(t).toLowerCase() === 'player' || String(t).toLowerCase() === 'party_npc')) {
                         chars.add(cache.frontmatter.name || file.basename);
                     }
                 }
@@ -1059,10 +1059,10 @@ class DMEngineClientCore {
             }
         }
     }
-    
+
     renderCharacterRadios(lockedCharacters = [], precalculatedChars = null) {
         this.view.ui.charSelect.empty();
-        
+
         let chars = precalculatedChars;
         if (!chars) {
             chars = new Set(["Human DM"]);
@@ -1072,14 +1072,14 @@ class DMEngineClientCore {
                     const cache = this.view.app.metadataCache.getFileCache(file);
                     if (cache && cache.frontmatter && cache.frontmatter.tags) {
                         const tags = Array.isArray(cache.frontmatter.tags) ? cache.frontmatter.tags : [cache.frontmatter.tags];
-                        if (tags.some(t => String(t).toLowerCase() === 'pc' || String(t).toLowerCase() === 'player')) {
+                        if (tags.some(t => String(t).toLowerCase() === 'pc' || String(t).toLowerCase() === 'player' || String(t).toLowerCase() === 'party_npc')) {
                             chars.add(cache.frontmatter.name || file.basename);
                         }
                     }
                 }
             }
         }
-        
+
         if (!chars.has(this.activeCharacter)) {
             this.activeCharacter = "Human DM";
         }
@@ -1093,7 +1093,7 @@ class DMEngineClientCore {
 
             const radio = lbl.createEl("input", { type: "radio", name: "dm-char-select", value: char });
             if (char === this.activeCharacter) radio.checked = true;
-            
+
             if (char !== "Human DM" && lockedCharacters.includes(char)) {
                 radio.disabled = true;
                 lbl.style.opacity = "0.5";
@@ -1110,17 +1110,17 @@ class DMEngineClientCore {
                             method: "POST", headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({ old_character: this.activeCharacter, new_character: newChar, client_id: this.clientId })
                         });
-                        
+
                         if (!response.ok) {
                             const errorData = await response.json();
                             throw new Error(errorData.detail || "Lock denied");
                         }
-                        
+
                         this.activeCharacter = newChar;
                         this.updatePerspectiveStyles();
                         if (this.view.ui.chatInput) this.view.ui.chatInput.placeholder = `Playing as: ${this.activeCharacter}\nWhat do you do? (Shift+Enter for new line)`;
                         this.appendMessage("System", `Active character switched to: **${this.activeCharacter}**`, "var(--text-faint)");
-                        
+
                         this.syncState();
                     } catch (err) {
                         this.appendMessage("System", `**Error swapping character:** ${err.message}`, "red");
@@ -1131,8 +1131,8 @@ class DMEngineClientCore {
                 }
             });
         }
-        
-        if(this.view.ui.chatInput) this.view.ui.chatInput.placeholder = `Playing as: ${this.activeCharacter}\nWhat do you do? (Shift+Enter for new line)`;
+
+        if (this.view.ui.chatInput) this.view.ui.chatInput.placeholder = `Playing as: ${this.activeCharacter}\nWhat do you do? (Shift+Enter for new line)`;
     }
 }
 
@@ -1178,7 +1178,7 @@ class DMChatView extends ItemView {
 
         const header = titleContainer.createEl("h4", { text: "DM Engine", margin: "0" });
         header.style.margin = "0";
-        
+
         this.ui.statusIndicator = titleContainer.createSpan({ text: "🟡 Checking..." });
         this.ui.statusIndicator.style.fontSize = "0.8em";
         this.ui.statusIndicator.style.fontWeight = "600";
@@ -1191,7 +1191,7 @@ class DMChatView extends ItemView {
         listenLabel.style.cursor = "pointer";
         const listenCheckbox = listenLabel.createEl("input", { type: "checkbox" });
         listenLabel.appendChild(document.createTextNode("Listen"));
-        
+
         listenCheckbox.addEventListener("change", (e) => {
             if (e.target.checked) {
                 this.clientCore.startListening();
@@ -1211,7 +1211,7 @@ class DMChatView extends ItemView {
         this.ui.charSelect.style.flexWrap = "wrap";
         this.ui.charSelect.style.gap = "10px";
         this.ui.charSelect.style.borderBottom = "1px solid var(--background-modifier-border)";
-        
+
         // Collapsible Settings Panel
         const settingsWrapper = container.createDiv({ cls: "dm-settings-wrapper" });
         settingsWrapper.style.flex = "0 0 auto";
@@ -1277,7 +1277,7 @@ class DMChatView extends ItemView {
         createToggle("saving_throws", "Automate Saving Throws");
         createToggle("skill_checks", "Automate Skill Checks");
         createToggle("attack_rolls", "Automate Attack Rolls");
-        
+
         // New toggle for Snap to Grid
         const snapGridLabel = settingsContent.createEl("label");
         snapGridLabel.style.display = "flex";
@@ -1358,21 +1358,21 @@ class DMChatView extends ItemView {
 
         // Chat History Container
         this.ui.chatHistory = this.viewChat.createDiv({ cls: "dm-chat-history" });
-        
-        this.ui.chatHistory.style.flex = "1 1 auto"; 
+
+        this.ui.chatHistory.style.flex = "1 1 auto";
         this.ui.chatHistory.style.overflowY = "auto";
         this.ui.chatHistory.style.padding = "10px";
         this.ui.chatHistory.style.border = "1px solid var(--background-modifier-border)";
         this.ui.chatHistory.style.marginBottom = "10px";
-        
+
         // Enable Text Selection
         this.ui.chatHistory.style.userSelect = "text";
         this.ui.chatHistory.style.webkitUserSelect = "text";
 
         // Input Container
         const inputContainer = this.viewChat.createDiv({ cls: "dm-input-container" });
-        
-        inputContainer.style.flex = "0 0 auto"; 
+
+        inputContainer.style.flex = "0 0 auto";
         inputContainer.style.display = "flex";
         inputContainer.style.flexDirection = "column";
         inputContainer.style.gap = "5px";
@@ -1405,16 +1405,16 @@ What do you do? (Shift+Enter for new line)`;
 
         // Event Listeners (Both route to submitMessage)
         this.ui.sendBtn.addEventListener("click", () => this.clientCore.submitMessage());
-        
+
         this.ui.chatInput.addEventListener("keydown", (e) => {
             if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault(); // Prevents adding a rogue newline on submit
                 this.clientCore.submitMessage();
             }
         });
-        
+
         this.clientCore.renderCharacterRadios();
-        
+
         // Start the heartbeat synchronization loop
         this.clientCore.pollInterval = setInterval(() => this.clientCore.syncState(), 5000);
         this.clientCore.syncState();
@@ -1440,7 +1440,7 @@ module.exports = class DMEnginePlugin extends Plugin {
         const { workspace } = this.app;
         let leaf = null;
         const leaves = workspace.getLeavesOfType(VIEW_TYPE_DM_CHAT);
-        
+
         if (leaves.length > 0) {
             leaf = leaves[0];
         } else {
