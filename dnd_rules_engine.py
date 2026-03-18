@@ -264,6 +264,10 @@ class Creature(BaseGameEntity):
     legendary_actions_current: int = 0
     speed: int = 30
     movement_remaining: int = 30
+    wild_shape_hp: int = 0
+    wild_shape_max_hp: int = 0
+    death_saves_successes: int = 0
+    death_saves_failures: int = 0
     exhaustion_level: int = 0
     spell_slots_expended_this_turn: int = 0
     summoned_by_uuid: Optional[uuid.UUID] = None

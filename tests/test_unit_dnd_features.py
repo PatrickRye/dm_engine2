@@ -324,7 +324,7 @@ def test_concentration_auto_drop_on_zero_hp():
         dmg_event.status = 3  # Bypass pre/exec straight to Apply Damage Post Event
         EventBus._notify(dmg_event)
 
-        assert pc.hp.base_value == -5
+        assert pc.hp.base_value == 0
         # Assert a DropConcentration event was dispatched automatically
         drop_events = [
             call_args.args[0]

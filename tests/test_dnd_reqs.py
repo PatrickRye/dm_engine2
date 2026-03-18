@@ -2,11 +2,19 @@ import pytest
 from unittest.mock import patch
 import uuid
 
-from dnd_rules_engine import Creature, ModifiableValue, GameEvent, EventBus, MeleeWeapon
+from dnd_rules_engine import (
+    Creature,
+    ModifiableValue,
+    GameEvent,
+    EventBus,
+    MeleeWeapon,
+    WeaponProperty,
+    NumericalModifier,
+    ModifierPriority,
+)
 from spatial_engine import spatial_service
 from registry import clear_registry, register_entity
-from tools import execute_melee_attack, move_entity, toggle_condition
-import event_handlers  # Ensure handlers are loaded
+from tools import move_entity, toggle_condition
 import os
 from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
 from item_system import WondrousItem, ItemCompendium
@@ -26,6 +34,25 @@ def setup_system():
 # ==========================================
 # CORE & COMBAT REQS
 # ==========================================
+
+
+def test_req_cor_001_d20_test(mock_dice):
+    """
+    REQ-COR-001: d20 Test
+    Resolve standard tests by combining a d20 roll with static modifiers against a Target Number (DC).
+    """
+    # Mock a roll of 15. With a +2 modifier, the result is 17.
+    with mock_dice(15):
+        event = GameEvent(
+            event_type="AbilityCheck",
+            source_uuid=uuid.uuid4(),
+            payload={"modifier": 2, "dc": 15, "roll": 0, "is_success": False},
+        )
+        EventBus.dispatch(event)
+
+    # 15 (roll) + 2 (mod) = 17, which is >= 15 (DC), so it's a success.
+    assert event.payload["is_success"] is True
+    assert event.payload["roll"] == 17
 
 
 def test_req_cor_002_adv_dis_cancellation(mock_dice):
@@ -68,6 +95,292 @@ def test_req_cor_002_adv_dis_cancellation(mock_dice):
     assert event.payload["hit"] is False
 
 
+@pytest.mark.asyncio
+async def test_req_cor_003_difficult_terrain(mock_obsidian_vault):
+    """
+    REQ-COR-003: Difficult Terrain
+    Traversing difficult terrain deducts double the movement budget per coordinate.
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+    from spatial_engine import TerrainZone
+
+    mover = Creature(
+        name="Mover",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        speed=30,
+        movement_remaining=30,
+    )
+    register_entity(mover)
+    spatial_service.sync_entity(mover)
+    spatial_service.active_combatants[vault_path] = ["Mover"]
+
+    # Create a difficult terrain zone
+    tz = TerrainZone(
+        label="Difficult Terrain",
+        points=[(0, -5), (15, -5), (15, 5), (0, 5)],
+        is_difficult=True,
+    )
+    spatial_service.add_terrain(tz, vault_path=vault_path)
+
+    # Move 10ft through difficult terrain. Cost should be 20ft.
+    res = await move_entity.ainvoke({"entity_name": "Mover", "target_x": 10.0, "target_y": 0.0}, config=config)
+
+    assert "Remaining movement: 10" in res
+    assert mover.movement_remaining == 10
+
+
+@pytest.mark.asyncio
+async def test_req_cor_003_prone_recovery(mock_obsidian_vault):
+    """
+    REQ-COR-003: Prone Recovery
+    Recovering from Prone costs exactly half the entity's maximum base speed.
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    prone_guy = Creature(
+        name="Prone Guy",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        speed=30,
+        movement_remaining=30,
+        active_conditions=[ActiveCondition(name="Prone")],
+    )
+    register_entity(prone_guy)
+    spatial_service.active_combatants[vault_path] = ["Prone Guy"]
+
+    # Move 0ft, but standing up should cost 15ft of movement.
+    res = await move_entity.ainvoke({"entity_name": "Prone Guy", "target_x": 0.0, "target_y": 0.0}, config=config)
+
+    assert "Remaining movement: 15" in res
+    assert prone_guy.movement_remaining == 15
+    assert not any(c.name == "Prone" for c in prone_guy.active_conditions)
+
+
+@pytest.mark.asyncio
+async def test_req_cor_003_crawling_difficult_terrain(mock_obsidian_vault):
+    """
+    REQ-COR-003: Crawling in Difficult Terrain
+    Moving 1 foot while crawling in difficult terrain costs 3 feet of speed.
+    (1 base + 1 crawling + 1 difficult terrain).
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+    from spatial_engine import TerrainZone
+
+    crawler = Creature(
+        name="Crawler",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        speed=30,
+        movement_remaining=30,
+        active_conditions=[ActiveCondition(name="Prone")],
+    )
+    register_entity(crawler)
+    spatial_service.sync_entity(crawler)
+    spatial_service.active_combatants[vault_path] = ["Crawler"]
+
+    # Create a difficult terrain zone covering the movement path
+    tz = TerrainZone(
+        label="Thick Mud",
+        points=[(-5, -5), (15, -5), (15, 5), (-5, 5)],
+        is_difficult=True,
+    )
+    spatial_service.add_terrain(tz, vault_path=vault_path)
+
+    # Move 10ft through difficult terrain while crawling.
+    # Cost should be 10 * 3 = 30ft.
+    res = await move_entity.ainvoke(
+        {"entity_name": "Crawler", "target_x": 10.0, "target_y": 0.0, "movement_type": "crawl"}, config=config
+    )
+
+    assert "Remaining movement: 0" in res
+    assert crawler.movement_remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_req_spc_004_dragging_difficult_terrain(mock_obsidian_vault):
+    """
+    REQ-SPC-004: Grappling (Dragging)
+    REQ-MOV-011: Additive Penalties
+    Moving a grappled target costs 1 extra foot per foot. Difficult terrain costs 1 extra.
+    Combined, moving 1 foot costs 3 feet of speed.
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+    from spatial_engine import TerrainZone
+
+    dragger = Creature(
+        name="Dragger",
+        vault_path=vault_path,
+        x=0.0,
+        y=0.0,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=4),
+        dexterity_mod=ModifiableValue(base_value=0),
+        speed=30,
+        movement_remaining=30,
+    )
+    target = Creature(
+        name="Grappled Target",
+        vault_path=vault_path,
+        x=5.0,
+        y=0.0,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        # The "Grappled" condition explicitly links back to the dragger's UUID
+        active_conditions=[ActiveCondition(name="Grappled", source_uuid=dragger.entity_uuid)],
+    )
+    register_entity(dragger)
+    register_entity(target)
+    spatial_service.sync_entity(dragger)
+    spatial_service.sync_entity(target)
+    spatial_service.active_combatants[vault_path] = ["Dragger", "Grappled Target"]
+
+    # Create difficult terrain
+    tz = TerrainZone(
+        label="Thick Mud",
+        points=[(0, -5), (15, -5), (15, 5), (0, 5)],
+        is_difficult=True,
+    )
+    spatial_service.add_terrain(tz, vault_path=vault_path)
+
+    # Move Dragger 10ft. Dragging (+1) + Difficult Terrain (+1) + Base (1) = 3x multiplier. Cost = 30ft.
+    res = await move_entity.ainvoke({"entity_name": "Dragger", "target_x": 10.0, "target_y": 0.0}, config=config)
+
+    assert "Remaining movement: 0" in res
+    assert dragger.movement_remaining == 0
+
+    # Ensure the target was physically dragged along with the dragger natively
+    assert target.x == 15.0
+    assert target.y == 0.0
+
+
+@pytest.mark.asyncio
+async def test_req_mov_006_vertical_drag_and_drop(mock_obsidian_vault, mock_dice):
+    """
+    REQ-MOV-006: Falling Damage
+    REQ-SPC-004: Grappling (Dragging)
+    Tests a flying creature grappling a target, flying 30ft into the air (costing 60ft of movement),
+    and dropping them to natively trigger falling damage and land prone.
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    flyer = Creature(
+        name="Eagle",
+        vault_path=vault_path,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        speed=60,
+        movement_remaining=60,
+        tags=["flying"],
+    )
+    target = Creature(
+        name="Prey",
+        vault_path=vault_path,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+        hp=ModifiableValue(base_value=50),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        active_conditions=[ActiveCondition(name="Grappled", source_uuid=flyer.entity_uuid)],
+    )
+    register_entity(flyer)
+    register_entity(target)
+    spatial_service.sync_entity(flyer)
+    spatial_service.sync_entity(target)
+    spatial_service.active_combatants[vault_path] = ["Eagle", "Prey"]
+
+    # 1. Fly up 30ft while dragging. Cost = 30 * 2 = 60ft.
+    res_fly = await move_entity.ainvoke(
+        {"entity_name": "Eagle", "target_x": 0.0, "target_y": 0.0, "target_z": 30.0, "movement_type": "fly"}, config=config
+    )
+    assert flyer.movement_remaining == 0
+    assert target.z == 30.0
+    assert "automatically dragged Prey" in res_fly
+
+    # 2. Drop the target (Remove Grapple)
+    await toggle_condition.ainvoke({"character_name": "Prey", "condition_name": "Grappled", "is_active": False}, config=config)
+
+    # 3. Target falls 30ft.
+    # 30ft fall = 3d6 damage. We mock the dice to consistently roll 6s (18 damage).
+    with mock_dice(default=6):
+        res_fall = await move_entity.ainvoke(
+            {"entity_name": "Prey", "target_x": target.x, "target_y": target.y, "target_z": 0.0, "movement_type": "fall"},
+            config=config,
+        )
+
+    assert target.z == 0.0
+    assert target.hp.base_value == 32  # 50 base - 18 damage
+    assert any(c.name == "Prone" for c in target.active_conditions)
+    assert "took falling damage and landed Prone" in res_fall
+
+
+@pytest.mark.asyncio
+async def test_req_cor_004_social_interactions(mock_obsidian_vault, mock_dice):
+    """
+    REQ-COR-004: Social Interactions
+    Hidden NPC attitude integer modifies the baseline DC of Charisma checks.
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    player = Creature(
+        name="Player",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        charisma_mod=ModifiableValue(base_value=5),
+    )
+    register_entity(player)
+
+    hostile_npc = Creature(
+        name="Hostile NPC",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        attitude_to_pcs=-10,
+    )
+    register_entity(hostile_npc)
+
+    # Base DC is 10. Hostile attitude adds +10 to DC, for a total of 20.
+    # Player rolls 14 + 5 Cha = 19. Fails.
+    with mock_dice(default=14):
+        res = await perform_ability_check_or_save.ainvoke(
+            {"character_name": "Player", "skill_or_stat_name": "persuasion"},
+            config=config,
+        )
+
+    assert "Result (persuasion):" in res
+    assert "19" in res
+
+
 def test_req_wpn_004_reach_property():
     """
     REQ-WPN-004: Reach Property
@@ -90,6 +403,74 @@ def test_req_wpn_004_reach_property():
 
     # Reach should now natively calculate as 10.0
     assert _calculate_reach(c) == 10.0
+
+
+def test_req_act_005_stacking_non_spells():
+    """
+    REQ-ACT-005: Stacking (Non-Spells)
+    Overlapping non-spell features stack linearly unless specifically excluded.
+    """
+    c = Creature(
+        name="Stacker",
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    c.ac.add_modifier(NumericalModifier(priority=ModifierPriority.ADDITIVE, value=2, source_name="Shield"))
+    c.ac.add_modifier(NumericalModifier(priority=ModifierPriority.ADDITIVE, value=1, source_name="Ring of Protection"))
+    c.ac.add_modifier(NumericalModifier(priority=ModifierPriority.ADDITIVE, value=3, source_name="Mage Armor"))
+    assert c.ac.total == 16
+
+
+def test_req_wpn_001_finesse_property():
+    """
+    REQ-WPN-001: Finesse Property
+    When attacking, the entity may use Strength OR Dexterity for both the attack and damage rolls.
+    """
+    wielder = Creature(
+        name="Rogue",
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=-1),
+        dexterity_mod=ModifiableValue(base_value=4),
+    )
+    rapier = MeleeWeapon(name="Rapier", damage_dice="1d8", damage_type="piercing", properties=[WeaponProperty.FINESSE])
+    assert rapier.get_attack_modifier(wielder).total == 4
+
+    wielder.strength_mod.base_value = 5
+    wielder.dexterity_mod.base_value = 2
+    assert rapier.get_attack_modifier(wielder).total == 5
+
+
+def test_req_wpn_002_heavy_property():
+    """
+    REQ-WPN-002: Heavy Property
+    Small and Tiny creatures have Disadvantage on attack rolls with Heavy weapons.
+    """
+    halfling = Creature(
+        name="Halfling",
+        tags=["small"],
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=3),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    target = Creature(
+        name="Target",
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    greatsword = MeleeWeapon(name="Greatsword", damage_dice="2d6", damage_type="slashing", properties=[WeaponProperty.HEAVY])
+    halfling.equipped_weapon_uuid = greatsword.entity_uuid
+    register_entity(halfling)
+    register_entity(target)
+
+    event = GameEvent(event_type="MeleeAttack", source_uuid=halfling.entity_uuid, target_uuid=target.entity_uuid)
+    EventBus.dispatch(event)
+    assert event.payload.get("disadvantage") is True
 
 
 # ==========================================
@@ -124,6 +505,43 @@ def test_req_dmg_001_resistance_rounding():
 
     # 20 - 7 = 13
     assert target.hp.base_value == 13
+
+
+def test_req_dmg_002_and_003_vulnerability_and_immunity():
+    """
+    REQ-DMG-002: Vulnerability (Damage taken is doubled)
+    REQ-DMG-003: Immunity (Damage taken is reduced to 0)
+    """
+    target = Creature(
+        name="Elemental",
+        hp=ModifiableValue(base_value=50),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        vulnerabilities=["cold"],
+        immunities=["fire"],
+    )
+    register_entity(target)
+
+    event_fire = GameEvent(
+        event_type="MeleeAttack",
+        source_uuid=target.entity_uuid,
+        target_uuid=target.entity_uuid,
+        payload={"hit": True, "damage": 20, "damage_type": "fire"},
+    )
+    event_fire.status = 3
+    EventBus._notify(event_fire)
+    assert target.hp.base_value == 50
+
+    event_cold = GameEvent(
+        event_type="MeleeAttack",
+        source_uuid=target.entity_uuid,
+        target_uuid=target.entity_uuid,
+        payload={"hit": True, "damage": 15, "damage_type": "cold"},
+    )
+    event_cold.status = 3
+    EventBus._notify(event_cold)
+    assert target.hp.base_value == 20
 
 
 def test_req_spl_017_save_half_damage():
@@ -725,6 +1143,51 @@ async def test_req_cnd_004_blinded(mock_obsidian_vault):
 
 
 @pytest.mark.asyncio
+async def test_req_cnd_016_unconscious(mock_obsidian_vault):
+    """
+    REQ-CND-016: Unconscious
+    Entity is Incapacitated, falls Prone. Auto-fails Str/Dex saves. Attacks against have Advantage.
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    victim = Creature(
+        name="Victim",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=5),
+        dexterity_mod=ModifiableValue(base_value=5),
+        active_conditions=[ActiveCondition(name="Unconscious")],
+    )
+    attacker = Creature(
+        name="Attacker",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    register_entity(victim)
+    register_entity(attacker)
+
+    atk_event = GameEvent(event_type="MeleeAttack", source_uuid=attacker.entity_uuid, target_uuid=victim.entity_uuid)
+    EventBus.dispatch(atk_event)
+    assert atk_event.payload.get("advantage") is True
+
+    spell = SpellDefinition(
+        name="Fireball", level=3, mechanics=SpellMechanics(damage_dice="8d6", damage_type="fire", save_required="dexterity")
+    )
+    await SpellCompendium.save_spell(vault_path, spell)
+
+    with patch("random.randint", return_value=20):
+        res = await use_ability_or_spell.ainvoke(
+            {"caster_name": "Attacker", "ability_name": "Fireball", "target_names": ["Victim"]}, config=config
+        )
+    assert "Failed Save" in res
+
+
+@pytest.mark.asyncio
 async def test_req_cnd_012_poisoned(mock_obsidian_vault, mock_dice):
     """
     REQ-CND-012: Poisoned
@@ -857,13 +1320,14 @@ async def test_req_cnd_024_start_of_turn_saves(mock_obsidian_vault, mock_dice):
             "is_active": True,
             "save_required": "wisdom",
             "save_dc": 15,
-            "save_timing": "start"
+            "save_timing": "start",
         },
         config=config,
     )
 
     import os
     from vault_io import get_journals_dir
+
     j_dir = get_journals_dir(vault_path)
     os.makedirs(j_dir, exist_ok=True)
     with open(os.path.join(j_dir, "Fighter.md"), "w") as f:
@@ -1260,7 +1724,7 @@ async def test_req_pet_008_concentration_drops_summon(mock_obsidian_vault):
     event.status = 3  # Bypass to POST_EVENT to apply damage
     EventBus._notify(event)
 
-    assert caster.hp.base_value == -10
+    assert caster.hp.base_value == 0
     assert caster.concentrating_on == ""
 
     # The summon should be killed/despawned
@@ -1477,3 +1941,289 @@ async def test_req_pet_010_deafened_blocks_summon_commands(mock_obsidian_vault):
     assert "SYSTEM ERROR" in res
     assert "Deafened" in res
     assert "Dodge action" in res
+
+
+# ==========================================
+# DEATH REQS
+# ==========================================
+
+
+def test_req_dth_001_and_002_falling_to_zero_and_massive_damage():
+    """
+    REQ-DTH-001: Massive Damage (Instant Death)
+    REQ-DTH-002: Falling to 0 HP
+    """
+    target = Creature(
+        name="Target",
+        max_hp=10,
+        hp=ModifiableValue(base_value=5),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    register_entity(target)
+
+    # 1. Fall to 0 HP (take 6 damage). Drops to 0, Dying, Unconscious.
+    event = GameEvent(
+        event_type="MeleeAttack",
+        source_uuid=target.entity_uuid,
+        target_uuid=target.entity_uuid,
+        payload={"hit": True, "damage": 6, "damage_type": "slashing"},
+    )
+    event.status = 3
+    EventBus._notify(event)
+
+    assert target.hp.base_value == 0
+    assert any(c.name == "Dying" for c in target.active_conditions)
+    assert any(c.name == "Unconscious" for c in target.active_conditions)
+
+    # Reset for Massive Damage
+    target.hp.base_value = 5
+    target.active_conditions = []
+
+    # 2. Massive Damage (take 15 damage). 5 - 15 = -10. Max HP is 10. Instant Death.
+    event2 = GameEvent(
+        event_type="MeleeAttack",
+        source_uuid=target.entity_uuid,
+        target_uuid=target.entity_uuid,
+        payload={"hit": True, "damage": 15, "damage_type": "slashing"},
+    )
+    event2.status = 3
+    EventBus._notify(event2)
+
+    assert target.hp.base_value == 0
+    assert any(c.name == "Dead" for c in target.active_conditions)
+
+
+def test_req_dth_003_and_004_death_saving_throws(mock_dice):
+    """
+    REQ-DTH-003: Death Saving Throws (Base)
+    REQ-DTH-004: Death Saving Throws (Criticals)
+    """
+    target = Creature(
+        name="Dying Target",
+        max_hp=10,
+        hp=ModifiableValue(base_value=0),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        active_conditions=[ActiveCondition(name="Dying"), ActiveCondition(name="Unconscious")],
+    )
+    register_entity(target)
+
+    # Test failure (< 10)
+    with mock_dice(default=5):
+        sot_event = GameEvent(event_type="StartOfTurn", source_uuid=target.entity_uuid)
+        EventBus.dispatch(sot_event)
+    assert target.death_saves_failures == 1
+
+    # Test success (>= 10)
+    with mock_dice(default=12):
+        sot_event = GameEvent(event_type="StartOfTurn", source_uuid=target.entity_uuid)
+        EventBus.dispatch(sot_event)
+    assert target.death_saves_successes == 1
+
+    # Test critical failure (Nat 1) -> Adds 2 failures (total 3) -> Dead!
+    with mock_dice(default=1):
+        sot_event = GameEvent(event_type="StartOfTurn", source_uuid=target.entity_uuid)
+        EventBus.dispatch(sot_event)
+    assert target.death_saves_failures == 3
+    assert any(c.name == "Dead" for c in target.active_conditions)
+
+    # Reset
+    target.active_conditions = [ActiveCondition(name="Dying"), ActiveCondition(name="Unconscious")]
+    target.death_saves_failures = 0
+    target.death_saves_successes = 0
+
+    # Test critical success (Nat 20) -> 1 HP, wake up
+    with mock_dice(default=20):
+        sot_event = GameEvent(event_type="StartOfTurn", source_uuid=target.entity_uuid)
+        EventBus.dispatch(sot_event)
+
+    assert target.hp.base_value == 1
+    assert not any(c.name == "Dying" for c in target.active_conditions)
+    assert not any(c.name == "Unconscious" for c in target.active_conditions)
+
+
+@pytest.mark.asyncio
+async def test_req_dth_005_and_006_damage_and_healing_at_zero(mock_obsidian_vault):
+    """
+    REQ-DTH-005: Damage at 0 HP
+    REQ-DTH-006: Healing at 0 HP
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    target = Creature(
+        name="Dying Target",
+        vault_path=vault_path,
+        max_hp=10,
+        hp=ModifiableValue(base_value=0),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        active_conditions=[ActiveCondition(name="Dying"), ActiveCondition(name="Unconscious")],
+    )
+    register_entity(target)
+
+    # 1. Take normal damage -> 1 fail
+    event = GameEvent(
+        event_type="MeleeAttack",
+        source_uuid=target.entity_uuid,
+        target_uuid=target.entity_uuid,
+        payload={"hit": True, "damage": 2, "damage_type": "slashing"},
+    )
+    event.status = 3
+    EventBus._notify(event)
+    assert target.death_saves_failures == 1
+
+    # 2. Take critical damage -> 2 fails -> (Total 3) -> Dead!
+    event2 = GameEvent(
+        event_type="MeleeAttack",
+        source_uuid=target.entity_uuid,
+        target_uuid=target.entity_uuid,
+        payload={"hit": True, "damage": 2, "damage_type": "slashing", "critical": True},
+    )
+    event2.status = 3
+    EventBus._notify(event2)
+    assert target.death_saves_failures == 3
+    assert any(c.name == "Dead" for c in target.active_conditions)
+
+    # Reset
+    target.active_conditions = [ActiveCondition(name="Dying"), ActiveCondition(name="Unconscious")]
+    target.death_saves_failures = 1
+    target.death_saves_successes = 2
+
+    # 3. Heal at 0 HP
+    from tools import modify_health
+
+    await modify_health.ainvoke({"target_name": "Dying Target", "hp_change": 5, "reason": "Potion"}, config=config)
+
+    assert target.hp.base_value == 5
+    assert not any(c.name == "Dying" for c in target.active_conditions)
+    assert target.death_saves_failures == 0
+    assert target.death_saves_successes == 0
+
+
+@pytest.mark.asyncio
+async def test_req_cnd_001_and_002_incapacitated_and_stunned(mock_obsidian_vault):
+    """
+    REQ-CND-001: Incapacitated (Zeroes action economy and drops concentration).
+    REQ-CND-002: Stunned (Combines Incapacitated with automatic save failures, Speed 0, Incoming Adv).
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    pc = Creature(
+        name="Wizard",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        concentrating_on="Haste",
+    )
+    register_entity(pc)
+
+    # 1. Apply Incapacitated natively via tool (Should drop concentration)
+    await toggle_condition.ainvoke(
+        {"character_name": "Wizard", "condition_name": "Incapacitated", "is_active": True}, config=config
+    )
+    assert pc.concentrating_on == ""
+    assert any(c.name == "Incapacitated" for c in pc.active_conditions)
+
+    # 2. Apply Stunned natively via tool
+    pc.speed = 30
+    pc.movement_remaining = 30
+    await toggle_condition.ainvoke({"character_name": "Wizard", "condition_name": "Stunned", "is_active": True}, config=config)
+    assert pc.movement_remaining == 0
+    assert any(c.name == "Stunned" for c in pc.active_conditions)
+
+    # Verify attacks against have advantage
+    enemy = Creature(
+        name="Enemy",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    register_entity(enemy)
+
+    atk = GameEvent(event_type="MeleeAttack", source_uuid=enemy.entity_uuid, target_uuid=pc.entity_uuid)
+    EventBus.dispatch(atk)
+    assert atk.payload.get("advantage") is True
+
+    # Verify auto-fails Dex/Str saves
+    spell = SpellDefinition(
+        name="Fireball", level=3, mechanics=SpellMechanics(damage_dice="8d6", damage_type="fire", save_required="dexterity")
+    )
+    await SpellCompendium.save_spell(vault_path, spell)
+
+    with patch("random.randint", return_value=20):  # Normally 20 would pass, but stunned forces fail
+        res = await use_ability_or_spell.ainvoke(
+            {"caster_name": "Enemy", "ability_name": "Fireball", "target_names": ["Wizard"]}, config=config
+        )
+
+    assert "Failed Save" in res
+
+
+@pytest.mark.asyncio
+async def test_req_exh_001_and_002_exhaustion_penalties_and_death(mock_obsidian_vault, mock_dice):
+    """
+    REQ-EXH-001: Exhaustion (Penalty) - Integer 0-6. Reduces speed and subtracts from d20 tests.
+    REQ-EXH-002: Exhaustion (Death) - Reaching level 6 exhaustion immediately triggers the death state.
+    """
+    vault_path = str(mock_obsidian_vault)
+    config = {"configurable": {"thread_id": vault_path}}
+
+    from tools import evaluate_extreme_weather, start_combat, perform_ability_check_or_save
+    import os
+    from vault_io import get_journals_dir
+
+    j_dir = get_journals_dir(vault_path)
+    os.makedirs(j_dir, exist_ok=True)
+    with open(os.path.join(j_dir, "Fighter.md"), "w") as f:
+        f.write("---\nname: Fighter\n---")
+
+    pc = Creature(
+        name="Fighter",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        speed=30,
+        movement_remaining=30,
+    )
+    register_entity(pc)
+
+    # 1. Apply Level 2 Exhaustion natively via weather tool
+    with mock_dice(default=1):  # Force fails
+        await evaluate_extreme_weather.ainvoke(
+            {"character_names": ["Fighter"], "temperature_f": -10, "hours_exposed": 2}, config=config
+        )
+
+    assert pc.exhaustion_level == 2
+
+    # 2. Check Speed Penalty (-10) on Turn Start
+    await start_combat.ainvoke({"pc_names": ["Fighter"], "enemies": []}, config=config)
+    assert pc.movement_remaining == 20  # 30 - (2 * 5)
+
+    # 3. Check D20 Penalty (-4) on Ability Check
+    with mock_dice(default=10):
+        res_check = await perform_ability_check_or_save.ainvoke(
+            {"character_name": "Fighter", "skill_or_stat_name": "athletics"}, config=config
+        )
+    assert "- 4 (Exhaustion)" in res_check
+    assert "= 6" in res_check  # 10 (roll) + 0 (mod) - 4 (exh)
+
+    # 4. Level 6 Exhaustion -> Death
+    with mock_dice(default=1):  # Force 4 more fails
+        await evaluate_extreme_weather.ainvoke(
+            {"character_names": ["Fighter"], "temperature_f": -10, "hours_exposed": 4}, config=config
+        )
+
+    assert pc.exhaustion_level == 6
+    assert pc.hp.base_value == 0
+    assert any(c.name == "Dead" for c in pc.active_conditions)

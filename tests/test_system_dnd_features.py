@@ -1613,3 +1613,63 @@ async def test_strict_material_components_and_penalties(mock_obsidian_vault, moc
     )
     assert "MECHANICAL TRUTH" in res2
     assert wizard.spell_slots_expended_this_turn == 1  # properly expended by success this time
+
+
+# ==========================================
+# SCENARIO J: COMPLEX SPELL INTERACTIONS
+# ==========================================
+def test_system_haste_buff_and_concentration_drop():
+    """
+    System test covering: Casting Haste to apply multiple modifiers, granted tags, and conditions,
+    and losing concentration to instantly strip them across the target.
+    [Mapped: REQ-SPL-019]
+    """
+    caster = Creature(
+        name="Sorcerer",
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=12),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    target = Creature(
+        name="Barbarian",
+        hp=ModifiableValue(base_value=40),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=4),
+        dexterity_mod=ModifiableValue(base_value=2),
+    )
+
+    spatial_service.sync_entity(caster)
+    spatial_service.sync_entity(target)
+
+    # 1. Cast Haste on the Barbarian
+    haste_mechanics = {
+        "requires_concentration": True,
+        "modifiers": [{"stat": "ac", "value": 2, "duration": "1 minute"}],
+        "conditions_applied": [{"condition": "Hasted", "duration": "1 minute"}],
+        "granted_tags": ["advantage_dex_saves", "extra_action"],
+    }
+    event = GameEvent(
+        event_type="SpellCast",
+        source_uuid=caster.entity_uuid,
+        payload={
+            "ability_name": "Haste",
+            "mechanics": haste_mechanics,
+            "target_uuids": [target.entity_uuid],
+        },
+    )
+    EventBus.dispatch(event)
+
+    # Verify Haste Buffs
+    assert caster.concentrating_on == "Haste"
+    assert target.ac.total == 17  # 15 base + 2 from Haste
+    assert any(c.name == "Hasted" for c in target.active_conditions)
+
+    # 2. Simulate Caster taking damage and failing a CON save, dropping concentration
+    drop_event = GameEvent(event_type="DropConcentration", source_uuid=caster.entity_uuid)
+    EventBus.dispatch(drop_event)
+
+    # Verify everything was stripped cleanly
+    assert caster.concentrating_on == ""
+    assert target.ac.total == 15  # Back to base AC
+    assert not any(c.name == "Hasted" for c in target.active_conditions)

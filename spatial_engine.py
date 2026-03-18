@@ -715,6 +715,9 @@ class SpatialQueryService:
         source_corners = list(source_poly.exterior.coords)[:-1]
         target_corners = list(target_poly.exterior.coords)[:-1]
 
+        s_z = source.z + getattr(source, "height", 5.0)
+        t_z = target.z + (getattr(target, "height", 5.0) / 2.0)
+
         best_visible_corners = 0
         for s_corner in source_corners:
             visible_corners = 0
@@ -725,9 +728,16 @@ class SpatialQueryService:
                 for cid in wall_candidates:
                     wall = self._wall_map[vault_path][cid]
                     if wall.is_solid and line.intersects(wall.line):
-                        min_z = min(source.z, target.z)
-                        max_z = max(source.z + getattr(source, "height", 5.0), target.z + getattr(target, "height", 5.0))
-                        if not (max_z <= wall.z or min_z >= wall.z + wall.height):
+                        inter = line.intersection(wall.line)
+                        if inter.is_empty:
+                            continue
+                        if line.length > 0:
+                            fraction = Point(s_corner).distance(inter) / line.length
+                        else:
+                            fraction = 0.0
+
+                        ray_z = s_z + fraction * (t_z - s_z)
+                        if wall.z <= ray_z <= wall.z + wall.height:
                             blocked = True
                             break
                 if not blocked:
@@ -749,6 +759,31 @@ class SpatialQueryService:
 
         self._cache_set(vault_path, cache_key, cover)
         return dist, cover
+
+    def get_intervening_creatures(
+        self, source_uuid: uuid.UUID, target_uuid: uuid.UUID, vault_path: str = "default"
+    ) -> List[uuid.UUID]:
+        """Returns a list of entity UUIDs that intersect the straight line between source and target."""
+        if not HAS_GIS:
+            return []
+        source = self._entities.get(vault_path, {}).get(source_uuid)
+        target = self._entities.get(vault_path, {}).get(target_uuid)
+        if not source or not target:
+            return []
+        path = LineString([(source.x, source.y), (target.x, target.y)])
+        candidates = list(self.entity_idx[vault_path].intersection(path.bounds))
+        interveners = []
+        for cid in candidates:
+            e_uuid = self._id_to_uuid[vault_path][cid]
+            if e_uuid in [source_uuid, target_uuid]:
+                continue
+            e_obj = self._entities[vault_path][e_uuid]
+            if getattr(e_obj, "hp", None) and e_obj.hp.base_value <= 0:
+                continue
+            e_poly = self._get_entity_bbox(e_obj)
+            if path.intersects(e_poly):
+                interveners.append(e_uuid)
+        return interveners
 
     def has_line_of_sight(self, source_uuid: uuid.UUID, target_uuid: uuid.UUID, vault_path: str = "default") -> bool:
         """Determines if the center point of the target is visible."""
@@ -854,9 +889,17 @@ class SpatialQueryService:
             wall = self._wall_map[vault_path][cid]
             blocks = wall.is_visible if check_vision else wall.is_solid
             if blocks and path.intersects(wall.line):
-                min_z = min(start_z, end_z)
-                max_z = max(start_z, end_z) + entity_height
-                if not (max_z <= wall.z or min_z >= wall.z + wall.height):
+                inter = path.intersection(wall.line)
+                if inter.is_empty:
+                    continue
+
+                if path.length > 0:
+                    fraction = Point(start_x, start_y).distance(inter) / path.length
+                else:
+                    fraction = 0.0
+
+                cross_z = start_z + fraction * (end_z - start_z)
+                if not (cross_z + entity_height <= wall.z or cross_z >= wall.z + wall.height):
                     self._cache_set(vault_path, cache_key, wall)
                     return wall
         self._cache_set(vault_path, cache_key, False)
@@ -906,6 +949,8 @@ class SpatialQueryService:
         source_poly = self._get_entity_bbox(source)
         source_corners = list(source_poly.exterior.coords)[:-1]
 
+        s_z = source.z + getattr(source, "height", 5.0)
+
         for s_corner in source_corners:
             path = LineString([s_corner, (target_x, target_y)])
             corner_blocked = False
@@ -913,7 +958,16 @@ class SpatialQueryService:
             for cid in wall_candidates:
                 wall = self._wall_map[vault_path][cid]
                 if wall.is_visible and path.intersects(wall.line):
-                    if not (source.z + getattr(source, "height", 5.0) <= wall.z or target_z >= wall.z + wall.height):
+                    inter = path.intersection(wall.line)
+                    if inter.is_empty:
+                        continue
+                    if path.length > 0:
+                        fraction = Point(s_corner).distance(inter) / path.length
+                    else:
+                        fraction = 0.0
+
+                    ray_z = s_z + fraction * (target_z - s_z)
+                    if wall.z <= ray_z <= wall.z + wall.height:
                         corner_blocked = True
                         break
             if not corner_blocked:

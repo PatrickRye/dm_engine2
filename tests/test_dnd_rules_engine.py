@@ -75,7 +75,7 @@ class TestDnDRulesEngine(unittest.TestCase):
         # Paladin's damage: 1d8 (longsword) + 1d8 (sun blade) + 3 (str) + 2 (magic)
         # 4 + 5 + 3 + 2 = 14
         # Zombie is vulnerable to slashing, so 14 * 2 = 28
-        self.assertEqual(zombie.hp.base_value, 22 - 28)
+        self.assertEqual(zombie.hp.base_value, 0)
 
         print("\n--- Paladin attacks Wizard ---")
         with patch("random.randint", side_effect=[15, 1, 4]):  # hit, attack roll, damage

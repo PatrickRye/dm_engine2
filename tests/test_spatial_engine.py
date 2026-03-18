@@ -208,6 +208,35 @@ class TestSpatialEngine(unittest.TestCase):
 
         self.assertFalse(spatial_service.check_path_collision(0, 0, 0, 10, 0, 0))
 
+    def test_3d_raycast_over_wall(self):
+        """Test that Line of Sight and Cover natively calculate the 3D ray Z-intersection."""
+        p1 = self.create_combatant("Archer", 0.0, 0.0)
+        p1.z = 0.0  # Height is 5. Eye level = 5
+
+        p2 = self.create_combatant("Target", 20.0, 0.0)
+        p2.z = 0.0  # Center is 2.5
+
+        # Ray goes from Z=5 to Z=2.5. Distance is 20ft.
+        # Wall is exactly in the middle at X=10.
+        # Ray crosses wall at fraction 0.5. Z = 5 + 0.5 * (2.5 - 5) = 3.75.
+
+        # If wall is Z=0, height 3 -> ray Z (3.75) is > 3. OVER the wall! Cover = None
+        short_wall = Wall(start=(10.0, -10.0), end=(10.0, 10.0), z=0.0, height=3.0)
+        spatial_service.add_wall(short_wall)
+
+        self.assertTrue(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
+        _, cover = spatial_service.get_distance_and_cover(p1.entity_uuid, p2.entity_uuid)
+        self.assertEqual(cover, "None")
+
+        # If wall is Z=0, height 5 -> ray Z (3.75) is < 5. HITS the wall! Cover = Total
+        spatial_service.remove_wall(short_wall.wall_id)
+        tall_wall = Wall(start=(10.0, -10.0), end=(10.0, 10.0), z=0.0, height=5.0)
+        spatial_service.add_wall(tall_wall)
+
+        self.assertFalse(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
+        _, cover2 = spatial_service.get_distance_and_cover(p1.entity_uuid, p2.entity_uuid)
+        self.assertEqual(cover2, "Total")
+
 
 if __name__ == "__main__":
     unittest.main()

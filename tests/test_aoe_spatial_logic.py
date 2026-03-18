@@ -225,7 +225,9 @@ def test_fireball_evasion_mechanics(mock_dice, mock_roll_dice):
 
     # --- SCENARIO 2: Successful Saves ---
     fighter.hp.base_value = 30
+    fighter.active_conditions.clear()
     rogue.hp.base_value = 30
+    rogue.active_conditions.clear()
     caster.spell_save_dc.base_value = 10  # Lower DC so they both succeed
 
     with mock_roll_dice(default=30), mock_dice(default=10):
@@ -528,8 +530,8 @@ def test_aoe_elemental_terrain_lightning_water(mock_roll_dice):
         EventBus.dispatch(event)
 
     # Because of the elemental extension, t_water should take the 30 damage anyway!
-    assert t_direct.hp.base_value == -20
-    assert t_water.hp.base_value == -20
+    assert t_direct.hp.base_value == 0
+    assert t_water.hp.base_value == 0
     assert any("electrified" in res for res in event.payload["results"])
 
 

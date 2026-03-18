@@ -24,7 +24,7 @@ from dnd_rules_engine import (
     NumericalModifier,
     ModifierPriority,
 )
-from state import PCDetails, NPCDetails, LocationDetails, FactionDetails
+from state import ClassLevel, PCDetails, NPCDetails, LocationDetails, FactionDetails
 from vault_io import (
     get_journals_dir,
     write_audit_log,
@@ -499,6 +499,15 @@ async def modify_health(
         elif dt in target.resistances:
             dmg //= 2
 
+        if dmg > 0 and target.wild_shape_hp > 0:
+            if dmg >= target.wild_shape_hp:
+                dmg -= target.wild_shape_hp
+                target.wild_shape_hp = 0
+                target.active_conditions = [c for c in target.active_conditions if c.name != "Wild Shape"]
+            else:
+                target.wild_shape_hp -= dmg
+                dmg = 0
+
             if dmg > 0 and target.temp_hp > 0:
                 if dmg >= target.temp_hp:
                     dmg -= target.temp_hp
@@ -509,6 +518,7 @@ async def modify_health(
 
         hp_change = -dmg
 
+    current_hp = target.hp.base_value
     target.hp.base_value += hp_change
     action = "healed for" if hp_change > 0 else "took"
     result_msg = (
@@ -516,18 +526,49 @@ async def modify_health(
         f"Current HP: {target.hp.base_value}."
     )
 
-    if hp_change < 0 and target.concentrating_on:
-        dc = max(10, abs(hp_change) // 2)
-        result_msg += (
-            f"\nSYSTEM ALERT: {target.name} took damage while concentrating on '{target.concentrating_on}'. "
-            f"You MUST prompt a Constitution saving throw (DC {dc}). If they fail, use `drop_concentration`."
-        )
+    if hp_change < 0:
+        damage = abs(hp_change)
+        if current_hp <= 0 and damage > 0:
+            fails = 2 if reason.lower() == "critical" else 1
+            target.death_saves_failures += fails
+            target.hp.base_value = 0
+            result_msg += f"\nSYSTEM ALERT: {target.name} took damage at 0 HP and suffered {fails} Death Save failure(s)!"
+            if target.death_saves_failures >= 3:
+                target.active_conditions = [c for c in target.active_conditions if c.name not in ["Dying", "Stable"]]
+                if not any(c.name == "Dead" for c in target.active_conditions):
+                    target.active_conditions.append(ActiveCondition(name="Dead"))
+                result_msg += f"\nSYSTEM ALERT: {target.name} is DEAD."
+        elif target.hp.base_value <= 0:
+            if (current_hp - damage) <= -target.max_hp:
+                target.hp.base_value = 0
+                target.active_conditions = [c for c in target.active_conditions if c.name not in ["Dying", "Stable"]]
+                if not any(c.name == "Dead" for c in target.active_conditions):
+                    target.active_conditions.append(ActiveCondition(name="Dead"))
+                result_msg += f"\nSYSTEM ALERT: {target.name} takes massive damage and is INSTANTLY KILLED!"
+            else:
+                target.hp.base_value = 0
+                if not any(c.name == "Dying" for c in target.active_conditions):
+                    target.active_conditions.append(ActiveCondition(name="Dying"))
+                    target.active_conditions.append(ActiveCondition(name="Unconscious"))
+                result_msg += f"\nSYSTEM ALERT: {target.name} drops to 0 HP and is Dying/Unconscious."
 
-    if target.hp.base_value <= 0 and target.concentrating_on:
-        EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid))
-        result_msg += (
-            f"\nSYSTEM ALERT: {target.name} dropped to 0 HP and lost concentration " f"on '{target.concentrating_on}'."
-        )
+        if target.concentrating_on:
+            dc = max(10, abs(hp_change) // 2)
+            result_msg += (
+                f"\nSYSTEM ALERT: {target.name} took damage while concentrating on '{target.concentrating_on}'. "
+                f"You MUST prompt a Constitution saving throw (DC {dc}). If they fail, use `drop_concentration`."
+            )
+
+        if target.hp.base_value <= 0 and target.concentrating_on:
+            EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid))
+            result_msg += (
+                f"\nSYSTEM ALERT: {target.name} dropped to 0 HP and lost concentration " f"on '{target.concentrating_on}'."
+            )
+    elif hp_change > 0 and current_hp <= 0:
+        target.active_conditions = [c for c in target.active_conditions if c.name not in ["Dying", "Stable", "Unconscious"]]
+        target.death_saves_successes = 0
+        target.death_saves_failures = 0
+        result_msg += f"\nSYSTEM ALERT: {target.name} is healed from 0 HP! They regain consciousness."
 
     return result_msg
 
@@ -1214,8 +1255,49 @@ async def level_up_character(
                     break
 
             if not class_to_level_up:
-                state["save"] = False
-                return f"Error: Class '{class_name}' not found on character '{character_name}'."
+
+                def meets_req(c_name, stats):
+                    MULTICLASS_REQS = {
+                        "barbarian": [("strength", 13)],
+                        "bard": [("charisma", 13)],
+                        "cleric": [("wisdom", 13)],
+                        "druid": [("wisdom", 13)],
+                        "fighter": [("strength", 13), ("dexterity", 13)],
+                        "monk": [("dexterity", 13), ("wisdom", 13)],
+                        "paladin": [("strength", 13), ("charisma", 13)],
+                        "ranger": [("dexterity", 13), ("wisdom", 13)],
+                        "rogue": [("dexterity", 13)],
+                        "sorcerer": [("charisma", 13)],
+                        "warlock": [("charisma", 13)],
+                        "wizard": [("intelligence", 13)],
+                    }
+                    reqs = MULTICLASS_REQS.get(c_name.lower())
+                    if not reqs:
+                        return True
+                    if c_name.lower() == "fighter":
+                        return stats.get("strength", 10) >= 13 or stats.get("dexterity", 10) >= 13
+                    for stat_name, min_val in reqs:
+                        if stats.get(stat_name, 10) < min_val:
+                            return False
+                    return True
+
+                stats_dict = {
+                    "strength": pc_details.strength,
+                    "dexterity": pc_details.dexterity,
+                    "constitution": pc_details.constitution,
+                    "intelligence": pc_details.intelligence,
+                    "wisdom": pc_details.wisdom,
+                    "charisma": pc_details.charisma,
+                }
+                for existing_c in pc_details.classes:
+                    if not meets_req(existing_c.class_name, stats_dict):
+                        state["save"] = False
+                        return f"SYSTEM ERROR: Cannot multiclass. {character_name} does not meet the minimum stat requirements for their current class '{existing_c.class_name}'."
+                if not meets_req(class_name, stats_dict):
+                    state["save"] = False
+                    return f"SYSTEM ERROR: Cannot multiclass. {character_name} does not meet the minimum stat requirements for the target class '{class_name}'."
+                class_to_level_up = ClassLevel(class_name=class_name, level=0)
+                pc_details.classes.append(class_to_level_up)
 
             class_to_level_up.level += 1
             new_level = class_to_level_up.level
@@ -1230,9 +1312,14 @@ async def level_up_character(
 
             creature.max_hp = new_max_hp
             creature.hp.base_value += hp_increase
-            for c in creature.classes:
-                if c.class_name.lower() == class_name.lower():
-                    c.level = new_level
+
+            found_in_creature = False
+            for c_in_c in creature.classes:
+                if c_in_c.class_name.lower() == class_name.lower():
+                    c_in_c.level = new_level
+                    found_in_creature = True
+            if not found_in_creature:
+                creature.classes.append(ClassLevel(class_name=class_name, level=new_level))
 
             class_def = await CompendiumManager.get_class_definition(vault_path, class_to_level_up.class_name)
             if class_def:
@@ -1629,9 +1716,13 @@ async def perform_ability_check_or_save(  # noqa: C901
                     "If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
                 )
 
+    exh_penalty = engine_creature.exhaustion_level * 2 if (engine_creature and isinstance(engine_creature, Creature)) else 0
+    total -= exh_penalty
+    exh_str = f" - {exh_penalty} (Exhaustion)" if exh_penalty > 0 else ""
+
     result_str = (
         f"MECHANICAL TRUTH: Roll Result ({clean_skill}): {base_roll} {roll_type_str} "
-        f"+ {total_mod} stat mod{bonus_str} = {total}. "
+        f"+ {total_mod} stat mod{bonus_str}{exh_str} = {total}. "
     )
     result_str += (
         "\nHIDDEN ROLL: Narrate sensory experience only." if is_hidden else "\nYou may reveal the total to the player."
@@ -1941,6 +2032,12 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
 
     # Update engine memory
     spatial_service.active_combatants[vault_path] = [c["name"] for c in combatants]
+
+    first_ent = await _get_entity_by_name(combatants[0]["name"], vault_path)
+    if first_ent and hasattr(first_ent, "speed"):
+        first_ent.movement_remaining = max(0, first_ent.speed - (getattr(first_ent, "exhaustion_level", 0) * 5))
+        EventBus.dispatch(GameEvent(event_type="StartOfTurn", source_uuid=first_ent.entity_uuid, vault_path=vault_path))
+
     return f"Combat started! {combatants[0]['name']} goes first."
 
 
@@ -2030,7 +2127,7 @@ async def update_combat_state(  # noqa: C901
                 if new_turn_ent and isinstance(new_turn_ent, Creature):
                     new_turn_ent.reaction_used = False
                     new_turn_ent.legendary_actions_current = new_turn_ent.legendary_actions_max
-                    new_turn_ent.movement_remaining = new_turn_ent.speed  # Refresh movement for new turn
+                    new_turn_ent.movement_remaining = max(0, new_turn_ent.speed - (new_turn_ent.exhaustion_level * 5))
                 new_turn_ent.spell_slots_expended_this_turn = 0
 
                 sot_event = GameEvent(
@@ -2233,8 +2330,10 @@ async def move_entity(  # noqa: C901
         except Exception:
             pass
 
+    rem = int(entity.movement_remaining) if float(entity.movement_remaining).is_integer() else entity.movement_remaining
     base_msg = (
-        f"MECHANICAL TRUTH: {entity.name} moved from ({old_x}, {old_y}) to ({target_x}, {target_y}) via {movement_type}."
+        f"MECHANICAL TRUTH: {entity.name} moved from ({old_x}, {old_y}) to ({target_x}, {target_y}) via {movement_type}. "
+        f"Remaining movement: {rem}"
     )
 
     if drag_msg_parts:
@@ -2282,6 +2381,26 @@ async def move_entity(  # noqa: C901
     if "trap_results" in result.payload and result.payload["trap_results"]:
         trap_msg = "\n".join(result.payload["trap_results"])
         base_msg += f"\nSYSTEM ALERT: TRAP TRIGGERED during movement!\n{trap_msg}"
+
+    # --- FALLING DAMAGE AUTOMATION (REQ-MOV-006 & REQ-MOV-007) ---
+    if movement_type.lower() == "fall":
+        fall_dist = old_z - target_z
+        if fall_dist >= 10.0:
+            dice_count = min(20, int(fall_dist // 10))
+            dmg = sum(random.randint(1, 6) for _ in range(dice_count))
+
+            # Apply the damage natively
+            dmg_res = await modify_health.ainvoke(
+                {"target_name": entity.name, "hp_change": -dmg, "reason": "Falling", "damage_type": "bludgeoning"},
+                config=config,
+            )
+            base_msg += f"\n{dmg_res}"
+
+            if dmg > 0 and not any(c.name.lower() == "prone" for c in getattr(entity, "active_conditions", [])):
+                await toggle_condition.ainvoke(
+                    {"character_name": entity.name, "condition_name": "Prone", "is_active": True}, config=config
+                )
+                base_msg += f"\nSYSTEM ALERT: {entity.name} took falling damage and landed Prone."
 
     return base_msg
 
@@ -3568,6 +3687,7 @@ async def toggle_condition(  # noqa: C901
     source_uuid = source_ent.entity_uuid if source_ent else None
     source_name = source_ent.name if source_ent else "Manual"
 
+    alerts = []
     # Update memory
     engine_creature = await _get_entity_by_name(character_name, vault_path)
     if engine_creature and isinstance(engine_creature, Creature):
@@ -3591,6 +3711,14 @@ async def toggle_condition(  # noqa: C901
             zero_speed = {"grappled", "restrained", "stunned", "paralyzed", "petrified", "unconscious"}
             if condition_name.lower() in zero_speed:
                 engine_creature.movement_remaining = 0
+
+            incap_conds = {"incapacitated", "stunned", "paralyzed", "petrified", "unconscious", "dead"}
+            if condition_name.lower() in incap_conds and engine_creature.concentrating_on:
+                EventBus.dispatch(
+                    GameEvent(event_type="DropConcentration", source_uuid=engine_creature.entity_uuid, vault_path=vault_path)
+                )
+                alerts.append(f"\nSYSTEM ALERT: {character_name} lost concentration because they are {condition_name}.")
+
         else:
             engine_creature.active_conditions = [
                 c for c in engine_creature.active_conditions if c.name.lower() != condition_name.lower()
@@ -3632,11 +3760,34 @@ async def toggle_condition(  # noqa: C901
 
     state = "applied to" if is_active else "removed from"
     result_msg = f"MECHANICAL TRUTH: Condition '{condition_name}' was {state} {character_name}."
+    for a in alerts:
+        result_msg += a
 
     # Add Contextual DM Alerts based on D&D 5e Rules
     if is_active:
         cond_lower = condition_name.lower()
         zero_speed = {"grappled", "restrained", "stunned", "paralyzed", "petrified", "unconscious"}
+
+        # --- STALLING FLYERS (REQ-MOV-008) ---
+        if engine_creature:
+            is_flying = "flying" in engine_creature.tags or any(
+                c.name.lower() == "flying" for c in engine_creature.active_conditions
+            )
+            has_hover = "hover" in engine_creature.tags
+            if (cond_lower in zero_speed or cond_lower == "prone") and is_flying and not has_hover and engine_creature.z > 0.0:
+                result_msg += f"\nSYSTEM ALERT: {character_name} loses flying stability and falls to the ground!"
+                fall_res = await move_entity.ainvoke(
+                    {
+                        "entity_name": character_name,
+                        "target_x": engine_creature.x,
+                        "target_y": engine_creature.y,
+                        "target_z": 0.0,
+                        "movement_type": "fall",
+                    },
+                    config=config,
+                )
+                result_msg += f"\n{fall_res}"
+
         if cond_lower in zero_speed:
             result_msg += (
                 f"\nSYSTEM ALERT: '{condition_name.capitalize()}' reduces " f"speed to 0. They cannot move until freed."

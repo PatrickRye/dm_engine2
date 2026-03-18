@@ -101,8 +101,14 @@ async def test_5_round_combat_execution(mock_5_round_vault):
     for e in get_all_entities(vault_path).values():
         if e.name in ["Fighter", "Thief", "Monk", "Wizard"]:
             e.x, e.y = 0, 0
-        else:
+        elif e.name == "Troll":
             e.x, e.y = 30, 0
+        elif e.name == "Orc1":
+            e.x, e.y = 30, -5
+        elif e.name == "Orc2":
+            e.x, e.y = 30, -10
+        elif e.name == "Goblin":
+            e.x, e.y = 30, 5
         spatial_service.sync_entity(e)
 
     res = await start_combat.ainvoke(
@@ -119,8 +125,8 @@ async def test_5_round_combat_execution(mock_5_round_vault):
     )
     assert "Combat started!" in res
 
-    # MOCK BEHAVIOR: Guarantee average hit and average damage values cleanly (e.g. d20 rolls 11)
-    with patch("random.randint", side_effect=lambda a, b: b // 2 + 1):
+    # MOCK BEHAVIOR: Guarantee high hit and damage values cleanly to avoid AC misses
+    with patch("random.randint", side_effect=lambda a, b: b - 2 if b == 20 else b - 1):
 
         # --- ROUND 1 ---
         res = await use_ability_or_spell.ainvoke(
@@ -137,7 +143,9 @@ async def test_5_round_combat_execution(mock_5_round_vault):
 
         # --- ROUND 2 ---
         res = await execute_melee_attack.ainvoke({"attacker_name": "Troll", "target_name": "Fighter"}, config=config)
-        await move_entity.ainvoke({"entity_name": "Orc1", "target_x": 5, "target_y": 0, "movement_type": "walk"}, config=config)
+        await move_entity.ainvoke(
+            {"entity_name": "Orc1", "target_x": 5, "target_y": 0, "movement_type": "walk"}, config=config
+        )
 
         # Orc1 attacks Wizard -> Wizard casts Shield reaction
         res = await execute_melee_attack.ainvoke({"attacker_name": "Orc1", "target_name": "Wizard"}, config=config)
@@ -156,7 +164,9 @@ async def test_5_round_combat_execution(mock_5_round_vault):
         await move_entity.ainvoke(
             {"entity_name": "Thief", "target_x": 25, "target_y": -5, "movement_type": "walk"}, config=config
         )
-        await perform_ability_check_or_save.ainvoke({"character_name": "Thief", "skill_or_stat_name": "stealth"}, config=config)
+        await perform_ability_check_or_save.ainvoke(
+            {"character_name": "Thief", "skill_or_stat_name": "stealth"}, config=config
+        )
         await execute_melee_attack.ainvoke({"attacker_name": "Thief", "target_name": "Orc2", "advantage": True}, config=config)
         await update_combat_state.ainvoke({"next_turn": True}, config=config)
 

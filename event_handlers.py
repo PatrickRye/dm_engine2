@@ -24,6 +24,34 @@ from spell_system import SpellMechanics
 from pydantic import ValidationError
 
 
+def check_death_and_dying(target: Creature, current_hp: int, damage: int, is_critical: bool, results_list: list):
+    if damage <= 0:
+        return
+    if current_hp <= 0:
+        fails = 2 if is_critical else 1
+        target.death_saves_failures += fails
+        target.hp.base_value = 0
+        results_list.append(f"[Engine] {target.name} took damage at 0 HP and suffers {fails} Death Save failure(s)!")
+        if target.death_saves_failures >= 3:
+            target.active_conditions = [c for c in target.active_conditions if c.name not in ["Dying", "Stable"]]
+            if not any(c.name == "Dead" for c in target.active_conditions):
+                target.active_conditions.append(ActiveCondition(name="Dead"))
+            results_list.append(f"[Engine] {target.name} has died from failed death saves.")
+    elif target.hp.base_value <= 0:
+        if (current_hp - damage) <= -target.max_hp:
+            target.hp.base_value = 0
+            target.active_conditions = [c for c in target.active_conditions if c.name not in ["Dying", "Stable"]]
+            if not any(c.name == "Dead" for c in target.active_conditions):
+                target.active_conditions.append(ActiveCondition(name="Dead"))
+            results_list.append(f"[Engine] {target.name} takes massive damage and is INSTANTLY KILLED!")
+        else:
+            target.hp.base_value = 0
+            if not any(c.name == "Dying" for c in target.active_conditions):
+                target.active_conditions.append(ActiveCondition(name="Dying"))
+                target.active_conditions.append(ActiveCondition(name="Unconscious"))
+            results_list.append(f"[Engine] {target.name} drops to 0 HP and is Dying/Unconscious.")
+
+
 def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
     """Calculates spell hits, saving throws, and damage across multiple targets."""
     if event.status != EventStatus.EXECUTION:
@@ -197,7 +225,7 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                 total_save = -99  # Guaranteed failure
                 save_roll = 1
             else:
-                total_save = save_roll + save_mod_val
+                total_save = save_roll + save_mod_val - (target.exhaustion_level * 2)
 
             is_success = total_save >= dc
 
@@ -250,7 +278,23 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                     target.temp_hp -= target_damage
                     target_damage = 0
 
+            if target_damage > 0 and target.wild_shape_hp > 0:
+                if target_damage >= target.wild_shape_hp:
+                    target_damage -= target.wild_shape_hp
+                    target.wild_shape_hp = 0
+                    target.active_conditions = [c for c in target.active_conditions if c.name != "Wild Shape"]
+                else:
+                    target.wild_shape_hp -= target_damage
+                    target_damage = 0
+
+            current_hp = target.hp.base_value
             target.hp.base_value -= target_damage
+
+            is_crit = event.payload.get("is_critical", False)
+            if requires_attack_roll and "Critical" in hit_or_save_str:
+                is_crit = True
+
+            check_death_and_dying(target, current_hp, target_damage, is_crit, results)
 
             if target.hp.base_value <= 0:
                 if target.concentrating_on:
@@ -408,8 +452,26 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
     attack_mod = weapon.get_attack_modifier(attacker)
     attack_bonus = attack_mod.total + weapon.magic_bonus
 
+    if WeaponProperty.HEAVY in weapon.properties and any(t.lower() in ["small", "tiny"] for t in attacker.tags):
+        print(f"[Engine] {attacker.name} is Small/Tiny and wielding a Heavy weapon. Applying DISADVANTAGE.")
+        event.payload["disadvantage"] = True
+
     # Evaluate Spatial Logic: Range & Cover
     dist, cover = spatial_service.get_distance_and_cover(attacker.entity_uuid, target.entity_uuid, event.vault_path)
+
+    if cover == "None":
+        # REQ-GEO-012: Intervening creatures provide Half Cover
+        interveners = spatial_service.get_intervening_creatures(attacker.entity_uuid, target.entity_uuid, event.vault_path)
+        if interveners:
+            print(f"[Engine] Intervening creatures detected between {attacker.name} and {target.name}. Applying Half Cover.")
+            cover = "Half"
+
+    if cover in ["Half", "Three-Quarters"] and any(
+        tag in attacker.tags for tag in ["sharpshooter", "ignores_cover", "spell_sniper"]
+    ):
+        print(f"[Engine] {attacker.name} has a feat that ignores {cover} cover!")
+        cover = "None"
+
     if cover == "Total":
         print(f"[Engine] {attacker.name} cannot hit {target.name}. Target has TOTAL COVER.")
         event.payload["hit"] = False
@@ -546,11 +608,21 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
     attacker_conds = [c.name.lower() for c in attacker.active_conditions]
     target_conds = [c.name.lower() for c in target.active_conditions]
 
-    if any(c in attacker_conds for c in ["restrained", "poisoned", "prone", "frightened"]):
+    if any(c in attacker_conds for c in ["restrained", "poisoned", "prone", "frightened", "squeezing"]):
         print(f"[Engine] {attacker.name} is hampered by a condition. Applying DISADVANTAGE to attack.")
         event.payload["disadvantage"] = True
 
-    if any(c in target_conds for c in ["restrained", "stunned", "paralyzed", "petrified", "unconscious", "blinded"]):
+    if "reckless" in attacker_conds:
+        print(f"[Engine] {attacker.name} is attacking Recklessly. Applying ADVANTAGE to attack.")
+        event.payload["advantage"] = True
+
+    if "reckless" in target_conds:
+        print(f"[Engine] {target.name} attacked Recklessly. Applying ADVANTAGE to attackers.")
+        event.payload["advantage"] = True
+
+    if any(
+        c in target_conds for c in ["restrained", "stunned", "paralyzed", "petrified", "unconscious", "blinded", "squeezing"]
+    ):
         print(f"[Engine] {target.name} has a debilitating condition. Applying ADVANTAGE to attackers.")
         event.payload["advantage"] = True
 
@@ -559,6 +631,13 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
             event.payload["advantage"] = True
         else:
             event.payload["disadvantage"] = True
+
+    vex_conds = [c for c in target.active_conditions if c.name.lower() == "vexed" and c.source_uuid == attacker.entity_uuid]
+    if vex_conds:
+        print(f"[Engine] {attacker.name} benefits from Vex against {target.name}. Applying ADVANTAGE.")
+        event.payload["advantage"] = True
+        for v in vex_conds:
+            target.active_conditions.remove(v)
 
     cover_ac_bonus = 2 if cover == "Half" else (5 if cover == "Three-Quarters" else 0)
     target_ac = target.ac.total + cover_ac_bonus
@@ -586,12 +665,14 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         else:
             d20_roll = roll1
 
-        total_attack = d20_roll + attack_bonus
+        exh_penalty = attacker.exhaustion_level * 2
+        total_attack = d20_roll + attack_bonus - exh_penalty
         is_critical_hit = d20_roll == 20
         is_hit = is_critical_hit or total_attack >= target_ac
+        exh_str = f" - {exh_penalty} (Exhaustion)" if exh_penalty > 0 else ""
         print(
             f"[Engine] {attacker.name} rolls a {d20_roll} ({roll1}, {roll2} if adv/disadv) "
-            f"+ {attack_bonus} = {total_attack} vs AC {target_ac}{cover_msg}"
+            f"+ {attack_bonus}{exh_str} = {total_attack} vs AC {target_ac}{cover_msg}"
         )
 
     # Attacking reveals the attacker
@@ -736,7 +817,25 @@ def apply_damage_handler(event: GameEvent):
                 target.temp_hp -= damage
                 damage = 0
 
+        if damage > 0 and target.wild_shape_hp > 0:
+            if damage >= target.wild_shape_hp:
+                print(f"[Engine] {target.name}'s Wild Shape absorbed some damage, but they revert to normal form!")
+                damage -= target.wild_shape_hp
+                target.wild_shape_hp = 0
+                target.active_conditions = [c for c in target.active_conditions if c.name != "Wild Shape"]
+            else:
+                print(f"[Engine] {target.name}'s Wild Shape absorbed the damage!")
+                target.wild_shape_hp -= damage
+                damage = 0
+
+        current_hp = target.hp.base_value
         target.hp.base_value -= damage
+
+        results = []
+        check_death_and_dying(target, current_hp, damage, event.payload.get("critical", False), results)
+        for r in results:
+            print(r)
+
         print(
             f"[Engine] {target.name} takes {damage} {damage_type} damage. HP remaining: {target.hp.base_value} (THP: {target.temp_hp})"
         )
@@ -773,8 +872,14 @@ def handle_rest_event(event: GameEvent):
             for res_name, res_val in target.resources.items():
                 match = re.match(r"(\d+)\s*/\s*(\d+)", str(res_val))
                 if match:
-                    maximum = match.group(2)
-                    target.resources[res_name] = f"{maximum}/{maximum}"
+                    current = int(match.group(1))
+                    maximum = int(match.group(2))
+                    if "hit dice" in res_name.lower():
+                        recover = max(1, maximum // 2)
+                        new_val = min(maximum, current + recover)
+                        target.resources[res_name] = f"{new_val}/{maximum}"
+                    else:
+                        target.resources[res_name] = f"{maximum}/{maximum}"
             print(f"[Engine] {target.name} finished a Long Rest. HP and resources fully restored.")
 
 
@@ -950,20 +1055,6 @@ def validate_movement_handler(event: GameEvent):
         event.payload["error"] = f"Movement failed. {entity.name} is suffering from a condition that reduces their speed to 0."
         return
 
-    # 2. Check Prone mechanics
-    stand_cost = 0
-    if "prone" in active_conds and movement_type not in ["crawl"]:
-        stand_cost = entity.speed // 2
-        if entity.movement_remaining < stand_cost:
-            event.status = EventStatus.CANCELLED
-            event.payload["error"] = (
-                f"Movement failed. {entity.name} is Prone and does not have enough movement "
-                f"({stand_cost}ft needed) to stand up. Try movement_type='crawl'."
-            )
-            return
-        entity.active_conditions = [c for c in entity.active_conditions if c.name.lower() != "prone"]
-        print(f"[Engine] {entity.name} spends {stand_cost}ft of movement to stand up from Prone.")
-
     target_x = event.payload.get("target_x")
     target_y = event.payload.get("target_y")
     target_z = event.payload.get("target_z", entity.z)
@@ -977,12 +1068,20 @@ def validate_movement_handler(event: GameEvent):
         normal_dist += diff_dist
         diff_dist = 0.0
 
-    # Truncate to 2 decimal places to eliminate floating point noise before applying math.ceil
-    raw_dist = normal_dist + (diff_dist * 2)
-    total_cost = math.ceil(int(raw_dist * 100) / 100.0) + stand_cost
+    cost_multiplier = 1
+    if "squeezing" in active_conds:
+        cost_multiplier += 1
+    if movement_type in ["crawl", "climb", "swim"]:
+        cost_multiplier += 1
 
     if event.payload.get("dragged_uuids"):
-        total_cost *= 2  # Dragging halves speed (costs twice as much movement per foot)
+        cost_multiplier += 1  # Dragging halves speed (costs 1 extra foot per foot)
+
+    raw_dist = (normal_dist * cost_multiplier) + (diff_dist * (cost_multiplier + 1))
+    total_cost = math.ceil(int(raw_dist * 100) / 100.0)
+
+    if "prone" in active_conds and movement_type == "walk":
+        total_cost += math.floor(entity.speed / 2)
 
     if total_cost > entity.movement_remaining and not event.payload.get("ignore_budget", False):
         event.status = EventStatus.CANCELLED
@@ -1006,6 +1105,13 @@ def resolve_movement_handler(event: GameEvent):  # noqa: C901
     target_x = event.payload.get("target_x")
     target_y = event.payload.get("target_y")
     target_z = event.payload.get("target_z", entity.z)
+
+    # --- Prone Recovery ---
+    if movement_type == "walk":
+        prone_conds = [c for c in entity.active_conditions if c.name.lower() == "prone"]
+        for cond in prone_conds:
+            entity.active_conditions.remove(cond)
+            print(f"[Engine] {entity.name} stood up from Prone.")
 
     # --- Grapple Breaking Checks ---
     # 1. Did the moving entity break out of a grapple? (e.g. Thunderwaved away)
@@ -1459,7 +1565,7 @@ def _evaluate_repeating_saves(entity: Creature, timing: str) -> list:
                     auto_fail = True
 
             has_disadv = False
-            if cond.save_required == "dexterity" and "restrained" in active_conds:
+            if cond.save_required == "dexterity" and any(c in active_conds for c in ["restrained", "squeezing"]):
                 has_disadv = True
 
             roll1, roll2 = random.randint(1, 20), random.randint(1, 20)
@@ -1473,9 +1579,13 @@ def _evaluate_repeating_saves(entity: Creature, timing: str) -> list:
 
             if total_save >= cond.save_dc:
                 conditions_to_remove.append(cond)
-                results.append(f"[Engine] {entity.name} succeeded on their {timing}-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) and is no longer {cond.name}.")
+                results.append(
+                    f"[Engine] {entity.name} succeeded on their {timing}-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) and is no longer {cond.name}."
+                )
             else:
-                results.append(f"[Engine] {entity.name} failed their {timing}-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) against {cond.name}.")
+                results.append(
+                    f"[Engine] {entity.name} failed their {timing}-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) against {cond.name}."
+                )
 
     for cond in conditions_to_remove:
         entity.active_conditions.remove(cond)
@@ -1553,6 +1663,39 @@ def start_of_turn_handler(event: GameEvent):
                 entity.temp_hp = cond.start_of_turn_thp
                 results.append(f"[Engine] {entity.name} gained {cond.start_of_turn_thp} Temporary HP from {cond.name}.")
 
+    # Evaluate Death Saving Throws
+    if any(c.name == "Dying" for c in entity.active_conditions):
+        roll = random.randint(1, 20)
+        if roll == 1:
+            entity.death_saves_failures += 2
+            results.append(
+                f"[Engine] {entity.name} rolled a 1 on their Death Save! They suffer 2 failures ({entity.death_saves_failures}/3)."
+            )
+        elif roll == 20:
+            entity.hp.base_value = 1
+            entity.active_conditions = [c for c in entity.active_conditions if c.name not in ["Dying", "Unconscious"]]
+            entity.death_saves_successes = 0
+            entity.death_saves_failures = 0
+            results.append(f"[Engine] {entity.name} rolled a 20 on their Death Save! They regain 1 HP and wake up!")
+        elif roll >= 10:
+            entity.death_saves_successes += 1
+            results.append(f"[Engine] {entity.name} succeeded on their Death Save ({entity.death_saves_successes}/3).")
+            if entity.death_saves_successes >= 3:
+                entity.active_conditions = [c for c in entity.active_conditions if c.name != "Dying"]
+                entity.active_conditions.append(ActiveCondition(name="Stable"))
+                entity.death_saves_successes = 0
+                entity.death_saves_failures = 0
+                results.append(f"[Engine] {entity.name} is now STABLE.")
+        else:
+            entity.death_saves_failures += 1
+            results.append(f"[Engine] {entity.name} failed their Death Save ({entity.death_saves_failures}/3).")
+
+        if entity.death_saves_failures >= 3:
+            entity.active_conditions = [c for c in entity.active_conditions if c.name not in ["Dying", "Stable"]]
+            if not any(c.name == "Dead" for c in entity.active_conditions):
+                entity.active_conditions.append(ActiveCondition(name="Dead"))
+            results.append(f"[Engine] {entity.name} is DEAD.")
+
     # Evaluate Spatial Traps (e.g., Flaming Sphere, Moonbeam)
     if HAS_GIS:
         ent_poly = spatial_service._get_entity_bbox(entity)
@@ -1617,9 +1760,29 @@ def start_of_turn_handler(event: GameEvent):
         event.payload.setdefault("results", []).extend(results)
 
 
+def resolve_ability_check_handler(event: GameEvent):
+    """Resolves a standard d20 ability check."""
+    if event.status != EventStatus.EXECUTION:
+        return
+
+    modifier = event.payload.get("modifier", 0)
+    dc = event.payload.get("dc", 10)
+
+    entity = get_entity(event.source_uuid)
+    exh_penalty = entity.exhaustion_level * 2 if isinstance(entity, Creature) else 0
+
+    # The dice roll is mocked in the test, so random.randint(1, 20) will return the mocked value.
+    roll = random.randint(1, 20)
+    total_roll = roll + modifier - exh_penalty
+
+    event.payload["roll"] = total_roll
+    event.payload["is_success"] = total_roll >= dc
+
+
 def register_core_handlers():
     """Registers all standard handlers to the Event Bus. Can be called to reset state."""
     EventBus._listeners.clear()
+    EventBus.subscribe("AbilityCheck", resolve_ability_check_handler, priority=10)
     EventBus.subscribe("MeleeAttack", shield_spell_reaction_handler, priority=1)
     EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
     EventBus.subscribe("MeleeAttack", apply_damage_handler, priority=100)

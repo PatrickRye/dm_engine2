@@ -23,6 +23,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 
 from shapely.geometry import LineString
+from dnd_rules_engine import Creature
 from state import DMState, QAResult
 from vault_io import (
     write_audit_log,
@@ -602,6 +603,37 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
     if not entity:
         raise HTTPException(status_code=404, detail="Entity not found")
 
+    from shapely.geometry import box
+
+    pixels_per_foot = getattr(spatial_service.get_map_data(request.vault_path), "pixels_per_foot", 1.0)
+    foot_waypoints = [(p[0] / pixels_per_foot, p[1] / pixels_per_foot) for p in request.waypoints]
+
+    # REQ-GEO-006: Check if final waypoint is occupied
+    final_wp = foot_waypoints[-1]
+    final_poly = box(
+        final_wp[0] - entity.size / 2,
+        final_wp[1] - entity.size / 2,
+        final_wp[0] + entity.size / 2,
+        final_wp[1] + entity.size / 2,
+    )
+    for other_entity in get_all_entities(request.vault_path).values():
+        if other_entity.entity_uuid == entity.entity_uuid:
+            continue
+        if not hasattr(other_entity, "hp") or getattr(other_entity.hp, "base_value", 0) <= 0:
+            continue
+        o_poly = box(
+            other_entity.x - other_entity.size / 2,
+            other_entity.y - other_entity.size / 2,
+            other_entity.x + other_entity.size / 2,
+            other_entity.y + other_entity.size / 2,
+        )
+        if final_poly.buffer(-0.1).intersects(o_poly.buffer(-0.1)):
+            return ProposeMoveResponse(
+                is_valid=False,
+                invalid_reason=f"Cannot end movement in a space occupied by {other_entity.name}.",
+                executed=False,
+            )
+
     if request.entity_name in spatial_service.active_paths.get(request.vault_path, {}):
         del spatial_service.active_paths[request.vault_path][request.entity_name]
 
@@ -630,9 +662,6 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                         )
         except Exception:
             pass
-
-    pixels_per_foot = getattr(spatial_service.get_map_data(request.vault_path), "pixels_per_foot", 1.0)
-    foot_waypoints = [(p[0] / pixels_per_foot, p[1] / pixels_per_foot) for p in request.waypoints]
 
     # Discretize path into <= 5ft chunks for precise trigger detection
     detailed_path = [foot_waypoints[0]]
@@ -685,6 +714,58 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                 ),
                 (end[0] * pixels_per_foot, end[1] * pixels_per_foot),
             ]
+            break
+
+        # REQ-GEO-007, REQ-GEO-008: Moving through creatures
+        for other_entity in all_entities.values():
+            if other_entity.entity_uuid == entity.entity_uuid:
+                continue
+            if not hasattr(other_entity, "hp") or getattr(other_entity.hp, "base_value", 0) <= 0:
+                continue
+            o_poly = box(
+                other_entity.x - other_entity.size / 2,
+                other_entity.y - other_entity.size / 2,
+                other_entity.x + other_entity.size / 2,
+                other_entity.y + other_entity.size / 2,
+            )
+
+            if path_line.intersects(o_poly):
+                is_entity_pc = any(t in entity.tags for t in ["pc", "player", "party_npc"])
+                is_other_pc = any(t in other_entity.tags for t in ["pc", "player", "party_npc"])
+
+                def size_cat(size: float, tags: list):
+                    tags_lower = [t.lower() for t in tags]
+                    if "tiny" in tags_lower:
+                        return 1
+                    if "small" in tags_lower:
+                        return 2
+                    if "large" in tags_lower:
+                        return 4
+                    if "huge" in tags_lower:
+                        return 5
+                    if "gargantuan" in tags_lower:
+                        return 6
+                    if size <= 2.5:
+                        return 1
+                    if size <= 5.0:
+                        return 3  # Medium
+                    if size <= 10.0:
+                        return 4  # Large
+                    if size <= 15.0:
+                        return 5  # Huge
+                    return 6
+
+                cat_e = size_cat(entity.size, getattr(entity, "tags", []))
+                cat_o = size_cat(other_entity.size, getattr(other_entity, "tags", []))
+
+                if is_entity_pc != is_other_pc and abs(cat_e - cat_o) < 2:
+                    is_valid = False
+                    invalid_reason = f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
+                    break
+                else:
+                    segment_cost += segment_dist * (o_poly.intersection(path_line).length / path_line.length)
+
+        if not is_valid and not request.force_execute:
             break
 
         if not ignores_dt:
