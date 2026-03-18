@@ -1333,10 +1333,12 @@ async def test_req_cnd_024_start_of_turn_saves(mock_obsidian_vault, mock_dice):
     with open(os.path.join(j_dir, "Fighter.md"), "w") as f:
         f.write("---\nname: Fighter\n---")
 
-    await start_combat.ainvoke({"pc_names": ["Fighter"], "enemies": []}, config=config)
+    with mock_dice(default=2):
+        res_start = await start_combat.ainvoke({"pc_names": ["Fighter"], "enemies": []}, config=config)
 
     with mock_dice(default=2):
         res_fail = await update_combat_state.ainvoke({"next_turn": True}, config=config)
+    assert "failed their start-of-turn wisdom save" in res_start
     assert "failed their start-of-turn wisdom save" in res_fail
     assert any(c.name == "Charmed" for c in fighter.active_conditions)
 

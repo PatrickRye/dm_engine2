@@ -78,7 +78,7 @@ async def test_req_mst_002_graze_mastery_on_miss(setup_system, mock_dice):
     # 5. Verify the miss occurred, but Graze dealt exactly 4 damage
     assert "MISS!" in res
     assert "Graze Mastery Triggered" in res
-    assert "Took 4 slashing damage" in res
+    assert "took 4 slashing damage" in res
     assert target.hp.base_value == 26  # 30 - 4
 
 

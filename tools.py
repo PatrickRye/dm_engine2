@@ -46,9 +46,11 @@ class VaultCache:
         self.chunk_cache = {}  # vault_path -> category -> [ (filename, chunk) ]
         self.indexed_vaults = set()
 
-    def build_index(self, vault_path: str):
-        if vault_path in self.indexed_vaults:
+    def build_index(self, vault_path: str, force: bool = False):
+        if vault_path in self.indexed_vaults and not force:
             return
+        if force:
+            self.indexed_vaults.discard(vault_path)
 
         self.bestiary_cache[vault_path] = []
         self.chunk_cache[vault_path] = {"rules": [], "modules": [], "bestiary": []}
@@ -1217,6 +1219,84 @@ async def use_expendable_resource(
 
 
 @tool
+async def use_font_of_magic(
+    character_name: str,
+    action: str,
+    slot_level: int = 1,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Sorcerer feature: Convert Sorcery Points to a Spell Slot ('create_slot')
+    or a Spell Slot to Sorcery Points ('convert_slot').
+    """
+    vault_path = config["configurable"].get("thread_id")
+    file_path = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
+
+    cost_map = {1: 2, 2: 3, 3: 5, 4: 6, 5: 7}
+    if slot_level not in cost_map and action == "create_slot":
+        return "SYSTEM ERROR: Can only create spell slots of 1st through 5th level."
+        
+    try:
+        async with edit_markdown_entity(file_path) as state:
+            yaml_data = state["yaml_data"]
+            resources = yaml_data.get("resources", {})
+            
+            sp_key = next((k for k in resources.keys() if "sorcery point" in k.lower()), None)
+            slot_key = next((k for k in resources.keys() if f"level {slot_level}" in k.lower() or f"{slot_level}st level" in k.lower() or f"{slot_level}nd level" in k.lower() or f"{slot_level}rd level" in k.lower() or f"{slot_level}th level" in k.lower()), None)
+
+            if not sp_key:
+                state["save"] = False
+                return f"SYSTEM ERROR: No Sorcery Points found on {character_name}."
+                
+            sp_match = re.match(r"(\d+)\s*/\s*(\d+)", str(resources[sp_key]))
+            sp_cur, sp_max = int(sp_match.group(1)), int(sp_match.group(2))
+            
+            if not slot_key:
+                slot_key = f"Level {slot_level} Spell Slots"
+                resources[slot_key] = "0/0"
+                
+            slot_match = re.match(r"(\d+)\s*/\s*(\d+)", str(resources[slot_key]))
+            slot_cur, slot_max = int(slot_match.group(1)), int(slot_match.group(2))
+            
+            if action == "create_slot":
+                cost = cost_map[slot_level]
+                if sp_cur < cost:
+                    state["save"] = False
+                    return f"SYSTEM ERROR: Not enough Sorcery Points ({sp_cur}/{sp_max}) to create a Level {slot_level} slot (costs {cost})."
+                sp_cur -= cost
+                slot_cur += 1
+                resources[sp_key] = f"{sp_cur}/{sp_max}"
+                resources[slot_key] = f"{slot_cur}/{max(slot_cur, slot_max)}"
+                log = f"Spent {cost} Sorcery Points to create a Level {slot_level} Spell Slot."
+            
+            elif action == "convert_slot":
+                if slot_cur < 1:
+                    state["save"] = False
+                    return f"SYSTEM ERROR: No Level {slot_level} Spell Slots available to convert."
+                slot_cur -= 1
+                sp_cur = min(sp_max, sp_cur + slot_level)
+                resources[sp_key] = f"{sp_cur}/{sp_max}"
+                resources[slot_key] = f"{slot_cur}/{slot_max}"
+                log = f"Converted a Level {slot_level} Spell Slot into {slot_level} Sorcery Points."
+            else:
+                state["save"] = False
+                return "SYSTEM ERROR: Invalid action. Use 'create_slot' or 'convert_slot'."
+    except Exception as e:
+        return str(e)
+
+    engine_creature = await _get_entity_by_name(character_name, vault_path)
+    if engine_creature and isinstance(engine_creature, Creature):
+        engine_creature.resources[sp_key] = f"{sp_cur}/{sp_max}"
+        engine_creature.resources[slot_key] = f"{slot_cur}/{max(slot_cur, slot_max)}"
+
+    await upsert_journal_section.ainvoke(
+        {"entity_name": character_name, "section_header": "Event Log", "content": f"- {log}", "mode": "append"}, config
+    )
+    return f"MECHANICAL TRUTH: {character_name} {log} (SP: {sp_cur}/{sp_max}, Lvl {slot_level} Slots: {slot_cur}/{max(slot_cur, slot_max)})"
+
+
+@tool
 async def update_character_status(
     character_name: str,
     hp: str,
@@ -2041,7 +2121,10 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
     first_ent = await _get_entity_by_name(combatants[0]["name"], vault_path)
     if first_ent and hasattr(first_ent, "speed"):
         first_ent.movement_remaining = max(0, first_ent.speed - (getattr(first_ent, "exhaustion_level", 0) * 5))
-        EventBus.dispatch(GameEvent(event_type="StartOfTurn", source_uuid=first_ent.entity_uuid, vault_path=vault_path))
+        sot_event = GameEvent(event_type="StartOfTurn", source_uuid=first_ent.entity_uuid, vault_path=vault_path)
+        EventBus.dispatch(sot_event)
+        if "results" in sot_event.payload and sot_event.payload["results"]:
+            return f"Combat started! {combatants[0]['name']} goes first.\n" + "\n".join(sot_event.payload["results"])
 
     return f"Combat started! {combatants[0]['name']} goes first."
 
@@ -2408,6 +2491,56 @@ async def move_entity(  # noqa: C901
                 base_msg += f"\nSYSTEM ALERT: {entity.name} took falling damage and landed Prone."
 
     return base_msg
+
+
+@tool
+async def refresh_vault_data(
+    entity_names: list[str] = None,
+    refresh_all: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Forces the engine to reload entities from the Obsidian Vault into memory, updating their stats to match the Markdown files.
+    - If `entity_names` is provided, those specific entities are forcefully re-hydrated.
+    - If `refresh_all` is True, it efficiently scans all files for changes using modified timestamps. 
+      You MUST ask the DM for confirmation ("Are you sure?") before calling with `refresh_all=True`.
+    """
+    vault_path = config["configurable"].get("thread_id")
+    
+    if not entity_names and not refresh_all:
+        return "SYSTEM ERROR: You must specify either a list of `entity_names` to refresh or set `refresh_all=True`."
+
+    if refresh_all:
+        from vault_io import sync_engine_from_vault_updates
+        res = await sync_engine_from_vault_updates(vault_path)
+        return res
+
+    from vault_io import load_entity_into_engine, get_journals_dir
+    import os
+    
+    j_dir = get_journals_dir(vault_path)
+    reloaded = []
+    not_found = []
+    
+    for name in entity_names:
+        filepath = os.path.join(j_dir, f"{name}.md")
+        if os.path.exists(filepath):
+            ent = await load_entity_into_engine(filepath, vault_path)
+            if ent:
+                reloaded.append(name)
+            else:
+                not_found.append(name)
+        else:
+            not_found.append(name)
+
+    res_str = ""
+    if reloaded:
+        res_str += f"MECHANICAL TRUTH: Successfully force-reloaded {', '.join(reloaded)} from vault. "
+    if not_found:
+        res_str += f"SYSTEM ERROR: Failed to reload (files not found or invalid): {', '.join(not_found)}"
+        
+    return res_str.strip()
 
 
 def _get_config_tone(vault_path: str) -> str:
@@ -4140,4 +4273,4 @@ async def ingest_battlemap_json(map_json_str: str, *, config: Annotated[Runnable
             f"{terr_cnt} terrain zones, and {lght_cnt} light sources."
         )
     except Exception as e:
-        return f"SYSTEM ERROR: Failed to parse or load map JSON. Details: {str(e)}"
+        return f"SYSTEM ERROR: Failed to ingest battlemap JSON. Error: {str(e)}"

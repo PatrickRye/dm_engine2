@@ -256,58 +256,30 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
             else:
                 hit_or_save_str = f"Failed Save (Rolled {save_event.payload['roll']} vs DC {dc})"
 
-        # 3. Process Damage (Reusing apply_damage_handler logic internally for multiple targets)
+        results.append(f"[{target.name}] {hit_or_save_str}.")
+
+        # 3. Process Damage
         if target_damage > 0:
             event.payload["hit"] = True  # Flag for potential reaction handlers
-            # Apply resistances/vulnerabilities
-            is_magically_silenced = any(
-                c.name.lower() == "silenced" and "silence" in c.source_name.lower() for c in target.active_conditions
-            )
-            if damage_type in target.immunities or (damage_type == "thunder" and is_magically_silenced):
-                target_damage = 0
-            elif damage_type in target.vulnerabilities:
-                target_damage *= 2
-            elif damage_type in target.resistances:
-                target_damage = target_damage // 2
-
-            if target_damage > 0 and target.temp_hp > 0:
-                if target_damage >= target.temp_hp:
-                    target_damage -= target.temp_hp
-                    target.temp_hp = 0
-                else:
-                    target.temp_hp -= target_damage
-                    target_damage = 0
-
-            if target_damage > 0 and target.wild_shape_hp > 0:
-                if target_damage >= target.wild_shape_hp:
-                    target_damage -= target.wild_shape_hp
-                    target.wild_shape_hp = 0
-                    target.active_conditions = [c for c in target.active_conditions if c.name != "Wild Shape"]
-                else:
-                    target.wild_shape_hp -= target_damage
-                    target_damage = 0
-
-            current_hp = target.hp.base_value
-            target.hp.base_value -= target_damage
-
             is_crit = event.payload.get("is_critical", False)
             if requires_attack_roll and "Critical" in hit_or_save_str:
                 is_crit = True
 
-            check_death_and_dying(target, current_hp, target_damage, is_crit, results)
-
-            if target.hp.base_value <= 0:
-                if target.concentrating_on:
-                    EventBus.dispatch(
-                        GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid, vault_path=event.vault_path)
-                    )
-            elif target_damage > 0 and target.concentrating_on:
-                dc = max(10, target_damage // 2)
-                msg = (
-                    f"[Engine] SYSTEM ALERT: {target.name} took damage while concentrating on '{target.concentrating_on}'. "
-                    f"LLM MUST prompt a Constitution saving throw (DC {dc}). Use `drop_concentration` tool if failed."
-                )
-                print(msg)
+            damage_event = GameEvent(
+                event_type="ApplyDamage",
+                source_uuid=caster.entity_uuid,
+                target_uuid=target.entity_uuid,
+                vault_path=event.vault_path,
+                payload={
+                    "damage": target_damage,
+                    "damage_type": damage_type,
+                    "critical": is_crit,
+                    "source_name": event.payload.get("ability_name", "Unknown Spell")
+                }
+            )
+            EventBus.dispatch(damage_event)
+            results.extend(damage_event.payload.get("results", []))
+            target_damage = damage_event.payload.get("final_damage_applied", target_damage)
 
         # 4. Process Conditions
         applied_effects = False
@@ -366,10 +338,6 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                         if event.payload.get("ability_name", "Unknown") not in target.active_mechanics:
                             target.active_mechanics.append(event.payload.get("ability_name", "Unknown"))
                         results.append(f"[{target.name}] gained modifier to {target_stat}.")
-
-        results.append(
-            f"[{target.name}] {hit_or_save_str}. Took {target_damage} {damage_type} damage. HP: {target.hp.base_value}"
-        )
 
     # 5. Process Collateral Damage to Geography (Walls/Doors)
     if base_damage > 0 and target_wall_ids and damage_type not in ["poison", "psychic"]:
@@ -783,12 +751,19 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
 
 def apply_damage_handler(event: GameEvent):
     """Applies final damage to a target, considering immunities, resistances, and vulnerabilities."""
-    if event.status != EventStatus.POST_EVENT or not event.payload.get("hit"):
+    if event.status != EventStatus.EXECUTION:
         return
 
     target: Creature = get_entity(event.target_uuid)
+    if not target:
+        return
+
     damage = event.payload.get("damage", 0)
     damage_type = event.payload.get("damage_type", "unknown")
+    is_critical = event.payload.get("critical", False)
+    source_name = event.payload.get("source_name")
+
+    results = []
 
     if damage > 0:
         # Check for immunities first
@@ -797,47 +772,45 @@ def apply_damage_handler(event: GameEvent):
         )
         if damage_type in target.immunities or (damage_type == "thunder" and is_magically_silenced):
             damage = 0
-            print(f"[Engine] {target.name} is IMMUNE to {damage_type}!")
+            results.append(f"[Engine] {target.name} is IMMUNE to {damage_type}!")
         else:
             # Then check for vulnerabilities and resistances
             if damage_type in target.vulnerabilities:
                 damage *= 2
-                print(f"[Engine] {target.name} is VULNERABLE to {damage_type}! Damage is doubled.")
+                results.append(f"[Engine] {target.name} is VULNERABLE to {damage_type}! Damage is doubled.")
             elif damage_type in target.resistances:
                 damage = damage // 2  # Halve the damage, rounding down
-                print(f"[Engine] {target.name} is RESISTANT to {damage_type}! Damage is halved.")
+                results.append(f"[Engine] {target.name} is RESISTANT to {damage_type}! Damage is halved.")
 
         if damage > 0 and target.temp_hp > 0:
             if damage >= target.temp_hp:
-                print(f"[Engine] {target.name}'s {target.temp_hp} Temporary HP absorbed some of the damage!")
+                results.append(f"[Engine] {target.name}'s {target.temp_hp} Temporary HP absorbed some of the damage!")
                 damage -= target.temp_hp
                 target.temp_hp = 0
             else:
-                print(f"[Engine] {target.name}'s Temporary HP completely absorbed the damage!")
+                results.append(f"[Engine] {target.name}'s Temporary HP completely absorbed the damage!")
                 target.temp_hp -= damage
                 damage = 0
 
         if damage > 0 and target.wild_shape_hp > 0:
             if damage >= target.wild_shape_hp:
-                print(f"[Engine] {target.name}'s Wild Shape absorbed some damage, but they revert to normal form!")
+                results.append(f"[Engine] {target.name}'s Wild Shape absorbed some damage, but they revert to normal form!")
                 damage -= target.wild_shape_hp
                 target.wild_shape_hp = 0
                 target.active_conditions = [c for c in target.active_conditions if c.name != "Wild Shape"]
             else:
-                print(f"[Engine] {target.name}'s Wild Shape absorbed the damage!")
+                results.append(f"[Engine] {target.name}'s Wild Shape absorbed the damage!")
                 target.wild_shape_hp -= damage
                 damage = 0
 
         current_hp = target.hp.base_value
         target.hp.base_value -= damage
 
-        results = []
-        check_death_and_dying(target, current_hp, damage, event.payload.get("critical", False), results)
-        for r in results:
-            print(r)
+        check_death_and_dying(target, current_hp, damage, is_critical, results)
 
-        print(
-            f"[Engine] {target.name} takes {damage} {damage_type} damage. HP remaining: {target.hp.base_value} (THP: {target.temp_hp})"
+        source_str = f" from {source_name}" if source_name else ""
+        results.append(
+            f"[Engine] {target.name} took {damage} {damage_type} damage{source_str}. HP remaining: {target.hp.base_value} (THP: {target.temp_hp})"
         )
 
         if target.hp.base_value <= 0:
@@ -851,7 +824,33 @@ def apply_damage_handler(event: GameEvent):
                 f"[Engine] SYSTEM ALERT: {target.name} took damage while concentrating on '{target.concentrating_on}'. "
                 f"LLM MUST prompt a Constitution saving throw (DC {dc}). Use `drop_concentration` tool if failed."
             )
-            print(msg)
+            results.append(msg)
+
+    for r in results:
+        print(r)
+
+    event.payload.setdefault("results", []).extend(results)
+    event.payload["final_damage_applied"] = damage
+
+
+def melee_attack_damage_dispatcher(event: GameEvent):
+    """Dispatches an ApplyDamage event after a successful melee attack."""
+    if event.status != EventStatus.POST_EVENT or not event.payload.get("hit"):
+        return
+
+    damage_event = GameEvent(
+        event_type="ApplyDamage",
+        source_uuid=event.source_uuid,
+        target_uuid=event.target_uuid,
+        vault_path=event.vault_path,
+        payload={
+            "damage": event.payload.get("damage", 0),
+            "damage_type": event.payload.get("damage_type", "unknown"),
+            "critical": event.payload.get("critical", False)
+        }
+    )
+    EventBus.dispatch(damage_event)
+    event.payload.setdefault("results", []).extend(damage_event.payload.get("results", []))
 
 
 def handle_rest_event(event: GameEvent):
@@ -983,6 +982,8 @@ def handle_drop_concentration_event(event: GameEvent):
     spell_name = caster.concentrating_on
     print(f"[Engine] {caster.name} lost concentration on {spell_name}.")
 
+    caster.concentrating_on = ""
+
     for uid, entity in get_all_entities(event.vault_path).items():
         if isinstance(entity, Creature):
             for field_name in type(entity).model_fields:
@@ -1029,8 +1030,6 @@ def handle_drop_concentration_event(event: GameEvent):
         if not any(c.name == "Dead" for c in ent.active_conditions):
             ent.active_conditions.append(ActiveCondition(name="Dead", source_name="Concentration Dropped"))
         print(f"[Engine] {ent.name} despawned (concentration dropped).")
-
-    caster.concentrating_on = ""
 
 
 def validate_movement_handler(event: GameEvent):
@@ -1423,6 +1422,11 @@ def counterspell_reaction_handler(event: GameEvent):  # noqa: C901
         if total_save < dc:
             event.status = EventStatus.CANCELLED
             msg = f"[Engine] {caster.name} failed CON save ({total_save} vs DC {dc}). The spell fails, but the spell slot is preserved."
+            
+            # In 5e, beginning to cast a new concentration spell instantly breaks the old one, even if countered.
+            if event.payload.get("mechanics", {}).get("requires_concentration", False) and caster.concentrating_on:
+                EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=caster.entity_uuid, vault_path=event.vault_path))
+
             print(msg)
             if "results" not in event.payload:
                 event.payload["results"] = []
@@ -1609,34 +1613,20 @@ def end_of_turn_save_handler(event: GameEvent):
         if cond.end_of_turn_damage_dice:
             dmg = roll_dice(cond.end_of_turn_damage_dice)
             if dmg > 0:
-                dmg_type = cond.end_of_turn_damage_type.lower()
-                is_magically_silenced = any(
-                    c.name.lower() == "silenced" and "silence" in c.source_name.lower() for c in entity.active_conditions
+                damage_event = GameEvent(
+                    event_type="ApplyDamage",
+                    source_uuid=entity.entity_uuid,
+                    target_uuid=entity.entity_uuid,
+                    vault_path=event.vault_path,
+                    payload={
+                        "damage": dmg,
+                        "damage_type": cond.end_of_turn_damage_type.lower(),
+                        "critical": False,
+                        "source_name": cond.name
+                    }
                 )
-                if dmg_type in entity.immunities or (dmg_type == "thunder" and is_magically_silenced):
-                    dmg = 0
-                elif dmg_type in entity.vulnerabilities:
-                    dmg *= 2
-                elif dmg_type in entity.resistances:
-                    dmg //= 2
-
-                if dmg > 0 and entity.temp_hp > 0:
-                    if dmg >= entity.temp_hp:
-                        dmg -= entity.temp_hp
-                        entity.temp_hp = 0
-                    else:
-                        entity.temp_hp -= dmg
-                        dmg = 0
-
-                entity.hp.base_value -= dmg
-                results.append(
-                    f"[Engine] {entity.name} took {dmg} {dmg_type} damage from {cond.name} (HP: {entity.hp.base_value})."
-                )
-
-                if entity.hp.base_value <= 0 and entity.concentrating_on:
-                    EventBus.dispatch(
-                        GameEvent(event_type="DropConcentration", source_uuid=entity.entity_uuid, vault_path=event.vault_path)
-                    )
+                EventBus.dispatch(damage_event)
+                results.extend(damage_event.payload.get("results", []))
 
     # 2. Saving Throws
     save_results = _evaluate_repeating_saves(entity, "end")
@@ -1785,7 +1775,8 @@ def register_core_handlers():
     EventBus.subscribe("AbilityCheck", resolve_ability_check_handler, priority=10)
     EventBus.subscribe("MeleeAttack", shield_spell_reaction_handler, priority=1)
     EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
-    EventBus.subscribe("MeleeAttack", apply_damage_handler, priority=100)
+    EventBus.subscribe("MeleeAttack", melee_attack_damage_dispatcher, priority=100)
+    EventBus.subscribe("ApplyDamage", apply_damage_handler, priority=10)
     EventBus.subscribe("SpellCast", shield_spell_reaction_handler, priority=1)
     EventBus.subscribe("SpellCast", counterspell_reaction_handler, priority=1)
     EventBus.subscribe("SpellCast", resolve_spell_cast_handler, priority=10)

@@ -76,7 +76,9 @@ from tools import (
     evaluate_extreme_weather,
     manage_map_terrain,
     update_roll_automations,
+    use_font_of_magic,
     spawn_summon,
+    refresh_vault_data,
     _get_config_tone,
     _get_entity_by_name,
     _calculate_reach,
@@ -125,10 +127,12 @@ MASTER_TOOLS_LIST = [
     manage_map_trap,
     manage_skill_challenge,
     generate_random_loot,
+    use_font_of_magic,
     ingest_battlemap_json,
     evaluate_extreme_weather,
     manage_map_terrain,
     spawn_summon,
+    refresh_vault_data,
 ]
 
 # 1. INITIALIZE THE APP FIRST
@@ -570,6 +574,12 @@ async def toggle_fow_endpoint(request: ToggleFoWRequest):
     spatial_service.get_map_data(request.vault_path).fow_disabled_for = request.disabled_for
     return {"status": "success", "fow_disabled_for": spatial_service.map_data.fow_disabled_for}
 
+@app.post("/sync_vault")
+async def sync_vault_endpoint(request: VaultRequest):
+    """Explicit API endpoint for the front-end to trigger hot-reloading."""
+    from vault_io import sync_engine_from_vault_updates
+    res = await sync_engine_from_vault_updates(request.vault_path)
+    return {"status": "success", "message": res}
 
 @app.post("/clear_path")
 async def clear_path_endpoint(request: ClearPathRequest):

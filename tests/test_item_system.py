@@ -181,7 +181,7 @@ async def test_wondrous_item_casts_spell(setup_engine_and_vault, mock_dice, mock
         )
 
     assert "Wand of Fireballs" in res
-    assert "Took 30 fire damage" in res
+    assert "took 30 fire damage" in res
     assert target.hp.base_value == 0
 
 
