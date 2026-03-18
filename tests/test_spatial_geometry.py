@@ -68,7 +68,8 @@ def test_req_geo_007_and_008_friendly_and_hostile_space(client):
         size=5.0,
         x=0.0,
         y=0.0,
-        movement_remaining=30,
+        speed=100,
+        movement_remaining=100,
         hp=ModifiableValue(base_value=10),
         ac=ModifiableValue(base_value=10),
         strength_mod=ModifiableValue(base_value=0),
@@ -82,6 +83,7 @@ def test_req_geo_007_and_008_friendly_and_hostile_space(client):
         y=0.0,
         hp=ModifiableValue(base_value=10),
         ac=ModifiableValue(base_value=10),
+        spell_save_dc=ModifiableValue(base_value=15),
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
@@ -130,6 +132,10 @@ def test_req_geo_007_and_008_friendly_and_hostile_space(client):
     assert "Size difference too small" in res2["invalid_reason"]
 
     # Move through Hostile Ogre (Small vs Large = 2 categories) -> Allowed, costs extra
+    halfling.x = 25.0
+    halfling.active_conditions.append(ActiveCondition(name="Disengage"))
+    spatial_service.sync_entity(halfling)
+
     req3 = {"entity_name": "Halfling", "waypoints": [[25.0, 0.0], [55.0, 0.0]], "vault_path": "default"}
     res3 = client.post("/propose_move", json=req3).json()
     assert res3["is_valid"] is True
@@ -158,6 +164,7 @@ def test_req_geo_009_and_010_squeezing(mock_dice):
         y=0.0,
         hp=ModifiableValue(base_value=10),
         ac=ModifiableValue(base_value=10),
+        spell_save_dc=ModifiableValue(base_value=15),
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )

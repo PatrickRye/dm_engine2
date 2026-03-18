@@ -48,7 +48,7 @@ def check_death_and_dying(target: Creature, current_hp: int, damage: int, is_cri
             target.hp.base_value = 0
             if not any(c.name == "Dying" for c in target.active_conditions):
                 target.active_conditions.append(ActiveCondition(name="Dying"))
-                target.active_conditions.append(ActiveCondition(name="Unconscious"))
+                target.active_conditions.append(ActiveCondition(name="Unconscious", source_name="0 HP"))
             results_list.append(f"[Engine] {target.name} drops to 0 HP and is Dying/Unconscious.")
 
 
@@ -208,7 +208,7 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
             if save_required in ["dexterity", "strength"]:
                 if any(cond in active_conds for cond in ["stunned", "paralyzed", "petrified", "unconscious", "incapacitated"]):
                     auto_fail = True
-            if save_required == "dexterity" and "restrained" in active_conds:
+            if save_required == "dexterity" and any(c in active_conds for c in ["restrained", "squeezing"]):
                 has_disadv = True
 
             roll1 = random.randint(1, 20)

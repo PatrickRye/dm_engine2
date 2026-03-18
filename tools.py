@@ -549,7 +549,7 @@ async def modify_health(
                 target.hp.base_value = 0
                 if not any(c.name == "Dying" for c in target.active_conditions):
                     target.active_conditions.append(ActiveCondition(name="Dying"))
-                    target.active_conditions.append(ActiveCondition(name="Unconscious"))
+                    target.active_conditions.append(ActiveCondition(name="Unconscious", source_name="0 HP"))
                 result_msg += f"\nSYSTEM ALERT: {target.name} drops to 0 HP and is Dying/Unconscious."
 
         if target.concentrating_on:
@@ -564,11 +564,16 @@ async def modify_health(
             result_msg += (
                 f"\nSYSTEM ALERT: {target.name} dropped to 0 HP and lost concentration " f"on '{target.concentrating_on}'."
             )
-    elif hp_change > 0 and current_hp <= 0:
-        target.active_conditions = [c for c in target.active_conditions if c.name not in ["Dying", "Stable", "Unconscious"]]
+
+    if target.hp.base_value > 0:
+        target.active_conditions = [
+            c for c in target.active_conditions
+            if c.name not in ["Dying", "Stable"] and not (c.name == "Unconscious" and c.source_name in ["0 HP", "Unknown"])
+        ]
         target.death_saves_successes = 0
         target.death_saves_failures = 0
-        result_msg += f"\nSYSTEM ALERT: {target.name} is healed from 0 HP! They regain consciousness."
+        if hp_change > 0 and current_hp <= 0:
+            result_msg += f"\nSYSTEM ALERT: {target.name} is healed from 0 HP! They regain consciousness."
 
     return result_msg
 
