@@ -143,6 +143,9 @@ dm_engine_app = None
 draft_llm = None
 qa_llm = None
 
+# CONCURRENCY LOCKS: Maps vault_path -> asyncio.Lock
+VAULT_LOCKS = {}
+
 # MULTIPLAYER LOCKS: Maps character_name -> client_id
 CHARACTER_LOCKS = {}
 LAST_SEEN = {}  # client_id -> timestamp
@@ -609,125 +612,29 @@ async def ping_endpoint(request: PingRequest):
 async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
     """Analyzes a proposed movement path for collisions, opportunity attacks, and traps."""
 
-    entity = await _get_entity_by_name(request.entity_name, request.vault_path)
-    if not entity:
-        raise HTTPException(status_code=404, detail="Entity not found")
+    if request.vault_path not in VAULT_LOCKS:
+        VAULT_LOCKS[request.vault_path] = asyncio.Lock()
+    vault_lock = VAULT_LOCKS[request.vault_path]
 
-    from shapely.geometry import box
-
-    pixels_per_foot = getattr(spatial_service.get_map_data(request.vault_path), "pixels_per_foot", 1.0)
-    foot_waypoints = [(p[0] / pixels_per_foot, p[1] / pixels_per_foot) for p in request.waypoints]
-
-    # REQ-GEO-006: Check if final waypoint is occupied
-    final_wp = foot_waypoints[-1]
-    final_poly = box(
-        final_wp[0] - entity.size / 2,
-        final_wp[1] - entity.size / 2,
-        final_wp[0] + entity.size / 2,
-        final_wp[1] + entity.size / 2,
-    )
-    for other_entity in get_all_entities(request.vault_path).values():
-        if other_entity.entity_uuid == entity.entity_uuid:
-            continue
-        if not hasattr(other_entity, "hp") or getattr(other_entity.hp, "base_value", 0) <= 0:
-            continue
-        o_poly = box(
-            other_entity.x - other_entity.size / 2,
-            other_entity.y - other_entity.size / 2,
-            other_entity.x + other_entity.size / 2,
-            other_entity.y + other_entity.size / 2,
+    async with vault_lock:
+        entity = await _get_entity_by_name(request.entity_name, request.vault_path)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+    
+        from shapely.geometry import box
+    
+        pixels_per_foot = getattr(spatial_service.get_map_data(request.vault_path), "pixels_per_foot", 1.0)
+        foot_waypoints = [(p[0] / pixels_per_foot, p[1] / pixels_per_foot) for p in request.waypoints]
+    
+        # REQ-GEO-006: Check if final waypoint is occupied
+        final_wp = foot_waypoints[-1]
+        final_poly = box(
+            final_wp[0] - entity.size / 2,
+            final_wp[1] - entity.size / 2,
+            final_wp[0] + entity.size / 2,
+            final_wp[1] + entity.size / 2,
         )
-        if final_poly.buffer(-0.1).intersects(o_poly.buffer(-0.1)):
-            return ProposeMoveResponse(
-                is_valid=False,
-                invalid_reason=f"Cannot end movement in a space occupied by {other_entity.name}.",
-                executed=False,
-            )
-
-    if request.entity_name in spatial_service.active_paths.get(request.vault_path, {}):
-        del spatial_service.active_paths[request.vault_path][request.entity_name]
-
-    is_valid = True
-    invalid_reason = ""
-    opportunity_attacks = []
-    traps_triggered = []
-    alternative_path = []
-
-    active_list = spatial_service.active_combatants.get(request.vault_path, [])
-    is_in_combat = any(c.lower() == request.entity_name.lower() for c in active_list)
-    # 0. Enforce Combat Turn Order
-    combat_file = os.path.join(get_journals_dir(request.vault_path), "ACTIVE_COMBAT.md")
-    if os.path.exists(combat_file):
-        try:
-            async with read_markdown_entity(combat_file) as (yaml_data, _):
-                combatants = yaml_data.get("combatants", [])
-                current_idx = yaml_data.get("current_turn_index", 0)
-                if combatants:
-                    active_combatant = combatants[current_idx]["name"] if 0 <= current_idx < len(combatants) else ""
-                    if is_in_combat and active_combatant.lower() != request.entity_name.lower():
-                        return ProposeMoveResponse(
-                            is_valid=False,
-                            invalid_reason=f"It is currently {active_combatant}'s turn. You cannot move out of turn.",
-                            executed=False,
-                        )
-        except Exception:
-            pass
-
-    # Discretize path into <= 5ft chunks for precise trigger detection
-    detailed_path = [foot_waypoints[0]]
-    for i in range(1, len(foot_waypoints)):
-        start = detailed_path[-1]
-        end = foot_waypoints[i]
-        dist = spatial_service.calculate_distance(start[0], start[1], entity.z, end[0], end[1], entity.z, request.vault_path)
-        if dist > 5.0:
-            num_steps = int(dist // 5.0)
-            for s in range(1, num_steps + 1):
-                fraction = (s * 5.0) / dist
-                midpoint = (start[0] + (end[0] - start[0]) * fraction, start[1] + (end[1] - start[1]) * fraction)
-                if midpoint != detailed_path[-1]:
-                    detailed_path.append(midpoint)
-        if detailed_path[-1] != end:
-            detailed_path.append(end)
-
-    movement_cost = 0.0
-    ignores_dt = any(t.lower() == "ignore_difficult_terrain" for t in getattr(entity, "tags", []))
-    is_disengaging = any(c.name.lower() == "disengage" for c in getattr(entity, "active_conditions", []))
-    all_entities = get_all_entities(request.vault_path)
-
-    executed_waypoints = [detailed_path[0]]
-    final_x, final_y = detailed_path[0][0], detailed_path[0][1]
-
-    for i in range(1, len(detailed_path)):
-        start = detailed_path[i - 1]
-        end = detailed_path[i]
-
-        segment_dist = spatial_service.calculate_distance(
-            start[0], start[1], entity.z, end[0], end[1], entity.z, request.vault_path
-        )
-        if segment_dist == 0:
-            continue
-
-        segment_cost = segment_dist
-        path_line = LineString([start, end])
-
-        collision = spatial_service.check_path_collision(
-            start[0], start[1], entity.z, end[0], end[1], entity.z, vault_path=request.vault_path
-        )
-        if collision:
-            is_valid = False
-            invalid_reason = f"Path blocked by {collision.label}."
-            alternative_path = [
-                (start[0] * pixels_per_foot, start[1] * pixels_per_foot),
-                (
-                    (collision.start[0] - 5) * pixels_per_foot,
-                    (collision.start[1] - 5) * pixels_per_foot,
-                ),
-                (end[0] * pixels_per_foot, end[1] * pixels_per_foot),
-            ]
-            break
-
-        # REQ-GEO-007, REQ-GEO-008: Moving through creatures
-        for other_entity in all_entities.values():
+        for other_entity in get_all_entities(request.vault_path).values():
             if other_entity.entity_uuid == entity.entity_uuid:
                 continue
             if not hasattr(other_entity, "hp") or getattr(other_entity.hp, "base_value", 0) <= 0:
@@ -738,167 +645,268 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                 other_entity.x + other_entity.size / 2,
                 other_entity.y + other_entity.size / 2,
             )
-
-            if path_line.intersects(o_poly):
-                is_entity_pc = any(t in entity.tags for t in ["pc", "player", "party_npc"])
-                is_other_pc = any(t in other_entity.tags for t in ["pc", "player", "party_npc"])
-
-                def size_cat(size: float, tags: list):
-                    tags_lower = [t.lower() for t in tags]
-                    if "tiny" in tags_lower:
-                        return 1
-                    if "small" in tags_lower:
-                        return 2
-                    if "large" in tags_lower:
-                        return 4
-                    if "huge" in tags_lower:
-                        return 5
-                    if "gargantuan" in tags_lower:
-                        return 6
-                    if size <= 2.5:
-                        return 1
-                    if size <= 5.0:
-                        return 3  # Medium
-                    if size <= 10.0:
-                        return 4  # Large
-                    if size <= 15.0:
-                        return 5  # Huge
-                    return 6
-
-                cat_e = size_cat(entity.size, getattr(entity, "tags", []))
-                cat_o = size_cat(other_entity.size, getattr(other_entity, "tags", []))
-
-                if is_entity_pc != is_other_pc and abs(cat_e - cat_o) < 2:
-                    is_valid = False
-                    invalid_reason = f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
-                    break
-                else:
-                    segment_cost += segment_dist * (o_poly.intersection(path_line).length / path_line.length)
-
-        if not is_valid and not request.force_execute:
-            break
-
-        if not ignores_dt:
-            for terrain in spatial_service.get_map_data(request.vault_path).active_terrain:
-                if getattr(terrain, "is_difficult", False):
-                    from shapely.geometry import Polygon
-
-                    try:
-                        poly = Polygon(terrain.points)
-                        if path_line.intersects(poly):
-                            intersection = path_line.intersection(poly)
-                            if path_line.length > 0:
-                                segment_cost += segment_dist * (intersection.length / path_line.length)
-                    except Exception:
-                        pass
-
-        if hasattr(entity, "movement_remaining") and is_in_combat:
-            projected_cost = movement_cost + segment_cost
-            truncated_cost = int(projected_cost * 100) / 100.0
-            if truncated_cost > entity.movement_remaining:
+            if final_poly.buffer(-0.1).intersects(o_poly.buffer(-0.1)):
+                return ProposeMoveResponse(
+                    is_valid=False,
+                    invalid_reason=f"Cannot end movement in a space occupied by {other_entity.name}.",
+                    executed=False,
+                )
+    
+        if request.entity_name in spatial_service.active_paths.get(request.vault_path, {}):
+            del spatial_service.active_paths[request.vault_path][request.entity_name]
+    
+        is_valid = True
+        invalid_reason = ""
+        opportunity_attacks = []
+        traps_triggered = []
+        alternative_path = []
+    
+        active_list = spatial_service.active_combatants.get(request.vault_path, [])
+        is_in_combat = any(c.lower() == request.entity_name.lower() for c in active_list)
+        # 0. Enforce Combat Turn Order
+        combat_file = os.path.join(get_journals_dir(request.vault_path), "ACTIVE_COMBAT.md")
+        if os.path.exists(combat_file):
+            try:
+                async with read_markdown_entity(combat_file) as (yaml_data, _):
+                    combatants = yaml_data.get("combatants", [])
+                    current_idx = yaml_data.get("current_turn_index", 0)
+                    if combatants:
+                        active_combatant = combatants[current_idx]["name"] if 0 <= current_idx < len(combatants) else ""
+                        if is_in_combat and active_combatant.lower() != request.entity_name.lower():
+                            return ProposeMoveResponse(
+                                is_valid=False,
+                                invalid_reason=f"It is currently {active_combatant}'s turn. You cannot move out of turn.",
+                                executed=False,
+                            )
+            except Exception:
+                pass
+    
+        # Discretize path into <= 5ft chunks for precise trigger detection
+        detailed_path = [foot_waypoints[0]]
+        for i in range(1, len(foot_waypoints)):
+            start = detailed_path[-1]
+            end = foot_waypoints[i]
+            dist = spatial_service.calculate_distance(start[0], start[1], entity.z, end[0], end[1], entity.z, request.vault_path)
+            if dist > 5.0:
+                num_steps = int(dist // 5.0)
+                for s in range(1, num_steps + 1):
+                    fraction = (s * 5.0) / dist
+                    midpoint = (start[0] + (end[0] - start[0]) * fraction, start[1] + (end[1] - start[1]) * fraction)
+                    if midpoint != detailed_path[-1]:
+                        detailed_path.append(midpoint)
+            if detailed_path[-1] != end:
+                detailed_path.append(end)
+    
+        movement_cost = 0.0
+        ignores_dt = any(t.lower() == "ignore_difficult_terrain" for t in getattr(entity, "tags", []))
+        is_disengaging = any(c.name.lower() == "disengage" for c in getattr(entity, "active_conditions", []))
+        all_entities = get_all_entities(request.vault_path)
+    
+        executed_waypoints = [detailed_path[0]]
+        final_x, final_y = detailed_path[0][0], detailed_path[0][1]
+    
+        for i in range(1, len(detailed_path)):
+            start = detailed_path[i - 1]
+            end = detailed_path[i]
+    
+            segment_dist = spatial_service.calculate_distance(
+                start[0], start[1], entity.z, end[0], end[1], entity.z, request.vault_path
+            )
+            if segment_dist == 0:
+                continue
+    
+            segment_cost = segment_dist
+            path_line = LineString([start, end])
+    
+            collision = spatial_service.check_path_collision(
+                start[0], start[1], entity.z, end[0], end[1], entity.z, vault_path=request.vault_path
+            )
+            if collision:
                 is_valid = False
-                movement_cost += segment_cost
-                invalid_reason = (
-                    f"Movement cost ({movement_cost:.1f} ft) exceeds remaining speed ({entity.movement_remaining} ft)."
-                )
+                invalid_reason = f"Path blocked by {collision.label}."
+                alternative_path = [
+                    (start[0] * pixels_per_foot, start[1] * pixels_per_foot),
+                    (
+                        (collision.start[0] - 5) * pixels_per_foot,
+                        (collision.start[1] - 5) * pixels_per_foot,
+                    ),
+                    (end[0] * pixels_per_foot, end[1] * pixels_per_foot),
+                ]
                 break
-
-        # Check Known Traps
-        trap_hit = None
-        for wall in spatial_service.get_map_data(request.vault_path).active_walls:
-            if getattr(wall, "trap", None) and getattr(wall.trap, "known_by_players", False):
-                if path_line.intersects(wall.line):
-                    trap_hit = wall.trap.hazard_name
-                    break
-        if not trap_hit:
-            for terrain in spatial_service.get_map_data(request.vault_path).active_terrain:
-                if getattr(terrain, "trap", None) and getattr(terrain.trap, "known_by_players", False):
-                    if path_line.intersects(terrain.polygon):
-                        trap_hit = terrain.trap.hazard_name
-                        break
-        if trap_hit:
-            traps_triggered.append(trap_hit)
-            if not request.force_execute:
-                break
-
-        # Check OAs
-        oa_hit = False
-        for other_entity in all_entities.values():
-            if (
-                other_entity.entity_uuid != entity.entity_uuid
-                and hasattr(other_entity, "hp")
-                and getattr(other_entity.hp, "base_value", 0) > 0
-            ):
-                if is_disengaging and "ignores_disengage" not in getattr(other_entity, "tags", []):
+    
+            # REQ-GEO-007, REQ-GEO-008: Moving through creatures
+            for other_entity in all_entities.values():
+                if other_entity.entity_uuid == entity.entity_uuid:
                     continue
-
-                base_reach = _calculate_reach(other_entity, is_active_turn=False)
-                eff_reach = base_reach + max(0, (other_entity.size - 5.0) / 2.0) + max(0, (entity.size - 5.0) / 2.0)
-
-                dist_before = spatial_service.calculate_distance(
-                    start[0], start[1], 0, other_entity.x, other_entity.y, 0, request.vault_path
+                if not hasattr(other_entity, "hp") or getattr(other_entity.hp, "base_value", 0) <= 0:
+                    continue
+                o_poly = box(
+                    other_entity.x - other_entity.size / 2,
+                    other_entity.y - other_entity.size / 2,
+                    other_entity.x + other_entity.size / 2,
+                    other_entity.y + other_entity.size / 2,
                 )
-                dist_after = spatial_service.calculate_distance(
-                    end[0], end[1], 0, other_entity.x, other_entity.y, 0, request.vault_path
-                )
-                if dist_before <= eff_reach and dist_after > eff_reach:
-                    oa_hit = True
-                    opportunity_attacks.append(other_entity.name)
-        if oa_hit and not request.force_execute:
-            break
-
-        movement_cost += segment_cost
-        executed_waypoints.append(end)
-        final_x, final_y = end[0], end[1]
-
-        # Break here to enforce resolving attacks/traps natively before continuing!
-        if oa_hit or trap_hit:
-            break
-
-    executed = False
-    if is_valid and len(executed_waypoints) > 1:
-        if request.force_execute or (not opportunity_attacks and not traps_triggered):
-            config = {"configurable": {"thread_id": request.vault_path}}
-
-            points_to_execute = []
-            for fw in foot_waypoints[1:]:
-                if fw in executed_waypoints:
-                    points_to_execute.append(fw)
-            if executed_waypoints[-1] not in points_to_execute:
-                points_to_execute.append(executed_waypoints[-1])
-
-            for point in points_to_execute:
-                await move_entity.ainvoke(
-                    {
-                        "entity_name": request.entity_name,
-                        "target_x": round(point[0], 2),
-                        "target_y": round(point[1], 2),
-                        "movement_type": "walk",
-                    },
-                    config=config,
-                )
-
-            executed = True
-
-    if not executed:
-        spatial_service.active_paths.setdefault(request.vault_path, {})[request.entity_name] = {
-            "entity_name": request.entity_name,
-            "waypoints": request.waypoints,
-            "alternative_path": alternative_path,
-            "is_valid": is_valid,
-        }
-
-    return ProposeMoveResponse(
-        is_valid=is_valid,
-        opportunity_attacks=list(set(opportunity_attacks)),
-        traps_triggered=list(set(traps_triggered)),
-        alternative_path=alternative_path,
-        movement_cost=movement_cost,
-        invalid_reason=invalid_reason,
-        executed=executed,
-        final_x=final_x * pixels_per_foot,
-        final_y=final_y * pixels_per_foot,
-    )
+    
+                if path_line.intersects(o_poly):
+                    is_entity_pc = any(t in entity.tags for t in ["pc", "player", "party_npc"])
+                    is_other_pc = any(t in other_entity.tags for t in ["pc", "player", "party_npc"])
+    
+                    def size_cat(size: float, tags: list):
+                        tags_lower = [t.lower() for t in tags]
+                        if "tiny" in tags_lower:
+                            return 1
+                        if "small" in tags_lower:
+                            return 2
+                        if "large" in tags_lower:
+                            return 4
+                        if "huge" in tags_lower:
+                            return 5
+                        if "gargantuan" in tags_lower:
+                            return 6
+                        if size <= 2.5:
+                            return 1
+                        if size <= 5.0:
+                            return 3  # Medium
+                        if size <= 10.0:
+                            return 4  # Large
+                        if size <= 15.0:
+                            return 5  # Huge
+                        return 6
+    
+                    cat_e = size_cat(entity.size, getattr(entity, "tags", []))
+                    cat_o = size_cat(other_entity.size, getattr(other_entity, "tags", []))
+    
+                    if is_entity_pc != is_other_pc and abs(cat_e - cat_o) < 2:
+                        is_valid = False
+                        invalid_reason = f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
+                        break
+                    else:
+                        segment_cost += segment_dist * (o_poly.intersection(path_line).length / path_line.length)
+    
+            if not is_valid and not request.force_execute:
+                break
+    
+            if not ignores_dt:
+                for terrain in spatial_service.get_map_data(request.vault_path).active_terrain:
+                    if getattr(terrain, "is_difficult", False):
+                        from shapely.geometry import Polygon
+    
+                        try:
+                            poly = Polygon(terrain.points)
+                            if path_line.intersects(poly):
+                                intersection = path_line.intersection(poly)
+                                if path_line.length > 0:
+                                    segment_cost += segment_dist * (intersection.length / path_line.length)
+                        except Exception:
+                            pass
+    
+            if hasattr(entity, "movement_remaining") and is_in_combat:
+                projected_cost = movement_cost + segment_cost
+                truncated_cost = int(projected_cost * 100) / 100.0
+                if truncated_cost > entity.movement_remaining:
+                    is_valid = False
+                    movement_cost += segment_cost
+                    invalid_reason = (
+                        f"Movement cost ({movement_cost:.1f} ft) exceeds remaining speed ({entity.movement_remaining} ft)."
+                    )
+                    break
+    
+            # Check Known Traps
+            trap_hit = None
+            for wall in spatial_service.get_map_data(request.vault_path).active_walls:
+                if getattr(wall, "trap", None) and getattr(wall.trap, "known_by_players", False):
+                    if path_line.intersects(wall.line):
+                        trap_hit = wall.trap.hazard_name
+                        break
+            if not trap_hit:
+                for terrain in spatial_service.get_map_data(request.vault_path).active_terrain:
+                    if getattr(terrain, "trap", None) and getattr(terrain.trap, "known_by_players", False):
+                        if path_line.intersects(terrain.polygon):
+                            trap_hit = terrain.trap.hazard_name
+                            break
+            if trap_hit:
+                traps_triggered.append(trap_hit)
+                if not request.force_execute:
+                    break
+    
+            # Check OAs
+            oa_hit = False
+            for other_entity in all_entities.values():
+                if (
+                    other_entity.entity_uuid != entity.entity_uuid
+                    and hasattr(other_entity, "hp")
+                    and getattr(other_entity.hp, "base_value", 0) > 0
+                ):
+                    if is_disengaging and "ignores_disengage" not in getattr(other_entity, "tags", []):
+                        continue
+    
+                    base_reach = _calculate_reach(other_entity, is_active_turn=False)
+                    eff_reach = base_reach + max(0, (other_entity.size - 5.0) / 2.0) + max(0, (entity.size - 5.0) / 2.0)
+    
+                    dist_before = spatial_service.calculate_distance(
+                        start[0], start[1], 0, other_entity.x, other_entity.y, 0, request.vault_path
+                    )
+                    dist_after = spatial_service.calculate_distance(
+                        end[0], end[1], 0, other_entity.x, other_entity.y, 0, request.vault_path
+                    )
+                    if dist_before <= eff_reach and dist_after > eff_reach:
+                        oa_hit = True
+                        opportunity_attacks.append(other_entity.name)
+            if oa_hit and not request.force_execute:
+                break
+    
+            movement_cost += segment_cost
+            executed_waypoints.append(end)
+            final_x, final_y = end[0], end[1]
+    
+            # Break here to enforce resolving attacks/traps natively before continuing!
+            if oa_hit or trap_hit:
+                break
+    
+        executed = False
+        if is_valid and len(executed_waypoints) > 1:
+            if request.force_execute or (not opportunity_attacks and not traps_triggered):
+                config = {"configurable": {"thread_id": request.vault_path}}
+    
+                points_to_execute = []
+                for fw in foot_waypoints[1:]:
+                    if fw in executed_waypoints:
+                        points_to_execute.append(fw)
+                if executed_waypoints[-1] not in points_to_execute:
+                    points_to_execute.append(executed_waypoints[-1])
+    
+                for point in points_to_execute:
+                    await move_entity.ainvoke(
+                        {
+                            "entity_name": request.entity_name,
+                            "target_x": round(point[0], 2),
+                            "target_y": round(point[1], 2),
+                            "movement_type": "walk",
+                        },
+                        config=config,
+                    )
+    
+                executed = True
+    
+        if not executed:
+            spatial_service.active_paths.setdefault(request.vault_path, {})[request.entity_name] = {
+                "entity_name": request.entity_name,
+                "waypoints": request.waypoints,
+                "alternative_path": alternative_path,
+                "is_valid": is_valid,
+            }
+    
+        return ProposeMoveResponse(
+            is_valid=is_valid,
+            opportunity_attacks=list(set(opportunity_attacks)),
+            traps_triggered=list(set(traps_triggered)),
+            alternative_path=alternative_path,
+            movement_cost=movement_cost,
+            invalid_reason=invalid_reason,
+            executed=executed,
+            final_x=final_x * pixels_per_foot,
+            final_y=final_y * pixels_per_foot,
+        )
 
 
 @app.post("/characters")
@@ -1149,67 +1157,74 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
 
     config = {"configurable": {"thread_id": request.vault_path}}
 
+    # Retrieve or create a concurrency lock for this specific campaign vault
+    if request.vault_path not in VAULT_LOCKS:
+        VAULT_LOCKS[request.vault_path] = asyncio.Lock()
+    vault_lock = VAULT_LOCKS[request.vault_path]
+
     async def stream_generator():
-        try:
-            # 1. Initialize Deterministic Engine
-            await initialize_engine_from_vault(request.vault_path)
-
-            # Yield an initial status
-            yield f"data: {json.dumps({'reply': '*(Thinking...)*\n\n', 'status': 'streaming'})}\n\n"
-
-            # 2. Run the graph with astream_events to catch token-by-token streams
-            async for event in dm_engine_app.astream_events(initial_state, config=config, version="v2"):
-                kind = event["event"]
-                node_name = event.get("metadata", {}).get("langgraph_node")
-
-                # A. Stream Narrator Tokens Live
-                if kind == "on_chat_model_stream" and node_name == "narrator":
-                    chunk = event["data"]["chunk"].content
-                    if chunk:
-                        payload = f"data: {json.dumps({'reply': chunk, 'status': 'streaming'})}\n\n"
-                        yield payload
-                        await broadcaster.broadcast(request.client_id, payload)
-
-                # B. Expose Engine Tools so players see the math happening
-                elif kind == "on_tool_start":
-                    tool_name = event.get("name", "tool")
-                    if tool_name not in ["ChatGoogleGenerativeAI", "planner_node"]:
-                        msg = f"\n> *(Engine: Executing {tool_name}...)*\n"
-                        payload = f"data: {json.dumps({'reply': msg, 'status': 'streaming'})}\n\n"
-                        yield payload
-                        await broadcaster.broadcast(request.client_id, payload)
-
-                # C. Intercept QA Rejections
-                elif kind == "on_chain_end" and node_name == "qa":
-                    qa_out = event["data"].get("output", {})
-                    if isinstance(qa_out, dict):
-                        feedback = qa_out.get("qa_feedback", "")
-                        # If QA asked a clarifying question, stream it out
-                        if "draft_response" in qa_out:
-                            intercept_msg = qa_out.get("draft_response")
-                            payload = f"data: {json.dumps({'reply': f'\n\n{intercept_msg}', 'status': 'streaming'})}\n\n"
+        # Lock acquired: Protects the Read -> Execute -> Write cycle
+        async with vault_lock:
+            try:
+                # 1. Initialize Deterministic Engine
+                await initialize_engine_from_vault(request.vault_path)
+    
+                # Yield an initial status
+                yield f"data: {json.dumps({'reply': '*(Thinking...)*\\n\\n', 'status': 'streaming'})}\n\n"
+    
+                # 2. Run the graph with astream_events to catch token-by-token streams
+                async for event in dm_engine_app.astream_events(initial_state, config=config, version="v2"):
+                    kind = event["event"]
+                    node_name = event.get("metadata", {}).get("langgraph_node")
+    
+                    # A. Stream Narrator Tokens Live
+                    if kind == "on_chat_model_stream" and node_name == "narrator":
+                        chunk = event["data"]["chunk"].content
+                        if chunk:
+                            payload = f"data: {json.dumps({'reply': chunk, 'status': 'streaming'})}\n\n"
                             yield payload
                             await broadcaster.broadcast(request.client_id, payload)
-                        # If QA rejected and forced a rewrite
-                        elif feedback and feedback != "APPROVED":
-                            msg = "\n\n> *(QA Intercept: Correcting mechanical discrepancy. Rewriting...)*\n\n"
+    
+                    # B. Expose Engine Tools so players see the math happening
+                    elif kind == "on_tool_start":
+                        tool_name = event.get("name", "tool")
+                        if tool_name not in ["ChatGoogleGenerativeAI", "planner_node"]:
+                            msg = f"\n> *(Engine: Executing {tool_name}...)*\n"
                             payload = f"data: {json.dumps({'reply': msg, 'status': 'streaming'})}\n\n"
                             yield payload
                             await broadcaster.broadcast(request.client_id, payload)
-
-            # 3. Save combat math back to Obsidian files
-            await sync_engine_to_vault(request.vault_path)
-            payload = f"data: {json.dumps({'reply': '', 'status': 'done'})}\n\n"
-            yield payload
-            await broadcaster.broadcast(request.client_id, payload)
-
-        except Exception as e:
-            print("\n" + "=" * 40 + "\n💥 FATAL ERROR DURING SUPERVISOR EXECUTION 💥\n" + "=" * 40)
-            traceback.print_exc()
-            print("=" * 40 + "\n")
-            payload = f"data: {json.dumps({'reply': f'\n\n**System Error:** {str(e)}', 'status': 'error'})}\n\n"
-            yield payload
-            await broadcaster.broadcast(request.client_id, payload)
+    
+                    # C. Intercept QA Rejections
+                    elif kind == "on_chain_end" and node_name == "qa":
+                        qa_out = event["data"].get("output", {})
+                        if isinstance(qa_out, dict):
+                            feedback = qa_out.get("qa_feedback", "")
+                            # If QA asked a clarifying question, stream it out
+                            if "draft_response" in qa_out:
+                                intercept_msg = qa_out.get("draft_response")
+                                payload = f"data: {json.dumps({'reply': f'\\n\\n{intercept_msg}', 'status': 'streaming'})}\n\n"
+                                yield payload
+                                await broadcaster.broadcast(request.client_id, payload)
+                            # If QA rejected and forced a rewrite
+                            elif feedback and feedback != "APPROVED":
+                                msg = "\n\n> *(QA Intercept: Correcting mechanical discrepancy. Rewriting...)*\n\n"
+                                payload = f"data: {json.dumps({'reply': msg, 'status': 'streaming'})}\n\n"
+                                yield payload
+                                await broadcaster.broadcast(request.client_id, payload)
+    
+                # 3. Save combat math back to Obsidian files
+                await sync_engine_to_vault(request.vault_path)
+                payload = f"data: {json.dumps({'reply': '', 'status': 'done'})}\n\n"
+                yield payload
+                await broadcaster.broadcast(request.client_id, payload)
+    
+            except Exception as e:
+                print("\n" + "=" * 40 + "\n💥 FATAL ERROR DURING SUPERVISOR EXECUTION 💥\n" + "=" * 40)
+                traceback.print_exc()
+                print("=" * 40 + "\n")
+                payload = f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {str(e)}', 'status': 'error'})}\n\n"
+                yield payload
+                await broadcaster.broadcast(request.client_id, payload)
 
     # Return the SSE stream bypassing the standard Pydantic model response
     return StreamingResponse(stream_generator(), media_type="text/event-stream")

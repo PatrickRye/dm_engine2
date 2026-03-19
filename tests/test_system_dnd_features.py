@@ -1673,3 +1673,74 @@ def test_system_haste_buff_and_concentration_drop():
     assert caster.concentrating_on == ""
     assert target.ac.total == 15  # Back to base AC
     assert not any(c.name == "Hasted" for c in target.active_conditions)
+
+
+@pytest.mark.asyncio
+async def test_system_hazard_attack_roll(mock_dice, mock_roll_dice):
+    """Tests a hazard that uses an attack roll instead of a save."""
+    target = Creature(
+        name="Target",
+        x=0,
+        y=0,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    spatial_service.sync_entity(target)
+    config = {"configurable": {"thread_id": "default"}}
+
+    # Poison dart trap, AC 15. Attack bonus +5.
+    # Mock dice: roll 12 + 5 = 17 (Hit). Damage roll 10.
+    with mock_dice(12), mock_roll_dice(10):
+        res = await trigger_environmental_hazard.ainvoke(
+            {
+                "hazard_name": "Poison Dart",
+                "target_names": ["Target"],
+                "requires_attack_roll": True,
+                "attack_bonus": 5,
+                "damage_dice": "1d4",
+                "damage_type": "piercing",
+            },
+            config=config,
+        )
+
+    assert "Hit (Rolled 17 vs AC 15)" in res
+    assert "took 10 piercing damage" in res
+    assert target.hp.base_value == 10
+
+
+@pytest.mark.asyncio
+async def test_system_hazard_resistance_vulnerability(mock_roll_dice):
+    """Tests that hazards correctly respect resistances and vulnerabilities."""
+    fire_elemental = Creature(
+        name="Fire Elemental",
+        x=0,
+        y=0,
+        hp=ModifiableValue(base_value=50),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        immunities=["fire"],
+        vulnerabilities=["cold"],
+    )
+    spatial_service.sync_entity(fire_elemental)
+    config = {"configurable": {"thread_id": "default"}}
+
+    # 1. Fire hazard -> Immune
+    with mock_roll_dice(20):
+        res_fire = await trigger_environmental_hazard.ainvoke(
+            {"hazard_name": "Fire Jet", "target_names": ["Fire Elemental"], "damage_dice": "4d6", "damage_type": "fire"},
+            config=config,
+        )
+    assert "IMMUNE to fire" in res_fire
+    assert fire_elemental.hp.base_value == 50
+
+    # 2. Cold hazard -> Vulnerable
+    with mock_roll_dice(20):
+        res_cold = await trigger_environmental_hazard.ainvoke(
+            {"hazard_name": "Ice Trap", "target_names": ["Fire Elemental"], "damage_dice": "4d6", "damage_type": "cold"},
+            config=config,
+        )
+    assert "VULNERABLE to cold" in res_cold
+    assert fire_elemental.hp.base_value == 10  # 50 - (20 * 2)
