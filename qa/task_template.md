@@ -1,8 +1,11 @@
 ---
 id: TASK-001
 role_required: implementer
-priority: high
-status: selected
+priority: unassigned
+status: inbox
+category: untriaged
+sub_category: none
+frequency: 1
 ---
 # Task Title
 Description of the bug or feature.

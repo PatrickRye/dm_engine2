@@ -1,0 +1,19 @@
+# Logs & Audits
+logs/
+*.jsonl
+*.log
+
+# Testing & Linting
+.pytest_cache/
+.coverage
+htmlcov/
+flake8_report.txt
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Engine & State Locks
+tasks/active_locks.json
+*.lock

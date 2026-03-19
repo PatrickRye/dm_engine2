@@ -44,6 +44,34 @@ def read_log_file(filepath: str) -> str:
         return f"Error reading file: {e}"
 
 @tool
+def list_inbox_tasks() -> list:
+    """Lists all .md task files currently in the inbox."""
+    if not os.path.exists(TASKS_INBOX): return []
+    return [os.path.join(TASKS_INBOX, f) for f in os.listdir(TASKS_INBOX) if f.endswith(".md")]
+
+@tool
+def read_task_file(filepath: str) -> str:
+    """Reads the contents of a task file."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f: return f.read()
+    except Exception as e: return str(e)
+
+@tool
+def update_task_frequency(filepath: str) -> str:
+    """Increments the frequency counter in the YAML frontmatter of an existing task."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
+        match = re.search(r'frequency:\s*(\d+)', content)
+        if match:
+            current_freq = int(match.group(1))
+            content = content[:match.start()] + f"frequency: {current_freq + 1}" + content[match.end():]
+        else:
+            content = content.replace("---\n", "---\nfrequency: 2\n", 1)
+        with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
+        return f"Incremented frequency for {os.path.basename(filepath)}"
+    except Exception as e: return f"Error updating frequency: {e}"
+
+@tool
 def create_task_file(title: str, description: str, requirements: list, priority: str, role_required: str, prefix: str = "BUG") -> str:
     """Creates a formatted Markdown task file in /tasks/inbox."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -59,12 +87,12 @@ def create_task_file(title: str, description: str, requirements: list, priority:
             content = f.read()
         content = content.replace("TASK-001", f"{prefix}-{timestamp}")
         content = content.replace("implementer", role_required)
-        content = content.replace("high", priority)
+        content = content.replace("unassigned", priority)
         content = content.replace("# Task Title", f"# {title}")
         content = content.replace("Description of the bug or feature.", description)
         content = re.sub(r"## Requirements\n.*", f"## Requirements\n{req_str}", content, flags=re.DOTALL)
     else:
-        content = f"---\nid: {prefix}-{timestamp}\nrole_required: {role_required}\npriority: {priority}\nstatus: selected\n---\n# {title}\n{description}\n\n## Requirements\n{req_str}"
+        content = f"---\nid: {prefix}-{timestamp}\nrole_required: {role_required}\npriority: {priority}\nstatus: inbox\ncategory: untriaged\nsub_category: none\nfrequency: 1\n---\n# {title}\n{description}\n\n## Requirements\n{req_str}"
     
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(content)
@@ -104,13 +132,15 @@ Your sole responsibility is to monitor system logs and translate errors (rules c
 Allowed Actions:
 1. Read `.jsonl` files in the `qa_audits` directory using `list_unprocessed_logs` and `read_log_file`.
 2. Validate the challenge using `search_online` (checking sage advice, reddit, etc.) or your internal knowledge.
-3. Create new `.md` files in the `/tasks/inbox` directory using `create_task_file` (use prefix 'CHALLENGE').
-4. Move fully processed log files to the `processed` directory using `move_to_processed`.
+3. Check existing tasks in `/tasks/inbox` using `list_inbox_tasks` and `read_task_file`. 
+4. If a highly similar task exists, DO NOT create a new one. Instead, use `update_task_frequency`. Otherwise, create a new `.md` file using `create_task_file` (use prefix 'CHALLENGE').
+5. Move fully processed log files to the `processed` directory using `move_to_processed`.
 
 Execution Rules:
 - Parse the JSON logs and identify any entry with `WARNING`, `ERROR` or rule disputes from the `QA_Agent` or `PLAYER_CHALLENGE`.
 - Validate the challenge against online sources or internal D&D 5e rules. If valid (the DM Engine was wrong), make it a task file. If it is an invalid challenge (the QA Agent hallucinated), ignore it.
-- For each unique issue, generate a task file. The description MUST contain the exact high-resolution timestamp, the `agent_id`, the error message, and the full JSON context block.
+- Before creating a task, ALWAYS check if it already exists in the inbox. If so, increment its frequency.
+- When generating a task file, the description MUST contain the exact high-resolution timestamp, the `agent_id`, the error message, and the full JSON context block.
 - Do NOT attempt to fix the code, invent solutions, or modify files outside of the `/tasks/inbox` and `/logs` directories.
 - Once a log file has been entirely parsed and converted into tasks, you must move it to `processed`.
 """
@@ -121,12 +151,14 @@ Your sole responsibility is to monitor system logs and translate server exceptio
 
 Allowed Actions:
 1. Read `.jsonl` files in the `active` directory using `list_unprocessed_logs` and `read_log_file`.
-2. Create new `.md` files in the `/tasks/inbox` directory using `create_task_file` (use prefix 'BUG').
-3. Move fully processed log files to the `processed` directory using `move_to_processed`.
+2. Check existing tasks in `/tasks/inbox` using `list_inbox_tasks` and `read_task_file`.
+3. If a highly similar task exists, use `update_task_frequency`. Otherwise, create a new `.md` file using `create_task_file` (use prefix 'BUG').
+4. Move fully processed log files to the `processed` directory using `move_to_processed`.
 
 Execution Rules:
 - Parse the JSON logs and identify any entry with a level of `ERROR` or `CRITICAL` (ignoring QA rule disputes).
-- For each unique issue, generate a task file. The description MUST contain the exact high-resolution timestamp, the `agent_id`, the error message, the stack trace, and the full JSON context block.
+- Before creating a task, ALWAYS check if it already exists in the inbox. If so, increment its frequency.
+- When generating a task file, the description MUST contain the exact high-resolution timestamp, the `agent_id`, the error message, the stack trace, and the full JSON context block.
 - Do NOT attempt to fix the code or modify files outside of the `/tasks/inbox` and `/logs` directories.
 - Once a log file is thoroughly checked, move it to processed.
 """
@@ -134,7 +166,7 @@ Execution Rules:
 def run_rules_agent():
     print("[Rules Agent] Started process. Monitoring /logs/qa_audits")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2)
-    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, search_online, create_task_file, move_to_processed])
+    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, search_online, list_inbox_tasks, read_task_file, update_task_frequency, create_task_file, move_to_processed])
     while True:
         state = {"messages": [SystemMessage(content=RULES_PROMPT), HumanMessage(content="Check 'qa_audits' for unprocessed log files. Process them fully, create tasks, and move them to processed.")]}
         agent.invoke(state)
@@ -143,7 +175,7 @@ def run_rules_agent():
 def run_system_agent():
     print("[System Agent] Started process. Monitoring /logs/active")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
-    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, create_task_file, move_to_processed])
+    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, list_inbox_tasks, read_task_file, update_task_frequency, create_task_file, move_to_processed])
     while True:
         state = {"messages": [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content="Check 'active' for unprocessed log files. Process them fully, extract Python Exceptions/ERRORs into BUG tasks, and move them to processed.")]}
         agent.invoke(state)
