@@ -6,6 +6,7 @@ from unittest.mock import patch
 from event_handlers import register_core_handlers
 import itertools
 from contextlib import contextmanager
+from system_logger import logger
 
 
 @pytest.fixture
@@ -87,3 +88,18 @@ def mock_obsidian_vault():
         patcher1.stop()
         patcher2.stop()
         patcher3.stop()
+
+
+def pytest_runtest_logreport(report):
+    """Pytest hook to push test failures directly into the JSONL event log."""
+    if report.when == 'call' and report.failed:
+        logger.error(f"Pytest failure in {report.nodeid}", extra={
+            "agent_id": "PYTEST",
+            "context": {
+                "client_id": "PYTEST_RUNNER",
+                "character": "QA_SYSTEM",
+                "vault_path": "TEST_VAULT",
+                "duration_s": round(report.duration, 2),
+                "longrepr": str(report.longrepr)
+            }
+        })

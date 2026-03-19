@@ -2543,6 +2543,29 @@ async def refresh_vault_data(
     return res_str.strip()
 
 
+@tool
+async def report_rule_challenge(
+    character_name: str,
+    dispute_details: str,
+    expected_rule: str = "",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """Use this tool IMMEDIATELY if a player complains, challenges, or disputes a game rule, dice roll, or mechanical outcome."""
+    from system_logger import qa_logger
+    vault_path = config["configurable"].get("thread_id", "default")
+    qa_logger.warning("Player Rule Dispute", extra={
+        "agent_id": "PLAYER_CHALLENGE",
+        "context": {
+            "character": character_name,
+            "vault_path": vault_path,
+            "dispute_details": dispute_details,
+            "expected_rule": expected_rule
+        }
+    })
+    return f"MECHANICAL TRUTH: Rule dispute from {character_name} successfully logged to the QA system."
+
+
 def _get_config_tone(vault_path: str) -> str:
     """Reads DM_CONFIG.md to optionally retrieve Tone & Boundaries."""
     config_path = os.path.join(vault_path, "DM_CONFIG.md")

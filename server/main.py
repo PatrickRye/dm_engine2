@@ -5,6 +5,9 @@ import asyncio
 import yaml
 import aiofiles
 import time
+import socket
+import psutil
+import subprocess
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,10 +82,12 @@ from tools import (
     use_font_of_magic,
     spawn_summon,
     refresh_vault_data,
+    report_rule_challenge,
     _get_config_tone,
     _get_entity_by_name,
     _calculate_reach,
 )
+from system_logger import logger, qa_logger
 import event_handlers  # noqa: F401
 from spatial_engine import spatial_service
 from registry import get_all_entities
@@ -133,6 +138,7 @@ MASTER_TOOLS_LIST = [
     manage_map_terrain,
     spawn_summon,
     refresh_vault_data,
+    report_rule_challenge,
 ]
 
 # 1. INITIALIZE THE APP FIRST
@@ -205,6 +211,7 @@ async def planner_node(state: DMState, config: RunnableConfig):
             "13. ENVIRONMENT: You can cast spells or cause effects that alter the environment. Use `manage_map_terrain`.\n"
             "14. SUMMONS: Use `spawn_summon` to spawn creatures or familiars. "
             "Use `use_ability_or_spell` with `proxy_caster_name` for familiar touch spells.\n\n"
+            "15. RULE DISPUTES: If the player challenges or disputes a mechanical ruling, immediately use `report_rule_challenge` to route it to the offline QA log.\n\n"
             "MOVEMENT PARADIGMS:\n"
             "- TRAVEL / TOWN (Out of Combat): Use `move_entity(movement_type='travel')`.\n"
             "- DUNGEON CRAWL (Out of Combat): Use `move_entity(movement_type='walk')`.\n"
@@ -361,6 +368,14 @@ async def qa_node(state: DMState, config: RunnableConfig):
     # --- QA INTERCEPT: QA takes over and asks the player directly ---
     if getattr(result, "requires_clarification", False):
         await write_audit_log(vault, "QA Agent", "Clarification Intercept", result.clarification_message)
+        qa_logger.info("Clarification required from player.", extra={
+            "agent_id": "QA_Agent",
+            "context": {
+                "character": state.get("active_character"),
+                "vault_path": vault,
+                "clarification_message": result.clarification_message
+            }
+        })
         final_msg = f"**[OOC - Engine Supervisor]:** {result.clarification_message}"
         return {
             "draft_response": final_msg,
@@ -370,10 +385,27 @@ async def qa_node(state: DMState, config: RunnableConfig):
 
     elif result.approved:
         await write_audit_log(vault, "QA Agent", "Result", "APPROVED")
+        qa_logger.info("Draft approved.", extra={
+            "agent_id": "QA_Agent",
+            "context": {
+                "character": state.get("active_character"),
+                "vault_path": vault,
+                "revisions_used": revisions
+            }
+        })
         return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
 
     else:
         await write_audit_log(vault, "QA Agent", "Result", f"REJECTED. Feedback: {result.feedback}")
+        qa_logger.warning("Rule inconsistency detected. Draft rejected.", extra={
+            "agent_id": "QA_Agent",
+            "context": {
+                "character": state.get("active_character"),
+                "vault_path": vault,
+                "feedback": result.feedback, 
+                "revision_count": revisions + 1
+            }
+        })
 
         return {"qa_feedback": result.feedback, "revision_count": revisions + 1}
 
@@ -395,6 +427,23 @@ def qa_router(state: DMState) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global dm_engine_app, draft_llm, qa_llm
+    heartbeat_task = None
+    qa_process = None
+
+    def is_qa_running():
+        for p in psutil.process_iter(['cmdline']):
+            try:
+                cmdline = p.info.get('cmdline') or []
+                if any('bug_reporters.py' in cmd for cmd in cmdline):
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        return False
+
+    if not is_qa_running():
+        qa_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "qa", "bug_reporters.py")
+        print(f"Starting QA Reporters at {qa_path}...")
+        qa_process = subprocess.Popen(["python", qa_path])
 
     try:
         # Upgraded to Pro for deeper reasoning, and Temp 0.6 to encourage "Jazz"
@@ -404,11 +453,33 @@ async def lifespan(app: FastAPI):
         # Build and compile the multi-agent graph ONCE when the server boots
         dm_engine_app = build_graph()
 
+        async def heartbeat_emitter():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            p = psutil.Process(os.getpid())
+            while True:
+                try:
+                    payload = json.dumps({
+                        "pid": p.pid,
+                        "cpu_percent": p.cpu_percent(),
+                        "mem_mb": p.memory_info().rss / (1024 * 1024),
+                        "timestamp": time.time()
+                    }).encode("utf-8")
+                    sock.sendto(payload, ("127.0.0.1", 9999))
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+                
+        heartbeat_task = asyncio.create_task(heartbeat_emitter())
         print("DM Engine initialized successfully with ReAct architecture.")
         yield
     except Exception as e:
         print(f"Failed to initialize DM Engine: {e}")
         yield
+    finally:
+        if heartbeat_task:
+            heartbeat_task.cancel()
+        if qa_process:
+            qa_process.terminate()
 
 
 # --- 4. YOUR FAST API APP ---
@@ -427,10 +498,10 @@ app.add_middleware(
 # EXCEPTION HANDLERS
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    print("\n" + "!" * 40)
-    print("🚨 BAD PAYLOAD RECEIVED FROM FRONTEND 🚨")
-    print(f"Details: {exc.errors()}")
-    print("!" * 40 + "\n")
+    logger.error("Bad payload received from frontend.", extra={
+        "agent_id": "SYSTEM_API",
+        "context": {"errors": exc.errors(), "body": exc.body, "url": str(request.url)}
+    })
     return JSONResponse(
         status_code=422,
         content={"detail": exc.errors(), "body": exc.body},
@@ -439,10 +510,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    print("\n" + "💥" * 20)
-    print("💥 UNHANDLED SERVER EXCEPTION 💥")
-    traceback.print_exc()
-    print("💥" * 20 + "\n")
+    logger.exception("Unhandled server exception.", extra={
+        "agent_id": "SYSTEM_API",
+        "context": {"url": str(request.url)}
+    })
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal Server Error. Check the backend console."},
@@ -452,12 +523,18 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
-    print(f"\n---> Incoming Request: {request.method} {request.url}")
+    logger.debug(f"Incoming Request: {request.method} {request.url}", extra={
+        "agent_id": "SYSTEM_API",
+        "context": {"method": request.method, "url": str(request.url)}
+    })
 
     try:
         response = await call_next(request)
         process_time = time.time() - start_time
-        print(f"<--- Response: {response.status_code} (Took {process_time:.2f}s)")
+        logger.debug(f"Response: {response.status_code}", extra={
+            "agent_id": "SYSTEM_API",
+            "context": {"status_code": response.status_code, "process_time_s": round(process_time, 2)}
+        })
         return response
     except Exception as e:
         print(f"<--- Server Error: {str(e)}")
@@ -1219,9 +1296,14 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                 await broadcaster.broadcast(request.client_id, payload)
     
             except Exception as e:
-                print("\n" + "=" * 40 + "\n💥 FATAL ERROR DURING SUPERVISOR EXECUTION 💥\n" + "=" * 40)
-                traceback.print_exc()
-                print("=" * 40 + "\n")
+                logger.exception("Fatal error during supervisor execution.", extra={
+                    "agent_id": "SUPERVISOR",
+                    "context": {
+                        "client_id": request.client_id,
+                        "character": request.character, 
+                        "vault_path": request.vault_path
+                    }
+                })
                 payload = f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {str(e)}', 'status': 'error'})}\n\n"
                 yield payload
                 await broadcaster.broadcast(request.client_id, payload)
