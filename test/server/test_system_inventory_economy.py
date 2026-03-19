@@ -9,7 +9,8 @@ from tools import manage_inventory, generate_random_loot
 @pytest.fixture
 def mock_inventory_entity(mock_obsidian_vault):
     """Helper fixture to seed the mocked vault with specific entities for inventory tests."""
-    journals_dir = os.path.join(mock_obsidian_vault, "Journals")
+    journals_dir = os.path.join(mock_obsidian_vault, "server", "Journals")
+    os.makedirs(journals_dir, exist_ok=True)
     char_name = "Rogue_Thief"
 
     with open(os.path.join(journals_dir, f"{char_name}.md"), "w", encoding="utf-8") as f:
@@ -67,13 +68,13 @@ async def test_inventory_buying_and_selling(mock_inventory_entity):
     assert "Success" in res_buy_pc
 
     # Check PC YAML
-    with open(os.path.join(vault_path, "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
+    with open(os.path.join(vault_path, "server", "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
         pc_yaml = yaml.safe_load(f.read().split("---")[1])
         assert pc_yaml["currency"]["cp"] == 45  # Started with 50
         assert "Torch (x5)" in pc_yaml["inventory"]
 
     # Check NPC YAML
-    with open(os.path.join(vault_path, "Journals", f"{npc_name}.md"), "r", encoding="utf-8") as f:
+    with open(os.path.join(vault_path, "server", "Journals", f"{npc_name}.md"), "r", encoding="utf-8") as f:
         npc_yaml = yaml.safe_load(f.read().split("---")[1])
         assert npc_yaml["currency"]["cp"] == 5
         assert "Torch (x45)" in npc_yaml["inventory"]  # Successfully deducted 5 from 50
@@ -101,7 +102,7 @@ async def test_inventory_currency_exchange_downconversion(mock_inventory_entity)
     )
 
     assert "Success" in res
-    with open(os.path.join(vault_path, "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
+    with open(os.path.join(vault_path, "server", "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
         pc_yaml = yaml.safe_load(f.read().split("---")[1])
 
         # 2750 cp - 300 cp (the 30 sp cost) = 2450 total remaining copper.
@@ -164,7 +165,7 @@ async def test_inventory_consumable_usage(mock_inventory_entity):
         config=config,
     )
 
-    with open(os.path.join(vault_path, "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
+    with open(os.path.join(vault_path, "server", "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
         pc_yaml = yaml.safe_load(f.read().split("---")[1])
         inv = pc_yaml["inventory"]
 
@@ -194,12 +195,12 @@ async def test_inventory_stealing_looting_and_bartering(mock_inventory_entity):
         {"character_name": char_name, "item_name": "Torch", "action": "add", "quantity": 10}, config=config
     )
 
-    with open(os.path.join(vault_path, "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
+    with open(os.path.join(vault_path, "server", "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
         pc_yaml = yaml.safe_load(f.read().split("---")[1])
         assert "Torch (x10)" in pc_yaml["inventory"]
         assert "Shortbow" not in pc_yaml["inventory"]  # Successfully removed
 
-    with open(os.path.join(vault_path, "Journals", f"{npc_name}.md"), "r", encoding="utf-8") as f:
+    with open(os.path.join(vault_path, "server", "Journals", f"{npc_name}.md"), "r", encoding="utf-8") as f:
         npc_yaml = yaml.safe_load(f.read().split("---")[1])
         assert "Shortbow" in npc_yaml["inventory"]
         assert "Torch (x40)" in npc_yaml["inventory"]

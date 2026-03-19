@@ -11,7 +11,7 @@ from langchain_core.tools import tool, InjectedToolArg
 from typing import Annotated, Optional
 from contextlib import asynccontextmanager
 import glob
-from server.dnd_rules_engine import (
+from dnd_rules_engine import (
     Creature,
     ModifiableValue,
     MeleeWeapon,
@@ -20,10 +20,10 @@ from server.dnd_rules_engine import (
     ActiveCondition,
     parse_duration_to_seconds,
 )
-from server.compendium_manager import CompendiumManager
-from server.spatial_engine import spatial_service
-from server.registry import clear_registry, get_all_entities
-from server.item_system import ItemCompendium, WeaponItem
+from compendium_manager import CompendiumManager
+from spatial_engine import spatial_service
+from registry import clear_registry, get_all_entities
+from item_system import ItemCompendium, WeaponItem
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from prompts import VISION_MAP_INGESTION_PROMPT
@@ -94,7 +94,7 @@ async def auto_ingest_maps_from_vault(vault_path: str):
             # Auto-load the first map we find into the active engine just for initialization
             if not spatial_service.map_data.walls and os.path.exists(json_sidecar):
                 try:
-                    from server.spatial_engine import MapData
+                    from spatial_engine import MapData
 
                     with open(json_sidecar, "r", encoding="utf-8") as f:
                         data = json.load(f)

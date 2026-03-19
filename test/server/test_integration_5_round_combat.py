@@ -28,7 +28,8 @@ def setup_engine_state():
 @pytest.fixture
 def mock_5_round_vault(mock_obsidian_vault):
     """Constructs the high-level PCs and Enemies, and loads the Compendium."""
-    journals_dir = os.path.join(mock_obsidian_vault, "Journals")
+    journals_dir = os.path.join(mock_obsidian_vault, "server", "Journals")
+    os.makedirs(journals_dir, exist_ok=True)
 
     # PCs (~Level 10)
     pc_data = [
@@ -69,7 +70,7 @@ def mock_5_round_vault(mock_obsidian_vault):
         f.write("---\ntags: [campaign]\n---\n# Campaign Master\n\n## Major Milestones (Event Log)\n- Started.\n")
 
     # Create Fireball in Compendium
-    comp_dir = os.path.join(mock_obsidian_vault, "Compendium", "entries")
+    comp_dir = os.path.join(mock_obsidian_vault, "server", "Compendium", "entries")
     os.makedirs(comp_dir, exist_ok=True)
 
     fireball = {
@@ -83,7 +84,7 @@ def mock_5_round_vault(mock_obsidian_vault):
         json.dump(fireball, f)
 
     registry = {"fireball": os.path.join(comp_dir, "fireball.json")}
-    with open(os.path.join(mock_obsidian_vault, "Compendium", "registry.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(mock_obsidian_vault, "server", "Compendium", "registry.json"), "w", encoding="utf-8") as f:
         json.dump(registry, f)
 
     return mock_obsidian_vault
