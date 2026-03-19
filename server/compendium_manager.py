@@ -59,7 +59,7 @@ class CompendiumManager:
 
     @staticmethod
     def _get_paths(vault_path: str):
-        compendium_dir = os.path.join(vault_path, "Compendium")
+        compendium_dir = os.path.join(vault_path, "server", "Compendium")
         registry_path = os.path.join(compendium_dir, "registry.json")
         entries_dir = os.path.join(compendium_dir, "entries")
         weapons_dir = os.path.join(compendium_dir, "weapons")

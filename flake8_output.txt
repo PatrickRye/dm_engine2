@@ -1,5 +1,0 @@
-.\tests\test_system_dnd_features.py:245:129: E501 line too long (132 > 128 characters)
-.\tests\test_system_dnd_features.py:939:129: E501 line too long (132 > 128 characters)
-.\vault_io.py:217:129: E501 line too long (138 > 128 characters)
-3     E501 line too long (132 > 128 characters)
-3

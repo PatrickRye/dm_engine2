@@ -37,7 +37,7 @@ class Describable(BaseModel):
     icon_url: str = Field(
         default="",
         description=(
-            "Relative vault path to the top-down token/avatar image for the VTT map " "(e.g., 'Assets/tokens/goblin.png')."
+            "Relative vault path to the top-down token/avatar image for the VTT map " "(e.g., 'server/Compendium/tokens/goblin.png')."
         ),
     )
     misc_notes: str = Field(default="", description="Catch-all for extra lore, rumors, dark secrets, or 'Jazz'.")

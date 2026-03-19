@@ -29,7 +29,8 @@ def setup_engine_state():
 @pytest.fixture
 def mock_entities(mock_obsidian_vault):
     """Helper fixture to seed the mocked vault with specific entities for this test file."""
-    journals_dir = os.path.join(mock_obsidian_vault, "Journals")
+    journals_dir = os.path.join(mock_obsidian_vault, "server", "Journals")
+    os.makedirs(journals_dir, exist_ok=True)
     char_name, target_name = "Tharion", "Goblin"
 
     with open(os.path.join(journals_dir, f"{char_name}.md"), "w", encoding="utf-8") as f:
@@ -49,7 +50,7 @@ def mock_entities(mock_obsidian_vault):
         f.write("---\ntags: [campaign]\n---\n# Campaign Master\n\n## Major Milestones (Event Log)\n- Started.\n")
 
     # Setup mock JSON compendium files for the Level Up Test
-    comp_dir = os.path.join(mock_obsidian_vault, "Compendium")
+    comp_dir = os.path.join(mock_obsidian_vault, "server", "Compendium")
     os.makedirs(os.path.join(comp_dir, "classes"), exist_ok=True)
     os.makedirs(os.path.join(comp_dir, "subclasses"), exist_ok=True)
 
@@ -113,7 +114,7 @@ async def test_tool_to_engine_sync(mock_entities):
     assert weapon.name == "Silver Longsword"
     assert weapon.damage_dice == "1d8"
 
-    with open(os.path.join(vault_path, "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
+    with open(os.path.join(vault_path, "server", "Journals", f"{char_name}.md"), "r", encoding="utf-8") as f:
         content = f.read()
     assert "main_hand: Silver Longsword" in content
     assert "ac: 17" in content
@@ -310,7 +311,7 @@ async def test_tool_manage_skill_challenge(mock_entities):
     res4 = await manage_skill_challenge.ainvoke({"action": "end", "note": "The party escaped safely."}, config=config)
     assert "ended" in res4
 
-    with open(os.path.join(vault_path, "Journals", "CAMPAIGN_MASTER.md"), "r", encoding="utf-8") as f:
+    with open(os.path.join(vault_path, "server", "Journals", "CAMPAIGN_MASTER.md"), "r", encoding="utf-8") as f:
         assert "The party escaped safely." in f.read()
 
 

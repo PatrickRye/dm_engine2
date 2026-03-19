@@ -12,7 +12,7 @@ from typing import Optional, Annotated, Union
 import uuid
 
 # === DETERMINISTIC ENGINE INTEGRATION ===
-from dnd_rules_engine import (
+from server.dnd_rules_engine import (
     EventBus,
     GameEvent,
     EventStatus,
@@ -25,19 +25,19 @@ from dnd_rules_engine import (
     ModifierPriority,
 )
 from state import ClassLevel, PCDetails, NPCDetails, LocationDetails, FactionDetails
-from vault_io import (
+from server.vault_io import (
     get_journals_dir,
     write_audit_log,
     upsert_journal_section,
     read_markdown_entity,
     edit_markdown_entity,
 )
-from compendium_manager import CompendiumManager, CompendiumEntry, MechanicEffect
-from spatial_engine import spatial_service, LightSource, Wall, HAS_GIS
-from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
-from item_system import WeaponItem, ArmorItem, WondrousItem, ItemCompendium
+from server.compendium_manager import CompendiumManager, CompendiumEntry, MechanicEffect
+from server.spatial_engine import spatial_service, LightSource, Wall, HAS_GIS
+from server.spell_system import SpellDefinition, SpellMechanics, SpellCompendium
+from server.item_system import WeaponItem, ArmorItem, WondrousItem, ItemCompendium
 
-from registry import get_all_entities, register_entity, get_entity
+from server.registry import get_all_entities, register_entity, get_entity
 
 
 class VaultCache:
@@ -100,8 +100,8 @@ def get_roll_automations(character_name: str) -> dict:
 
 async def _get_entity_by_name(name: str, vault_path: str) -> Optional[BaseGameEntity]:
     """Helper to find an active entity in the engine's memory by name, with JIT lazy loading."""
-    from registry import _NAME_INDEX
-    from vault_io import load_entity_into_engine, get_journals_dir
+    from server.registry import _NAME_INDEX
+    from server.vault_io import load_entity_into_engine, get_journals_dir
 
     name_lower = name.lower().strip()
 
@@ -2512,11 +2512,11 @@ async def refresh_vault_data(
         return "SYSTEM ERROR: You must specify either a list of `entity_names` to refresh or set `refresh_all=True`."
 
     if refresh_all:
-        from vault_io import sync_engine_from_vault_updates
+        from server.vault_io import sync_engine_from_vault_updates
         res = await sync_engine_from_vault_updates(vault_path)
         return res
 
-    from vault_io import load_entity_into_engine, get_journals_dir
+    from server.vault_io import load_entity_into_engine, get_journals_dir
     import os
     
     j_dir = get_journals_dir(vault_path)
@@ -3695,7 +3695,7 @@ async def manage_map_terrain(
     - action: 'add' or 'remove'.
     - tags: Pass elemental descriptors like 'wet', 'frozen', or 'flammable'.
     """
-    from spatial_engine import TerrainZone
+    from server.spatial_engine import TerrainZone
 
     vp = config["configurable"].get("thread_id", "default")
     if action.lower() == "add":
@@ -3743,7 +3743,7 @@ async def manage_map_trap(
     Attaches a trap or alarm to an existing wall, door, or terrain zone on the spatial map.
     It can trigger on interact failures, entering the zone (trigger_on_move), or starting a turn in the zone.
     """
-    from spatial_engine import TrapDefinition
+    from server.spatial_engine import TrapDefinition
 
     vp = config["configurable"].get("thread_id", "default")
 
@@ -4247,7 +4247,7 @@ async def ingest_battlemap_json(map_json_str: str, *, config: Annotated[Runnable
     and natively bulk-loads all walls, terrain, and lights into the Spatial Engine.
     """
     import json
-    from spatial_engine import MapData
+    from server.spatial_engine import MapData
 
     try:
         # Clean markdown code blocks if the LLM wrapped the JSON payload

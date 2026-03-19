@@ -64,7 +64,7 @@ def mock_obsidian_vault():
 
     with tempfile.TemporaryDirectory() as temp_dir:
         # Setup isolated vault space
-        journals_dir = os.path.join(temp_dir, "Journals")
+        journals_dir = os.path.join(temp_dir, "server", "Journals")
         os.makedirs(journals_dir, exist_ok=True)
 
         # If you drop "Curse_of_Strahd.md" or other files into tests/resources/vault,

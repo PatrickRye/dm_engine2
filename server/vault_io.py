@@ -11,7 +11,7 @@ from langchain_core.tools import tool, InjectedToolArg
 from typing import Annotated, Optional
 from contextlib import asynccontextmanager
 import glob
-from dnd_rules_engine import (
+from server.dnd_rules_engine import (
     Creature,
     ModifiableValue,
     MeleeWeapon,
@@ -20,10 +20,10 @@ from dnd_rules_engine import (
     ActiveCondition,
     parse_duration_to_seconds,
 )
-from compendium_manager import CompendiumManager
-from spatial_engine import spatial_service
-from registry import clear_registry, get_all_entities
-from item_system import ItemCompendium, WeaponItem
+from server.compendium_manager import CompendiumManager
+from server.spatial_engine import spatial_service
+from server.registry import clear_registry, get_all_entities
+from server.item_system import ItemCompendium, WeaponItem
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from prompts import VISION_MAP_INGESTION_PROMPT
@@ -94,7 +94,7 @@ async def auto_ingest_maps_from_vault(vault_path: str):
             # Auto-load the first map we find into the active engine just for initialization
             if not spatial_service.map_data.walls and os.path.exists(json_sidecar):
                 try:
-                    from spatial_engine import MapData
+                    from server.spatial_engine import MapData
 
                     with open(json_sidecar, "r", encoding="utf-8") as f:
                         data = json.load(f)
@@ -344,7 +344,7 @@ async def sync_engine_to_vault(vault_path: str):
 
 def get_journals_dir(vault_path: str):
     """Helper to dynamically locate or create the Journals folder for the active campaign."""
-    j_dir = os.path.join(vault_path, "Journals")
+    j_dir = os.path.join(vault_path, "server", "Journals")
     os.makedirs(j_dir, exist_ok=True)
     return j_dir
 
@@ -407,7 +407,7 @@ async def edit_markdown_entity(file_path: str):
 
 
 async def write_audit_log(vault_path: str, agent_name: str, action: str, details: str):
-    log_path = os.path.join(vault_path, "Journals", "AUDIT_LOG.md")
+    log_path = os.path.join(vault_path, "server", "Journals", "AUDIT_LOG.md")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
     if not os.path.exists(log_path):
