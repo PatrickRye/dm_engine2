@@ -1,0 +1,39 @@
+name: AI PM Reviewer
+
+on:
+  workflow_run:
+    workflows: ["Python Pytest CI"] # Must match exactly the name of your test workflow
+    types:
+      - completed
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # Required to modify /tasks files and active_locks.json
+      pull-requests: write  # Required to approve, comment, and merge
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install Agent Dependencies
+        run: |
+          pip install langchain-google-genai langchain-core langgraph pydantic
+          pip install mcp langchain-mcp-adapters
+
+      - name: Execute Reviewer Agent
+        env:
+          GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} 
+          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TEST_CONCLUSION: ${{ github.event.workflow_run.conclusion }} # 'success' or 'failure'
+        run: |
+          python qa/reviewer_agent.py

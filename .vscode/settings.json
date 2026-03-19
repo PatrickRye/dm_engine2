@@ -18,5 +18,17 @@
     ],
     "flake8.args": [
         "--max-line-length=127"
-    ]
+    ],
+    "terminal.integrated.env.windows": {
+        "GITHUB_REPO": "your-username/dm_engine",
+        "GITHUB_PAT": "your-token-here"
+    },
+    "terminal.integrated.env.osx": {
+        "GITHUB_REPO": "your-username/dm_engine",
+        "GITHUB_PAT": "your-token-here"
+    },
+    "terminal.integrated.env.linux": {
+        "GITHUB_REPO": "your-username/dm_engine",
+        "GITHUB_PAT": "your-token-here"
+    }
 }

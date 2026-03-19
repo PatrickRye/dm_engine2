@@ -8,6 +8,7 @@ from urllib.parse import quote
 import socket
 import json
 import re
+from filelock import FileLock
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -19,10 +20,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_ACTIVE = os.path.join(BASE_DIR, "logs", "active")
 LOGS_QA = os.path.join(BASE_DIR, "logs", "qa_audits")
 LOGS_PROCESSED = os.path.join(BASE_DIR, "logs", "processed")
-TASKS_INBOX = os.path.join(BASE_DIR, "tasks", "inbox")
-QA_DIR = os.path.join(BASE_DIR, "qa")
 
-for d in [LOGS_ACTIVE, LOGS_QA, LOGS_PROCESSED, TASKS_INBOX, QA_DIR]:
+for d in [LOGS_ACTIVE, LOGS_QA, LOGS_PROCESSED]:
     os.makedirs(d, exist_ok=True)
 
 # 2. Agent Tools
@@ -43,60 +42,58 @@ def read_log_file(filepath: str) -> str:
     except Exception as e:
         return f"Error reading file: {e}"
 
-@tool
-def list_inbox_tasks() -> list:
-    """Lists all .md task files currently in the inbox."""
-    if not os.path.exists(TASKS_INBOX): return []
-    return [os.path.join(TASKS_INBOX, f) for f in os.listdir(TASKS_INBOX) if f.endswith(".md")]
+def _get_repo():
+    from github import Auth, Github
+    token = os.environ.get("GITHUB_PAT")
+    repo_name = os.environ.get("GITHUB_REPO")
+    if not token or not repo_name:
+        raise ValueError("GITHUB_PAT or GITHUB_REPO env variables are missing.")
+    auth = Auth.Token(token)
+    g = Github(auth=auth)
+    return g.get_repo(repo_name)
 
 @tool
-def read_task_file(filepath: str) -> str:
-    """Reads the contents of a task file."""
+def list_open_github_issues() -> str:
+    """Lists all open GitHub issues in the repository."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f: return f.read()
-    except Exception as e: return str(e)
+        repo = _get_repo()
+        issues = repo.get_issues(state='open')
+        return "\n".join([f"#{i.number}: {i.title}" for i in issues[:20]]) or "No open issues."
+    except Exception as e:
+        return f"Error connecting to GitHub: {e}"
 
 @tool
-def update_task_frequency(filepath: str) -> str:
-    """Increments the frequency counter in the YAML frontmatter of an existing task."""
+def read_github_issue(issue_number: int) -> str:
+    """Reads the body and comments of a specific GitHub issue."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
-        match = re.search(r'frequency:\s*(\d+)', content)
-        if match:
-            current_freq = int(match.group(1))
-            content = content[:match.start()] + f"frequency: {current_freq + 1}" + content[match.end():]
-        else:
-            content = content.replace("---\n", "---\nfrequency: 2\n", 1)
-        with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
-        return f"Incremented frequency for {os.path.basename(filepath)}"
-    except Exception as e: return f"Error updating frequency: {e}"
+        repo = _get_repo()
+        issue = repo.get_issue(number=issue_number)
+        comments = [c.body for c in issue.get_comments()]
+        comments_str = "\n---\n".join(comments)
+        return f"Title: {issue.title}\n\nBody: {issue.body}\n\nComments:\n{comments_str}"
+    except Exception as e:
+        return f"Error reading issue #{issue_number}: {e}"
 
 @tool
-def create_task_file(title: str, description: str, requirements: list, priority: str, role_required: str, prefix: str = "BUG") -> str:
-    """Creates a formatted Markdown task file in /tasks/inbox."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_title = "".join(c for c in title if c.isalnum() or c in " -_").replace(" ", "_")[:30]
-    filename = f"{prefix}-{timestamp}-{safe_title}.md"
-    filepath = os.path.join(TASKS_INBOX, filename)
-    
-    req_str = "\n".join([f"- [ ] {req}" for req in requirements])
-    
-    template_path = os.path.join(QA_DIR, "task_template.md")
-    if os.path.exists(template_path):
-        with open(template_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        content = content.replace("TASK-001", f"{prefix}-{timestamp}")
-        content = content.replace("implementer", role_required)
-        content = content.replace("unassigned", priority)
-        content = content.replace("# Task Title", f"# {title}")
-        content = content.replace("Description of the bug or feature.", description)
-        content = re.sub(r"## Requirements\n.*", f"## Requirements\n{req_str}", content, flags=re.DOTALL)
-    else:
-        content = f"---\nid: {prefix}-{timestamp}\nrole_required: {role_required}\npriority: {priority}\nstatus: inbox\ncategory: untriaged\nsub_category: none\nfrequency: 1\n---\n# {title}\n{description}\n\n## Requirements\n{req_str}"
-    
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
-    return f"Created task file: {filepath}"
+def comment_on_github_issue(issue_number: int, comment_body: str) -> str:
+    """Adds a comment to an existing GitHub issue (e.g., to report a recurring bug)."""
+    try:
+        repo = _get_repo()
+        issue = repo.get_issue(number=issue_number)
+        issue.create_comment(comment_body)
+        return f"Successfully added comment to issue #{issue_number}."
+    except Exception as e:
+        return f"Error commenting on issue #{issue_number}: {e}"
+
+@tool
+def create_github_issue(title: str, body: str, labels: list[str] = None) -> str:
+    """Creates a new GitHub issue."""
+    try:
+        repo = _get_repo()
+        issue = repo.create_issue(title=title, body=body, labels=labels or [])
+        return f"Successfully created issue #{issue.number}: {issue.title}"
+    except Exception as e:
+        return f"Error creating issue: {e}"
 
 @tool
 def move_to_processed(filepath: str) -> str:
@@ -127,46 +124,46 @@ def search_online(query: str) -> str:
 # 3. System Prompts
 RULES_PROMPT = """
 Role: You are the Rules Compliance Bug Reporter Agent for a Python-based Dungeons & Dragons AI system.
-Your sole responsibility is to monitor system logs and translate errors (rules challenges) into actionable Markdown tasks.
+Your sole responsibility is to monitor system logs and translate errors (rules challenges) into actionable GitHub Issues.
 
 Allowed Actions:
 1. Read `.jsonl` files in the `qa_audits` directory using `list_unprocessed_logs` and `read_log_file`.
 2. Validate the challenge using `search_online` (checking sage advice, reddit, etc.) or your internal knowledge.
-3. Check existing tasks in `/tasks/inbox` using `list_inbox_tasks` and `read_task_file`. 
-4. If a highly similar task exists, DO NOT create a new one. Instead, use `update_task_frequency`. Otherwise, create a new `.md` file using `create_task_file` (use prefix 'CHALLENGE').
+3. Check existing issues on GitHub using `list_open_github_issues` and `read_github_issue`. 
+4. If a highly similar issue exists, DO NOT create a new one. Instead, use `comment_on_github_issue` to add the new instance details. Otherwise, create a new issue using `create_github_issue` with appropriate labels (e.g., 'rules').
 5. Move fully processed log files to the `processed` directory using `move_to_processed`.
 
 Execution Rules:
 - Parse the JSON logs and identify any entry with `WARNING`, `ERROR` or rule disputes from the `QA_Agent` or `PLAYER_CHALLENGE`.
-- Validate the challenge against online sources or internal D&D 5e rules. If valid (the DM Engine was wrong), make it a task file. If it is an invalid challenge (the QA Agent hallucinated), ignore it.
-- Before creating a task, ALWAYS check if it already exists in the inbox. If so, increment its frequency.
-- When generating a task file, the description MUST contain the exact high-resolution timestamp, the `agent_id`, the error message, and the full JSON context block.
-- Do NOT attempt to fix the code, invent solutions, or modify files outside of the `/tasks/inbox` and `/logs` directories.
+- Validate the challenge against online sources or internal D&D 5e rules. If valid (the DM Engine was wrong), make it an issue. If it is an invalid challenge (the QA Agent hallucinated), ignore it.
+- Before creating an issue, ALWAYS check if it already exists. If so, add a comment to it.
+- When generating an issue, the body MUST contain the exact high-resolution timestamp, the `agent_id`, the error message, and the full JSON context block. Assign the label "rules".
+- Do NOT attempt to fix the code, invent solutions, or modify files outside of the `/logs` directories.
 - Once a log file has been entirely parsed and converted into tasks, you must move it to `processed`.
 """
 
 SYSTEM_PROMPT = """
 Role: You are the System Bug Reporter Agent for a Python-based D&D AI system. 
-Your sole responsibility is to monitor system logs and translate server exceptions, bugs, and API errors into actionable Markdown tasks.
+Your sole responsibility is to monitor system logs and translate server exceptions, bugs, and API errors into actionable GitHub Issues.
 
 Allowed Actions:
 1. Read `.jsonl` files in the `active` directory using `list_unprocessed_logs` and `read_log_file`.
-2. Check existing tasks in `/tasks/inbox` using `list_inbox_tasks` and `read_task_file`.
-3. If a highly similar task exists, use `update_task_frequency`. Otherwise, create a new `.md` file using `create_task_file` (use prefix 'BUG').
+2. Check existing issues on GitHub using `list_open_github_issues` and `read_github_issue`.
+3. If a highly similar issue exists, use `comment_on_github_issue`. Otherwise, create a new issue using `create_github_issue` with appropriate labels (e.g., 'bug').
 4. Move fully processed log files to the `processed` directory using `move_to_processed`.
 
 Execution Rules:
 - Parse the JSON logs and identify any entry with a level of `ERROR` or `CRITICAL` (ignoring QA rule disputes).
-- Before creating a task, ALWAYS check if it already exists in the inbox. If so, increment its frequency.
-- When generating a task file, the description MUST contain the exact high-resolution timestamp, the `agent_id`, the error message, the stack trace, and the full JSON context block.
-- Do NOT attempt to fix the code or modify files outside of the `/tasks/inbox` and `/logs` directories.
+- Before creating an issue, ALWAYS check if it already exists. If so, add a comment to it.
+- When generating an issue, the body MUST contain the exact high-resolution timestamp, the `agent_id`, the error message, the stack trace, and the full JSON context block. Assign the label "bug".
+- Do NOT attempt to fix the code or modify files outside of the `/logs` directories.
 - Once a log file is thoroughly checked, move it to processed.
 """
 
 def run_rules_agent():
     print("[Rules Agent] Started process. Monitoring /logs/qa_audits")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2)
-    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, search_online, list_inbox_tasks, read_task_file, update_task_frequency, create_task_file, move_to_processed])
+    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, search_online, list_open_github_issues, read_github_issue, comment_on_github_issue, create_github_issue, move_to_processed])
     while True:
         state = {"messages": [SystemMessage(content=RULES_PROMPT), HumanMessage(content="Check 'qa_audits' for unprocessed log files. Process them fully, create tasks, and move them to processed.")]}
         agent.invoke(state)
@@ -175,7 +172,7 @@ def run_rules_agent():
 def run_system_agent():
     print("[System Agent] Started process. Monitoring /logs/active")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
-    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, list_inbox_tasks, read_task_file, update_task_frequency, create_task_file, move_to_processed])
+    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, list_open_github_issues, read_github_issue, comment_on_github_issue, create_github_issue, move_to_processed])
     while True:
         state = {"messages": [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content="Check 'active' for unprocessed log files. Process them fully, extract Python Exceptions/ERRORs into BUG tasks, and move them to processed.")]}
         agent.invoke(state)
@@ -203,22 +200,20 @@ def run_server_monitor():
             now = time.time()
             if (cpu > 90.0 or mem > 1024.0) and (now - last_resource_alert > 300):
                 print(f"[System Monitor] Alerted on high resource usage: CPU {cpu}%, Mem {mem:.1f}MB")
-                create_task_file.invoke({
+                create_github_issue.invoke({
                     "title": "High Resource Usage Detected",
-                    "description": f"Server PID {payload.get('pid')} is currently using {cpu}% CPU and {mem:.1f} MB RAM.",
-                    "requirements": ["Investigate memory leaks", "Profile CPU usage"],
-                    "priority": "high", "role_required": "system_admin", "prefix": "BUG"
+                    "body": f"Server PID {payload.get('pid')} is currently using {cpu}% CPU and {mem:.1f} MB RAM.\n\n**Requirements:**\n- Investigate memory leaks\n- Profile CPU usage",
+                    "labels": ["bug", "high-priority", "system"]
                 })
                 last_resource_alert = now
                 
         except socket.timeout:
             if server_was_alive:
                 print("[System Monitor] CRITICAL: Server heartbeat lost! Possible crash.")
-                create_task_file.invoke({
+                create_github_issue.invoke({
                     "title": "Server Crash Detected",
-                    "description": "The FastAPI server stopped emitting UDP heartbeats for over 5 seconds. It has likely crashed.",
-                    "requirements": ["Check active logs for exceptions", "Restart the server process"],
-                    "priority": "critical", "role_required": "system_admin", "prefix": "BUG"
+                    "body": "The FastAPI server stopped emitting UDP heartbeats for over 5 seconds. It has likely crashed.\n\n**Requirements:**\n- Check active logs for exceptions\n- Restart the server process",
+                    "labels": ["bug", "critical", "system"]
                 })
                 server_was_alive = False  # Reset so we don't spam crash reports endlessly
         except Exception:
