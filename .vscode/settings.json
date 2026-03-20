@@ -14,7 +14,8 @@
         "--line-length=127"
     ],
     "python.analysis.extraPaths": [
-        "."
+        ".",
+        "./server"
     ],
     "flake8.args": [
         "--max-line-length=127"

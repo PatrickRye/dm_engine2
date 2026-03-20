@@ -120,7 +120,6 @@ The system relies heavily on GitHub Labels to trigger workflows.
 
 **1. State Pipeline (Status)**
 *   *(No Label)* -> Issue just opened. Waiting for Triager.
-*   `status: needs_architect` -> Issue is too large/epic. Requires subdivision before moving to backlog.
 *   `status: backlog` -> Triaged. Waiting for Planner.
 *   `status: selected` -> Branch created. Waiting for Implementer to code.
 *   `status: needs_review` -> PR open. Waiting for CI & Reviewer.
@@ -135,13 +134,7 @@ The system relies heavily on GitHub Labels to trigger workflows.
 *   `priority: low` -> Minor formatting or narrative discrepancy.
 
 **3. Category**
-*   `category: rules` -> Strict D&D mechanical miscalculations (e.g., damage calculation wrong).
-*   `category: story-compliance` -> Failure to adhere to the module or established campaign history.
-*   `category: narrative-agency` -> Failure to uphold player agency, or poor sensory descriptions.
-*   `category: software` -> Python crashes, API failures, middleware bugs, and server errors.
-
-**4. Scale (Task Size)**
-*   `scale: small` -> Quick, localized fix.
-*   `scale: medium` -> Standard feature or bug fix.
-*   `scale: large` -> Complex logic touching multiple files.
-*   `scale: epic` -> Too massive for one pass. Needs to be broken into smaller tasks.
+*   `category: rules` -> Handled via `dnd_rules_engine.py` or `tools.py`.
+*   `category: narrative` -> Handled via `prompts.py` or State schemas.
+*   `category: code` -> API failures, middleware, spatial engine math.
+*   `category: system` -> Hardware / UDP Heartbeat alerts.

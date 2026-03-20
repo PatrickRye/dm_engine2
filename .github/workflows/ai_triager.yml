@@ -20,7 +20,7 @@ jobs:
           cache: 'pip'
 
       - name: Install Dependencies
-        run: pip install langchain-google-genai langchain-core langgraph PyGithub
+        run: pip install -r requirements.txt
 
       - name: Run Triager Agent
         env:

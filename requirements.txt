@@ -1,0 +1,29 @@
+# --- Core Engine Dependencies ---
+fastapi
+uvicorn
+pydantic
+pyyaml
+aiofiles
+filelock
+psutil
+python-dotenv
+
+# --- Spatial & GIS Engine ---
+shapely
+rtree
+
+# --- AI & LangChain ---
+langchain-core
+langchain-google-genai
+langgraph
+
+# --- MCP & GitHub Integration ---
+mcp
+langchain-mcp-adapters
+PyGithub
+
+# --- Testing & Linting (Dev) ---
+pytest
+pytest-asyncio
+pytest-cov
+flake8

@@ -15,14 +15,26 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
+from dotenv import dotenv_values
+
+# Load non-default env variables
+env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(env_path):
+    defaults = {"your_gemini_api_key_here", "github_pat_your_token_here", "owner/repo_name"}
+    for k, v in dotenv_values(env_path).items():
+        if v and v not in defaults:
+            os.environ[k] = v
+
 # 1. Directories Setup
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_ACTIVE = os.path.join(BASE_DIR, "logs", "active")
 LOGS_QA = os.path.join(BASE_DIR, "logs", "qa_audits")
 LOGS_PROCESSED = os.path.join(BASE_DIR, "logs", "processed")
+LOGS_PUBLISHED_ISSUES = os.path.join(BASE_DIR, "logs", "published_issues")
 
-for d in [LOGS_ACTIVE, LOGS_QA, LOGS_PROCESSED]:
+for d in [LOGS_ACTIVE, LOGS_QA, LOGS_PROCESSED, LOGS_PUBLISHED_ISSUES]:
     os.makedirs(d, exist_ok=True)
+
 
 # 2. Agent Tools
 @tool
@@ -33,17 +45,20 @@ def list_unprocessed_logs(directory: str) -> list:
         return []
     return [os.path.join(target_dir, f) for f in os.listdir(target_dir) if f.endswith(".jsonl")]
 
+
 @tool
 def read_log_file(filepath: str) -> str:
     """Reads the contents of a JSONL log file."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
         return f"Error reading file: {e}"
 
+
 def _get_repo():
     from github import Auth, Github
+
     token = os.environ.get("GITHUB_PAT")
     repo_name = os.environ.get("GITHUB_REPO")
     if not token or not repo_name:
@@ -52,15 +67,17 @@ def _get_repo():
     g = Github(auth=auth)
     return g.get_repo(repo_name)
 
+
 @tool
 def list_open_github_issues() -> str:
     """Lists all open GitHub issues in the repository."""
     try:
         repo = _get_repo()
-        issues = repo.get_issues(state='open')
+        issues = repo.get_issues(state="open")
         return "\n".join([f"#{i.number}: {i.title}" for i in issues[:20]]) or "No open issues."
     except Exception as e:
         return f"Error connecting to GitHub: {e}"
+
 
 @tool
 def read_github_issue(issue_number: int) -> str:
@@ -74,16 +91,26 @@ def read_github_issue(issue_number: int) -> str:
     except Exception as e:
         return f"Error reading issue #{issue_number}: {e}"
 
+
 @tool
 def comment_on_github_issue(issue_number: int, comment_body: str) -> str:
     """Adds a comment to an existing GitHub issue (e.g., to report a recurring bug)."""
     try:
         repo = _get_repo()
         issue = repo.get_issue(number=issue_number)
-        issue.create_comment(comment_body)
+        comment = issue.create_comment(comment_body)
+
+        # DevOps Observability: Generate a local receipt of the comment
+        safe_title = "".join(c for c in issue.title if c.isalnum() or c in " -_").replace(" ", "_")[:30]
+        receipt_path = os.path.join(LOGS_PUBLISHED_ISSUES, f"COMMENT_ISSUE_{issue.number}_{safe_title}.md")
+
+        with open(receipt_path, "w", encoding="utf-8") as f:
+            f.write(f"# Added Comment to Issue #{issue.number} ({issue.title})\n\n{comment_body}")
+
         return f"Successfully added comment to issue #{issue_number}."
     except Exception as e:
         return f"Error commenting on issue #{issue_number}: {e}"
+
 
 @tool
 def create_github_issue(title: str, body: str, labels: list[str] = None) -> str:
@@ -91,9 +118,18 @@ def create_github_issue(title: str, body: str, labels: list[str] = None) -> str:
     try:
         repo = _get_repo()
         issue = repo.create_issue(title=title, body=body, labels=labels or [])
+
+        # DevOps Observability: Generate a local receipt of the new issue
+        safe_title = "".join(c for c in title if c.isalnum() or c in " -_").replace(" ", "_")[:30]
+        receipt_path = os.path.join(LOGS_PUBLISHED_ISSUES, f"ISSUE_{issue.number}_{safe_title}.md")
+
+        with open(receipt_path, "w", encoding="utf-8") as f:
+            f.write(f"---\nissue_number: {issue.number}\nlabels: {labels}\n---\n# {title}\n\n{body}")
+
         return f"Successfully created issue #{issue.number}: {issue.title}"
     except Exception as e:
         return f"Error creating issue: {e}"
+
 
 @tool
 def move_to_processed(filepath: str) -> str:
@@ -106,20 +142,22 @@ def move_to_processed(filepath: str) -> str:
     except Exception as e:
         return f"Error moving file: {e}"
 
+
 @tool
 def search_online(query: str) -> str:
     """Searches the web (Reddit, D&D forums, Sage Advice) for D&D 5e rules clarifications."""
     try:
         url = f"https://html.duckduckgo.com/html/?q={quote(query + ' D&D 5e rules')}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-        html = urllib.request.urlopen(req, timeout=5).read().decode('utf-8')
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        html = urllib.request.urlopen(req, timeout=5).read().decode("utf-8")
         snippets = re.findall(r'<a class="result__snippet[^>]*>(.*?)</a>', html, re.IGNORECASE | re.DOTALL)
-        clean_snippets = [re.sub(r'<[^>]+>', '', s).strip() for s in snippets]
+        clean_snippets = [re.sub(r"<[^>]+>", "", s).strip() for s in snippets]
         if not clean_snippets:
             return "No external results. Rely on your internal parametric D&D 5e knowledge."
         return "\n".join(clean_snippets[:3])
     except Exception:
         return "Search failed. Rely on your internal D&D 5e knowledge."
+
 
 # 3. System Prompts
 RULES_PROMPT = """
@@ -160,64 +198,109 @@ Execution Rules:
 - Once a log file is thoroughly checked, move it to processed.
 """
 
+
 def run_rules_agent():
     print("[Rules Agent] Started process. Monitoring /logs/qa_audits")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2)
-    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, search_online, list_open_github_issues, read_github_issue, comment_on_github_issue, create_github_issue, move_to_processed])
+    agent = create_react_agent(
+        llm,
+        [
+            list_unprocessed_logs,
+            read_log_file,
+            search_online,
+            list_open_github_issues,
+            read_github_issue,
+            comment_on_github_issue,
+            create_github_issue,
+            move_to_processed,
+        ],
+    )
     while True:
-        state = {"messages": [SystemMessage(content=RULES_PROMPT), HumanMessage(content="Check 'qa_audits' for unprocessed log files. Process them fully, create tasks, and move them to processed.")]}
+        state = {
+            "messages": [
+                SystemMessage(content=RULES_PROMPT),
+                HumanMessage(
+                    content="Check 'qa_audits' for unprocessed log files. Process them fully, create tasks, and move them to processed."
+                ),
+            ]
+        }
         agent.invoke(state)
         time.sleep(60)
+
 
 def run_system_agent():
     print("[System Agent] Started process. Monitoring /logs/active")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
-    agent = create_react_agent(llm, [list_unprocessed_logs, read_log_file, list_open_github_issues, read_github_issue, comment_on_github_issue, create_github_issue, move_to_processed])
+    agent = create_react_agent(
+        llm,
+        [
+            list_unprocessed_logs,
+            read_log_file,
+            list_open_github_issues,
+            read_github_issue,
+            comment_on_github_issue,
+            create_github_issue,
+            move_to_processed,
+        ],
+    )
     while True:
-        state = {"messages": [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content="Check 'active' for unprocessed log files. Process them fully, extract Python Exceptions/ERRORs into BUG tasks, and move them to processed.")]}
+        state = {
+            "messages": [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(
+                    content="Check 'active' for unprocessed log files. Process them fully, extract Python Exceptions/ERRORs into BUG tasks, and move them to processed."
+                ),
+            ]
+        }
         agent.invoke(state)
         time.sleep(60)
+
 
 def run_server_monitor():
     print("[System Monitor] Started UDP heartbeat monitor on 127.0.0.1:9999")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 9999))
     sock.settimeout(5.0)  # 5 second timeout to detect crash
-    
+
     server_was_alive = False
     last_resource_alert = 0
-    
+
     while True:
         try:
             data, addr = sock.recvfrom(1024)
             payload = json.loads(data.decode("utf-8"))
             server_was_alive = True
-            
+
             cpu = payload.get("cpu_percent", 0)
             mem = payload.get("mem_mb", 0)
-            
+
             # Alert on high usage (throttle to once every 5 minutes so it doesn't flood inbox)
             now = time.time()
             if (cpu > 90.0 or mem > 1024.0) and (now - last_resource_alert > 300):
                 print(f"[System Monitor] Alerted on high resource usage: CPU {cpu}%, Mem {mem:.1f}MB")
-                create_github_issue.invoke({
-                    "title": "High Resource Usage Detected",
-                    "body": f"Server PID {payload.get('pid')} is currently using {cpu}% CPU and {mem:.1f} MB RAM.\n\n**Requirements:**\n- Investigate memory leaks\n- Profile CPU usage",
-                    "labels": ["bug", "high-priority", "system"]
-                })
+                create_github_issue.invoke(
+                    {
+                        "title": "High Resource Usage Detected",
+                        "body": f"Server PID {payload.get('pid')} is currently using {cpu}% CPU and {mem:.1f} MB RAM.\n\n**Requirements:**\n- Investigate memory leaks\n- Profile CPU usage",
+                        "labels": ["bug", "high-priority", "system"],
+                    }
+                )
                 last_resource_alert = now
-                
+
         except socket.timeout:
             if server_was_alive:
                 print("[System Monitor] CRITICAL: Server heartbeat lost! Possible crash.")
-                create_github_issue.invoke({
-                    "title": "Server Crash Detected",
-                    "body": "The FastAPI server stopped emitting UDP heartbeats for over 5 seconds. It has likely crashed.\n\n**Requirements:**\n- Check active logs for exceptions\n- Restart the server process",
-                    "labels": ["bug", "critical", "system"]
-                })
+                create_github_issue.invoke(
+                    {
+                        "title": "Server Crash Detected",
+                        "body": "The FastAPI server stopped emitting UDP heartbeats for over 5 seconds. It has likely crashed.\n\n**Requirements:**\n- Check active logs for exceptions\n- Restart the server process",
+                        "labels": ["bug", "critical", "system"],
+                    }
+                )
                 server_was_alive = False  # Reset so we don't spam crash reports endlessly
         except Exception:
-            time.sleep(1) # Prevent tight loop on malformed data
+            time.sleep(1)  # Prevent tight loop on malformed data
+
 
 if __name__ == "__main__":
     multiprocessing.Process(target=run_rules_agent).start()

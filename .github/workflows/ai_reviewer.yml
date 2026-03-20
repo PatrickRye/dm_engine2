@@ -25,9 +25,7 @@ jobs:
           cache: 'pip'
 
       - name: Install Agent Dependencies
-        run: |
-          pip install langchain-google-genai langchain-core langgraph pydantic
-          pip install mcp langchain-mcp-adapters
+        run: pip install -r requirements.txt
 
       - name: Execute Reviewer Agent
         env:

@@ -15,6 +15,7 @@ class DMEngineClientCore {
         this.listenController = null;
         this.pollInterval = null;
         this.availableCharacters = new Set(["Human DM"]);
+        this.lastUpdateCheck = 0;
         this.loadedImages = {};
         this.isMapDragging = false;
         this.isDrawingPath = false;
@@ -79,6 +80,10 @@ class DMEngineClientCore {
             }
         }
 
+        if (this.view && this.view.ui && this.view.ui.livePatchContainer) {
+            this.view.ui.livePatchContainer.style.display = (this.activeCharacter === "Human DM") ? "flex" : "none";
+        }
+
         let css = `
             .perspective { display: none; margin-bottom: 10px; padding: 10px; border-left: 3px solid var(--interactive-accent); background: var(--background-modifier-hover); border-radius: 4px; }
             .perspective[data-target="ALL"] { display: block; border-left: none; background: transparent; padding: 0; }
@@ -121,6 +126,19 @@ class DMEngineClientCore {
 
                 this.fetchCharacterSheet();
                 this.fetchMaps();
+
+                // Check for updates every 60 seconds (DM only)
+                const now = Date.now();
+                if (now - this.lastUpdateCheck > 60000 && this.activeCharacter === "Human DM") {
+                    this.lastUpdateCheck = now;
+                    fetch(`${this.serverUrl}/check_updates`)
+                        .then(r => r.json())
+                        .then(data => {
+                            if (this.view.ui && this.view.ui.updateBtn) {
+                                this.view.ui.updateBtn.style.display = data.update_available ? "inline-block" : "none";
+                            }
+                        }).catch(() => { });
+                }
             } else {
                 this.setConnectionStatus(false);
             }
@@ -1183,6 +1201,29 @@ class DMChatView extends ItemView {
         this.ui.statusIndicator.style.fontSize = "0.8em";
         this.ui.statusIndicator.style.fontWeight = "600";
 
+        this.ui.updateBtn = titleContainer.createEl("button", { text: "🔄 Update Available" });
+        this.ui.updateBtn.style.display = "none";
+        this.ui.updateBtn.style.fontSize = "0.75em";
+        this.ui.updateBtn.style.padding = "2px 8px";
+        this.ui.updateBtn.style.backgroundColor = "var(--interactive-accent)";
+        this.ui.updateBtn.style.color = "var(--text-on-accent)";
+        this.ui.updateBtn.style.border = "none";
+        this.ui.updateBtn.style.cursor = "pointer";
+        this.ui.updateBtn.addEventListener("click", async () => {
+            this.ui.updateBtn.textContent = "Pulling...";
+            this.ui.updateBtn.disabled = true;
+            try {
+                const res = await fetch(`${this.clientCore.serverUrl}/apply_update`, { method: "POST" });
+                const data = await res.json();
+                if (data.status === "success") {
+                    new Notice("Update applied! Server is hot-reloading.");
+                    this.ui.updateBtn.style.display = "none";
+                } else { new Notice("Failed to pull update: " + data.message); }
+            } catch (e) { new Notice("Error applying update."); }
+            this.ui.updateBtn.textContent = "🔄 Update Available";
+            this.ui.updateBtn.disabled = false;
+        });
+
         // Listen Checkbox
         const listenLabel = topBar.createEl("label");
         listenLabel.style.display = "flex";
@@ -1291,6 +1332,24 @@ class DMChatView extends ItemView {
             localStorage.setItem("dm_snap_to_grid", e.target.checked);
         });
         snapGridLabel.appendChild(document.createTextNode("Snap to 5ft Grid"));
+
+        // Live Patch Toggle (DM Only)
+        this.ui.livePatchContainer = settingsContent.createEl("label");
+        this.ui.livePatchContainer.style.display = "none";
+        this.ui.livePatchContainer.style.alignItems = "center";
+        this.ui.livePatchContainer.style.gap = "8px";
+        this.ui.livePatchContainer.style.cursor = "pointer";
+        this.ui.livePatchContainer.style.color = "var(--text-error)";
+        this.ui.livePatchCheckbox = this.ui.livePatchContainer.createEl("input", { type: "checkbox" });
+        this.ui.livePatchContainer.appendChild(document.createTextNode("🔥 Enable AI Live Patching (Danger)"));
+        this.ui.livePatchCheckbox.addEventListener("change", async (e) => {
+            try {
+                await fetch(`${this.clientCore.serverUrl}/toggle_live_patch`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ client_id: this.clientCore.clientId, character: this.clientCore.activeCharacter, enabled: e.target.checked })
+                });
+            } catch (err) { console.error(err); }
+        });
 
         // Tab Bar
         const tabBar = container.createDiv({ cls: "dm-tab-bar" });

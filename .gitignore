@@ -17,3 +17,6 @@ __pycache__/
 # Engine & State Locks
 tasks/active_locks.json
 *.lock
+
+# Environment Variables
+.env

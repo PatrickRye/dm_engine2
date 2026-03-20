@@ -6,7 +6,7 @@ on:
 
 jobs:
   plan:
-    if: github.event.label.name == 'status: backlog'
+    if: "github.event.label.name == 'status: backlog'"
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -23,7 +23,7 @@ jobs:
           cache: 'pip'
 
       - name: Install Dependencies
-        run: pip install langchain-google-genai langchain-core langgraph PyGithub
+        run: pip install -r requirements.txt
 
       - name: Run Planner Agent
         env:

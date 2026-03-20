@@ -14,6 +14,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.exceptions import RequestValidationError
+from filelock import FileLock
+
+from dotenv import dotenv_values
+
+# Load non-default env variables
+env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(env_path):
+    defaults = {"your_gemini_api_key_here", "github_pat_your_token_here", "owner/repo_name"}
+    for k, v in dotenv_values(env_path).items():
+        if v and v not in defaults:
+            os.environ[k] = v
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_LOCK_FILE = os.path.join(BASE_DIR, "repo_operation.lock")
 
 from pydantic import BaseModel, Field
 import uvicorn
@@ -368,14 +382,17 @@ async def qa_node(state: DMState, config: RunnableConfig):
     # --- QA INTERCEPT: QA takes over and asks the player directly ---
     if getattr(result, "requires_clarification", False):
         await write_audit_log(vault, "QA Agent", "Clarification Intercept", result.clarification_message)
-        qa_logger.info("Clarification required from player.", extra={
-            "agent_id": "QA_Agent",
-            "context": {
-                "character": state.get("active_character"),
-                "vault_path": vault,
-                "clarification_message": result.clarification_message
-            }
-        })
+        qa_logger.info(
+            "Clarification required from player.",
+            extra={
+                "agent_id": "QA_Agent",
+                "context": {
+                    "character": state.get("active_character"),
+                    "vault_path": vault,
+                    "clarification_message": result.clarification_message,
+                },
+            },
+        )
         final_msg = f"**[OOC - Engine Supervisor]:** {result.clarification_message}"
         return {
             "draft_response": final_msg,
@@ -385,27 +402,29 @@ async def qa_node(state: DMState, config: RunnableConfig):
 
     elif result.approved:
         await write_audit_log(vault, "QA Agent", "Result", "APPROVED")
-        qa_logger.info("Draft approved.", extra={
-            "agent_id": "QA_Agent",
-            "context": {
-                "character": state.get("active_character"),
-                "vault_path": vault,
-                "revisions_used": revisions
-            }
-        })
+        qa_logger.info(
+            "Draft approved.",
+            extra={
+                "agent_id": "QA_Agent",
+                "context": {"character": state.get("active_character"), "vault_path": vault, "revisions_used": revisions},
+            },
+        )
         return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
 
     else:
         await write_audit_log(vault, "QA Agent", "Result", f"REJECTED. Feedback: {result.feedback}")
-        qa_logger.warning("Rule inconsistency detected. Draft rejected.", extra={
-            "agent_id": "QA_Agent",
-            "context": {
-                "character": state.get("active_character"),
-                "vault_path": vault,
-                "feedback": result.feedback, 
-                "revision_count": revisions + 1
-            }
-        })
+        qa_logger.warning(
+            "Rule inconsistency detected. Draft rejected.",
+            extra={
+                "agent_id": "QA_Agent",
+                "context": {
+                    "character": state.get("active_character"),
+                    "vault_path": vault,
+                    "feedback": result.feedback,
+                    "revision_count": revisions + 1,
+                },
+            },
+        )
 
         return {"qa_feedback": result.feedback, "revision_count": revisions + 1}
 
@@ -431,10 +450,10 @@ async def lifespan(app: FastAPI):
     qa_process = None
 
     def is_qa_running():
-        for p in psutil.process_iter(['cmdline']):
+        for p in psutil.process_iter(["cmdline"]):
             try:
-                cmdline = p.info.get('cmdline') or []
-                if any('bug_reporters.py' in cmd for cmd in cmdline):
+                cmdline = p.info.get("cmdline") or []
+                if any("bug_reporters.py" in cmd for cmd in cmdline):
                     return True
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 pass
@@ -458,17 +477,19 @@ async def lifespan(app: FastAPI):
             p = psutil.Process(os.getpid())
             while True:
                 try:
-                    payload = json.dumps({
-                        "pid": p.pid,
-                        "cpu_percent": p.cpu_percent(),
-                        "mem_mb": p.memory_info().rss / (1024 * 1024),
-                        "timestamp": time.time()
-                    }).encode("utf-8")
+                    payload = json.dumps(
+                        {
+                            "pid": p.pid,
+                            "cpu_percent": p.cpu_percent(),
+                            "mem_mb": p.memory_info().rss / (1024 * 1024),
+                            "timestamp": time.time(),
+                        }
+                    ).encode("utf-8")
                     sock.sendto(payload, ("127.0.0.1", 9999))
                 except Exception:
                     pass
                 await asyncio.sleep(1)
-                
+
         heartbeat_task = asyncio.create_task(heartbeat_emitter())
         print("DM Engine initialized successfully with ReAct architecture.")
         yield
@@ -498,10 +519,10 @@ app.add_middleware(
 # EXCEPTION HANDLERS
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    logger.error("Bad payload received from frontend.", extra={
-        "agent_id": "SYSTEM_API",
-        "context": {"errors": exc.errors(), "body": exc.body, "url": str(request.url)}
-    })
+    logger.error(
+        "Bad payload received from frontend.",
+        extra={"agent_id": "SYSTEM_API", "context": {"errors": exc.errors(), "body": exc.body, "url": str(request.url)}},
+    )
     return JSONResponse(
         status_code=422,
         content={"detail": exc.errors(), "body": exc.body},
@@ -510,10 +531,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled server exception.", extra={
-        "agent_id": "SYSTEM_API",
-        "context": {"url": str(request.url)}
-    })
+    logger.exception("Unhandled server exception.", extra={"agent_id": "SYSTEM_API", "context": {"url": str(request.url)}})
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal Server Error. Check the backend console."},
@@ -523,18 +541,21 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
-    logger.debug(f"Incoming Request: {request.method} {request.url}", extra={
-        "agent_id": "SYSTEM_API",
-        "context": {"method": request.method, "url": str(request.url)}
-    })
+    logger.debug(
+        f"Incoming Request: {request.method} {request.url}",
+        extra={"agent_id": "SYSTEM_API", "context": {"method": request.method, "url": str(request.url)}},
+    )
 
     try:
         response = await call_next(request)
         process_time = time.time() - start_time
-        logger.debug(f"Response: {response.status_code}", extra={
-            "agent_id": "SYSTEM_API",
-            "context": {"status_code": response.status_code, "process_time_s": round(process_time, 2)}
-        })
+        logger.debug(
+            f"Response: {response.status_code}",
+            extra={
+                "agent_id": "SYSTEM_API",
+                "context": {"status_code": response.status_code, "process_time_s": round(process_time, 2)},
+            },
+        )
         return response
     except Exception as e:
         print(f"<--- Server Error: {str(e)}")
@@ -614,6 +635,56 @@ class PingRequest(BaseModel):
     vault_path: str
 
 
+class ToggleLivePatchRequest(BaseModel):
+    client_id: str
+    character: str
+    enabled: bool
+
+
+@app.post("/toggle_live_patch")
+async def toggle_live_patch_endpoint(request: ToggleLivePatchRequest):
+    if request.character != "Human DM":
+        raise HTTPException(status_code=403, detail="Only the DM can toggle Live Patch Mode.")
+
+    mode_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".live_patch_mode")
+    if request.enabled:
+        with open(mode_file, "w") as f:
+            f.write("true")
+    else:
+        if os.path.exists(mode_file):
+            os.remove(mode_file)
+    return {"status": "success", "live_patch_mode": request.enabled}
+
+
+@app.get("/check_updates")
+async def check_updates_endpoint():
+    """Silently checks if the GitHub repository has updates the local machine lacks."""
+    try:
+        subprocess.run(["git", "fetch", "origin", "main"], cwd=BASE_DIR, capture_output=True, timeout=10)
+        local = subprocess.run(["git", "rev-parse", "HEAD"], cwd=BASE_DIR, capture_output=True, text=True).stdout.strip()
+        remote = subprocess.run(
+            ["git", "rev-parse", "origin/main"], cwd=BASE_DIR, capture_output=True, text=True
+        ).stdout.strip()
+        return {"update_available": local != remote and bool(remote)}
+    except Exception as e:
+        return {"update_available": False, "error": str(e)}
+
+
+@app.post("/apply_update")
+async def apply_update_endpoint():
+    """Acquires the repo lock, pulls changes, and relies on Uvicorn to hot-reload."""
+    lock = FileLock(REPO_LOCK_FILE, timeout=60)
+    try:
+        with lock:
+            res = subprocess.run(["git", "pull", "origin", "main"], cwd=BASE_DIR, capture_output=True, text=True, timeout=30)
+            if res.returncode == 0:
+                return {"status": "success", "message": "Update pulled. Server is hot-reloading."}
+            else:
+                return {"status": "error", "message": res.stderr}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ooc_move_entity")
 async def ooc_move_entity_endpoint(request: OOCMoveRequest):
     """OOC wrapper for the DM to drag and drop tokens without triggering combat rules."""
@@ -654,12 +725,15 @@ async def toggle_fow_endpoint(request: ToggleFoWRequest):
     spatial_service.get_map_data(request.vault_path).fow_disabled_for = request.disabled_for
     return {"status": "success", "fow_disabled_for": spatial_service.map_data.fow_disabled_for}
 
+
 @app.post("/sync_vault")
 async def sync_vault_endpoint(request: VaultRequest):
     """Explicit API endpoint for the front-end to trigger hot-reloading."""
     from vault_io import sync_engine_from_vault_updates
+
     res = await sync_engine_from_vault_updates(request.vault_path)
     return {"status": "success", "message": res}
+
 
 @app.post("/clear_path")
 async def clear_path_endpoint(request: ClearPathRequest):
@@ -697,12 +771,12 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
         entity = await _get_entity_by_name(request.entity_name, request.vault_path)
         if not entity:
             raise HTTPException(status_code=404, detail="Entity not found")
-    
+
         from shapely.geometry import box
-    
+
         pixels_per_foot = getattr(spatial_service.get_map_data(request.vault_path), "pixels_per_foot", 1.0)
         foot_waypoints = [(p[0] / pixels_per_foot, p[1] / pixels_per_foot) for p in request.waypoints]
-    
+
         # REQ-GEO-006: Check if final waypoint is occupied
         final_wp = foot_waypoints[-1]
         final_poly = box(
@@ -728,16 +802,16 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                     invalid_reason=f"Cannot end movement in a space occupied by {other_entity.name}.",
                     executed=False,
                 )
-    
+
         if request.entity_name in spatial_service.active_paths.get(request.vault_path, {}):
             del spatial_service.active_paths[request.vault_path][request.entity_name]
-    
+
         is_valid = True
         invalid_reason = ""
         opportunity_attacks = []
         traps_triggered = []
         alternative_path = []
-    
+
         active_list = spatial_service.active_combatants.get(request.vault_path, [])
         is_in_combat = any(c.lower() == request.entity_name.lower() for c in active_list)
         # 0. Enforce Combat Turn Order
@@ -757,13 +831,15 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                             )
             except Exception:
                 pass
-    
+
         # Discretize path into <= 5ft chunks for precise trigger detection
         detailed_path = [foot_waypoints[0]]
         for i in range(1, len(foot_waypoints)):
             start = detailed_path[-1]
             end = foot_waypoints[i]
-            dist = spatial_service.calculate_distance(start[0], start[1], entity.z, end[0], end[1], entity.z, request.vault_path)
+            dist = spatial_service.calculate_distance(
+                start[0], start[1], entity.z, end[0], end[1], entity.z, request.vault_path
+            )
             if dist > 5.0:
                 num_steps = int(dist // 5.0)
                 for s in range(1, num_steps + 1):
@@ -773,28 +849,28 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                         detailed_path.append(midpoint)
             if detailed_path[-1] != end:
                 detailed_path.append(end)
-    
+
         movement_cost = 0.0
         ignores_dt = any(t.lower() == "ignore_difficult_terrain" for t in getattr(entity, "tags", []))
         is_disengaging = any(c.name.lower() == "disengage" for c in getattr(entity, "active_conditions", []))
         all_entities = get_all_entities(request.vault_path)
-    
+
         executed_waypoints = [detailed_path[0]]
         final_x, final_y = detailed_path[0][0], detailed_path[0][1]
-    
+
         for i in range(1, len(detailed_path)):
             start = detailed_path[i - 1]
             end = detailed_path[i]
-    
+
             segment_dist = spatial_service.calculate_distance(
                 start[0], start[1], entity.z, end[0], end[1], entity.z, request.vault_path
             )
             if segment_dist == 0:
                 continue
-    
+
             segment_cost = segment_dist
             path_line = LineString([start, end])
-    
+
             collision = spatial_service.check_path_collision(
                 start[0], start[1], entity.z, end[0], end[1], entity.z, vault_path=request.vault_path
             )
@@ -810,7 +886,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                     (end[0] * pixels_per_foot, end[1] * pixels_per_foot),
                 ]
                 break
-    
+
             # REQ-GEO-007, REQ-GEO-008: Moving through creatures
             for other_entity in all_entities.values():
                 if other_entity.entity_uuid == entity.entity_uuid:
@@ -823,11 +899,11 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                     other_entity.x + other_entity.size / 2,
                     other_entity.y + other_entity.size / 2,
                 )
-    
+
                 if path_line.intersects(o_poly):
                     is_entity_pc = any(t in entity.tags for t in ["pc", "player", "party_npc"])
                     is_other_pc = any(t in other_entity.tags for t in ["pc", "player", "party_npc"])
-    
+
                     def size_cat(size: float, tags: list):
                         tags_lower = [t.lower() for t in tags]
                         if "tiny" in tags_lower:
@@ -849,25 +925,27 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                         if size <= 15.0:
                             return 5  # Huge
                         return 6
-    
+
                     cat_e = size_cat(entity.size, getattr(entity, "tags", []))
                     cat_o = size_cat(other_entity.size, getattr(other_entity, "tags", []))
-    
+
                     if is_entity_pc != is_other_pc and abs(cat_e - cat_o) < 2:
                         is_valid = False
-                        invalid_reason = f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
+                        invalid_reason = (
+                            f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
+                        )
                         break
                     else:
                         segment_cost += segment_dist * (o_poly.intersection(path_line).length / path_line.length)
-    
+
             if not is_valid and not request.force_execute:
                 break
-    
+
             if not ignores_dt:
                 for terrain in spatial_service.get_map_data(request.vault_path).active_terrain:
                     if getattr(terrain, "is_difficult", False):
                         from shapely.geometry import Polygon
-    
+
                         try:
                             poly = Polygon(terrain.points)
                             if path_line.intersects(poly):
@@ -876,7 +954,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                                     segment_cost += segment_dist * (intersection.length / path_line.length)
                         except Exception:
                             pass
-    
+
             if hasattr(entity, "movement_remaining") and is_in_combat:
                 projected_cost = movement_cost + segment_cost
                 truncated_cost = int(projected_cost * 100) / 100.0
@@ -887,7 +965,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                         f"Movement cost ({movement_cost:.1f} ft) exceeds remaining speed ({entity.movement_remaining} ft)."
                     )
                     break
-    
+
             # Check Known Traps
             trap_hit = None
             for wall in spatial_service.get_map_data(request.vault_path).active_walls:
@@ -905,7 +983,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                 traps_triggered.append(trap_hit)
                 if not request.force_execute:
                     break
-    
+
             # Check OAs
             oa_hit = False
             for other_entity in all_entities.values():
@@ -916,10 +994,10 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                 ):
                     if is_disengaging and "ignores_disengage" not in getattr(other_entity, "tags", []):
                         continue
-    
+
                     base_reach = _calculate_reach(other_entity, is_active_turn=False)
                     eff_reach = base_reach + max(0, (other_entity.size - 5.0) / 2.0) + max(0, (entity.size - 5.0) / 2.0)
-    
+
                     dist_before = spatial_service.calculate_distance(
                         start[0], start[1], 0, other_entity.x, other_entity.y, 0, request.vault_path
                     )
@@ -931,27 +1009,27 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                         opportunity_attacks.append(other_entity.name)
             if oa_hit and not request.force_execute:
                 break
-    
+
             movement_cost += segment_cost
             executed_waypoints.append(end)
             final_x, final_y = end[0], end[1]
-    
+
             # Break here to enforce resolving attacks/traps natively before continuing!
             if oa_hit or trap_hit:
                 break
-    
+
         executed = False
         if is_valid and len(executed_waypoints) > 1:
             if request.force_execute or (not opportunity_attacks and not traps_triggered):
                 config = {"configurable": {"thread_id": request.vault_path}}
-    
+
                 points_to_execute = []
                 for fw in foot_waypoints[1:]:
                     if fw in executed_waypoints:
                         points_to_execute.append(fw)
                 if executed_waypoints[-1] not in points_to_execute:
                     points_to_execute.append(executed_waypoints[-1])
-    
+
                 for point in points_to_execute:
                     await move_entity.ainvoke(
                         {
@@ -962,9 +1040,9 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                         },
                         config=config,
                     )
-    
+
                 executed = True
-    
+
         if not executed:
             spatial_service.active_paths.setdefault(request.vault_path, {})[request.entity_name] = {
                 "entity_name": request.entity_name,
@@ -972,7 +1050,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                 "alternative_path": alternative_path,
                 "is_valid": is_valid,
             }
-    
+
         return ProposeMoveResponse(
             is_valid=is_valid,
             opportunity_attacks=list(set(opportunity_attacks)),
@@ -1245,15 +1323,15 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
             try:
                 # 1. Initialize Deterministic Engine
                 await initialize_engine_from_vault(request.vault_path)
-    
+
                 # Yield an initial status
                 yield f"data: {json.dumps({'reply': '*(Thinking...)*\\n\\n', 'status': 'streaming'})}\n\n"
-    
+
                 # 2. Run the graph with astream_events to catch token-by-token streams
                 async for event in dm_engine_app.astream_events(initial_state, config=config, version="v2"):
                     kind = event["event"]
                     node_name = event.get("metadata", {}).get("langgraph_node")
-    
+
                     # A. Stream Narrator Tokens Live
                     if kind == "on_chat_model_stream" and node_name == "narrator":
                         chunk = event["data"]["chunk"].content
@@ -1261,7 +1339,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                             payload = f"data: {json.dumps({'reply': chunk, 'status': 'streaming'})}\n\n"
                             yield payload
                             await broadcaster.broadcast(request.client_id, payload)
-    
+
                     # B. Expose Engine Tools so players see the math happening
                     elif kind == "on_tool_start":
                         tool_name = event.get("name", "tool")
@@ -1270,7 +1348,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                             payload = f"data: {json.dumps({'reply': msg, 'status': 'streaming'})}\n\n"
                             yield payload
                             await broadcaster.broadcast(request.client_id, payload)
-    
+
                     # C. Intercept QA Rejections
                     elif kind == "on_chain_end" and node_name == "qa":
                         qa_out = event["data"].get("output", {})
@@ -1288,22 +1366,25 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                                 payload = f"data: {json.dumps({'reply': msg, 'status': 'streaming'})}\n\n"
                                 yield payload
                                 await broadcaster.broadcast(request.client_id, payload)
-    
+
                 # 3. Save combat math back to Obsidian files
                 await sync_engine_to_vault(request.vault_path)
                 payload = f"data: {json.dumps({'reply': '', 'status': 'done'})}\n\n"
                 yield payload
                 await broadcaster.broadcast(request.client_id, payload)
-    
+
             except Exception as e:
-                logger.exception("Fatal error during supervisor execution.", extra={
-                    "agent_id": "SUPERVISOR",
-                    "context": {
-                        "client_id": request.client_id,
-                        "character": request.character, 
-                        "vault_path": request.vault_path
-                    }
-                })
+                logger.exception(
+                    "Fatal error during supervisor execution.",
+                    extra={
+                        "agent_id": "SUPERVISOR",
+                        "context": {
+                            "client_id": request.client_id,
+                            "character": request.character,
+                            "vault_path": request.vault_path,
+                        },
+                    },
+                )
                 payload = f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {str(e)}', 'status': 'error'})}\n\n"
                 yield payload
                 await broadcaster.broadcast(request.client_id, payload)
@@ -1313,4 +1394,5 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Passing the app as an import string with reload=True enables Uvicorn's native hot-patching.
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, app_dir=os.path.dirname(__file__))
