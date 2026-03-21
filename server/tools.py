@@ -40,17 +40,26 @@ from item_system import WeaponItem, ArmorItem, WondrousItem, ItemCompendium
 from registry import get_all_entities, register_entity, get_entity
 
 
+_MAX_CACHED_VAULTS = 5  # Evict oldest vault when this many are in memory
+
+
 class VaultCache:
     def __init__(self):
         self.bestiary_cache = {}  # vault_path -> [ (filename, content) ]
         self.chunk_cache = {}  # vault_path -> category -> [ (filename, chunk) ]
-        self.indexed_vaults = set()
+        self.indexed_vaults = []  # ordered list; front = oldest, back = most-recently indexed
+
+    def _evict_oldest(self):
+        while len(self.indexed_vaults) >= _MAX_CACHED_VAULTS:
+            oldest = self.indexed_vaults.pop(0)
+            self.bestiary_cache.pop(oldest, None)
+            self.chunk_cache.pop(oldest, None)
 
     def build_index(self, vault_path: str, force: bool = False):
         if vault_path in self.indexed_vaults and not force:
             return
         if force:
-            self.indexed_vaults.discard(vault_path)
+            self.indexed_vaults = [v for v in self.indexed_vaults if v != vault_path]
 
         self.bestiary_cache[vault_path] = []
         self.chunk_cache[vault_path] = {"rules": [], "modules": [], "bestiary": []}
@@ -81,7 +90,8 @@ class VaultCache:
 
                             except Exception:
                                 pass
-        self.indexed_vaults.add(vault_path)
+        self._evict_oldest()
+        self.indexed_vaults.append(vault_path)
 
 
 _VAULT_CACHE = VaultCache()
@@ -438,7 +448,7 @@ async def execute_melee_attack(
         },
     )
 
-    result = EventBus.dispatch(event)
+    result = await EventBus.adispatch(event)
 
     base_msg = ""
     if result.payload.get("hit"):
@@ -562,7 +572,7 @@ async def modify_health(
             )
 
         if target.hp.base_value <= 0 and target.concentrating_on:
-            EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid))
+            await EventBus.adispatch(GameEvent(event_type="DropConcentration", source_uuid=target.entity_uuid))
             result_msg += (
                 f"\nSYSTEM ALERT: {target.name} dropped to 0 HP and lost concentration " f"on '{target.concentrating_on}'."
             )
@@ -2030,7 +2040,7 @@ async def advance_time(
         event = GameEvent(
             event_type="AdvanceTime", source_uuid=uuid.uuid4(), payload={"seconds_advanced": total_seconds_advanced}
         )
-        EventBus.dispatch(event)
+        await EventBus.adispatch(event)
 
     return f"Success: Time advanced. It is now Day {new_day}, {new_time_str}."
 
@@ -2122,7 +2132,7 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
     if first_ent and hasattr(first_ent, "speed"):
         first_ent.movement_remaining = max(0, first_ent.speed - (getattr(first_ent, "exhaustion_level", 0) * 5))
         sot_event = GameEvent(event_type="StartOfTurn", source_uuid=first_ent.entity_uuid, vault_path=vault_path)
-        EventBus.dispatch(sot_event)
+        await EventBus.adispatch(sot_event)
         if "results" in sot_event.payload and sot_event.payload["results"]:
             return f"Combat started! {combatants[0]['name']} goes first.\n" + "\n".join(sot_event.payload["results"])
 
@@ -2190,7 +2200,7 @@ async def update_combat_state(  # noqa: C901
                         source_uuid=current_ent.entity_uuid,
                         vault_path=vault_path,
                     )
-                    EventBus.dispatch(eot_event)
+                    await EventBus.adispatch(eot_event)
                     if "results" in eot_event.payload and eot_event.payload["results"]:
                         log_msg.extend(eot_event.payload["results"])
 
@@ -2223,7 +2233,7 @@ async def update_combat_state(  # noqa: C901
                     source_uuid=new_turn_ent.entity_uuid,
                     vault_path=vault_path,
                 )
-                EventBus.dispatch(sot_event)
+                await EventBus.adispatch(sot_event)
                 if "results" in sot_event.payload and sot_event.payload["results"]:
                     log_msg.extend(sot_event.payload["results"])
     except Exception as e:
@@ -2236,7 +2246,7 @@ async def update_combat_state(  # noqa: C901
         event = GameEvent(
             event_type="AdvanceTime", source_uuid=uuid.uuid4(), payload={"seconds_advanced": 6, "target_initiative": new_init}
         )
-        EventBus.dispatch(event)
+        await EventBus.adispatch(event)
 
     return " | ".join(log_msg) if log_msg else "Combat updated."
 
@@ -2370,7 +2380,7 @@ async def move_entity(  # noqa: C901
             "ignore_budget": not in_combat,
         },
     )
-    result = EventBus.dispatch(event)
+    result = await EventBus.adispatch(event)
 
     if result.status == EventStatus.CANCELLED:
         error_msg = result.payload.get("error", "Movement cancelled by rules engine.")
@@ -3022,7 +3032,7 @@ async def use_ability_or_spell(  # noqa: C901
         },
     )
 
-    result = EventBus.dispatch(event)
+    result = await EventBus.adispatch(event)
 
     results_list = result.payload.get("results", [])
 
@@ -3265,7 +3275,7 @@ async def take_rest(character_names: list[str], rest_type: str, *, config: Annot
             vault_path=config["configurable"].get("thread_id"),
             payload={"rest_type": rest_type.lower(), "target_uuids": uuids},
         )
-        EventBus.dispatch(event)
+        await EventBus.adispatch(event)
 
     return (
         f"MECHANICAL TRUTH: {', '.join(character_names)} completed a {rest_type} rest. "
@@ -3287,7 +3297,7 @@ async def drop_concentration(character_name: str, *, config: Annotated[RunnableC
     spell_name = entity.concentrating_on
 
     event = GameEvent(event_type="DropConcentration", source_uuid=entity.entity_uuid, vault_path=vault_path)
-    EventBus.dispatch(event)
+    await EventBus.adispatch(event)
 
     return (
         f"MECHANICAL TRUTH: {entity.name} dropped concentration on {spell_name}. " "All associated effects have been cleared."
@@ -3318,7 +3328,7 @@ async def ready_action(
 
                 entity.spell_slots_expended_this_turn += 1
                 if entity.concentrating_on:
-                    EventBus.dispatch(
+                    await EventBus.adispatch(
                         GameEvent(event_type="DropConcentration", source_uuid=entity.entity_uuid, vault_path=vault_path)
                     )
 
@@ -3618,7 +3628,7 @@ async def trigger_environmental_hazard(
         },
     )
 
-    result = EventBus.dispatch(event)
+    result = await EventBus.adispatch(event)
     BaseGameEntity.remove(trap_source.entity_uuid)
 
     results_list = result.payload.get("results", [])
@@ -3875,7 +3885,7 @@ async def toggle_condition(  # noqa: C901
 
             incap_conds = {"incapacitated", "stunned", "paralyzed", "petrified", "unconscious", "dead"}
             if condition_name.lower() in incap_conds and engine_creature.concentrating_on:
-                EventBus.dispatch(
+                await EventBus.adispatch(
                     GameEvent(event_type="DropConcentration", source_uuid=engine_creature.entity_uuid, vault_path=vault_path)
                 )
                 alerts.append(f"\nSYSTEM ALERT: {character_name} lost concentration because they are {condition_name}.")

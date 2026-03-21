@@ -1,4 +1,25 @@
-const { requestUrl, ItemView, Plugin, Notice, MarkdownRenderer } = require('obsidian');
+let requestUrl, ItemView, Plugin, Notice, MarkdownRenderer;
+if (typeof require !== "undefined") {
+    try {
+        const obsidian = require('obsidian');
+        requestUrl = obsidian.requestUrl;
+        ItemView = obsidian.ItemView;
+        Plugin = obsidian.Plugin;
+        Notice = obsidian.Notice;
+        MarkdownRenderer = obsidian.MarkdownRenderer;
+    } catch (e) { }
+}
+if (!ItemView) {
+    ItemView = class { };
+    Plugin = class { };
+    Notice = class { constructor(msg) { console.log("Notice:", msg); alert(msg); } };
+    MarkdownRenderer = {
+        renderMarkdown: async (text, el) => {
+            if (typeof marked !== "undefined") el.innerHTML = marked.parse(text);
+            else el.innerHTML = `<p>${text}</p>`;
+        }
+    };
+}
 
 const VIEW_TYPE_DM_CHAT = "dm-chat-view";
 
@@ -37,6 +58,31 @@ class DMEngineClientCore {
         if (this.platform === "obsidian") {
             this.serverUrl = window.localStorage.getItem("dm_server_url") || "http://127.0.0.1:8000";
             this.vaultPath = this.view.app.vault.adapter.getBasePath();
+        } else if (this.platform === "web") {
+            this.serverUrl = window.localStorage.getItem("dm_server_url_web") || "http://127.0.0.1:8000";
+            this.vaultPath = window.localStorage.getItem("dm_vault_path") || "";
+        }
+
+        // Polyfill Obsidian's custom DOM helpers for the generic web browser
+        if (this.platform === "web") {
+            if (typeof HTMLElement !== "undefined" && !HTMLElement.prototype.createEl) {
+                HTMLElement.prototype.empty = function () { this.innerHTML = ""; };
+                HTMLElement.prototype.createEl = function (tag, opt) {
+                    const el = document.createElement(tag);
+                    if (opt) {
+                        if (opt.cls) el.className = opt.cls;
+                        if (opt.text) el.textContent = opt.text;
+                        if (opt.type) el.type = opt.type;
+                        if (opt.value) el.value = opt.value;
+                        if (opt.name) el.name = opt.name;
+                        if (opt.margin) el.style.margin = opt.margin;
+                    }
+                    this.appendChild(el);
+                    return el;
+                };
+                HTMLElement.prototype.createDiv = function (opt) { return this.createEl('div', opt); };
+                HTMLElement.prototype.createSpan = function (opt) { return this.createEl('span', opt); };
+            }
         }
     }
 
@@ -143,7 +189,8 @@ class DMEngineClientCore {
                 this.setConnectionStatus(false);
             }
         } catch (e) {
-            // Silently fail if server is down during heartbeat to prevent spamming errors
+            // Fail silently in the UI to prevent spamming, but log to console for debugging
+            console.warn("DM Engine Heartbeat failed to connect:", e.message);
             this.setConnectionStatus(false);
         }
     }
@@ -157,6 +204,21 @@ class DMEngineClientCore {
             this.view.ui.statusIndicator.textContent = "🔴 Disconnected";
             this.view.ui.statusIndicator.style.color = "var(--text-error, #dc3545)";
         }
+    }
+
+    async fetchCharacters() {
+        if (this.platform === "obsidian") return; // Handled dynamically via local plugin access
+        try {
+            const res = await fetch(`${this.serverUrl}/characters`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ vault_path: this.vaultPath })
+            });
+            if (res.ok) {
+                const data = await res.json();
+                this.availableCharacters = new Set(data.characters || ["Human DM"]);
+                this.renderCharacterRadios([], this.availableCharacters);
+            }
+        } catch (e) { console.error("Failed to fetch characters:", e); }
     }
 
     async fetchCharacterSheet() {
@@ -1048,6 +1110,8 @@ class DMEngineClientCore {
                     }
                 }
             }
+        } else if (this.platform === "web") {
+            this.availableCharacters.forEach(c => chars.add(c));
         }
 
         const existingRadios = Array.from(this.view.ui.charSelect.querySelectorAll('input[type="radio"]'));
@@ -1096,6 +1160,8 @@ class DMEngineClientCore {
                     }
                 }
             }
+        } else if (this.platform === "web") {
+            chars = this.availableCharacters;
         }
 
         if (!chars.has(this.activeCharacter)) {
@@ -1480,32 +1546,34 @@ What do you do? (Shift+Enter for new line)`;
     }
 }
 
-module.exports = class DMEnginePlugin extends Plugin {
-    async onload() {
-        this.registerView(VIEW_TYPE_DM_CHAT, (leaf) => new DMChatView(leaf));
-        this.addRibbonIcon('dice', 'Open DM Engine', () => this.activateView());
-        this.addCommand({
-            id: 'open-dm-chat',
-            name: 'Open DM Chat',
-            callback: () => this.activateView()
-        });
-    }
-
-    async onunload() {
-        this.app.workspace.detachLeavesOfType(VIEW_TYPE_DM_CHAT);
-    }
-
-    async activateView() {
-        const { workspace } = this.app;
-        let leaf = null;
-        const leaves = workspace.getLeavesOfType(VIEW_TYPE_DM_CHAT);
-
-        if (leaves.length > 0) {
-            leaf = leaves[0];
-        } else {
-            leaf = workspace.getRightLeaf(false);
-            if (leaf) await leaf.setViewState({ type: VIEW_TYPE_DM_CHAT, active: true });
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = class DMEnginePlugin extends Plugin {
+        async onload() {
+            this.registerView(VIEW_TYPE_DM_CHAT, (leaf) => new DMChatView(leaf));
+            this.addRibbonIcon('dice', 'Open DM Engine', () => this.activateView());
+            this.addCommand({
+                id: 'open-dm-chat',
+                name: 'Open DM Chat',
+                callback: () => this.activateView()
+            });
         }
-        if (leaf) workspace.revealLeaf(leaf);
+
+        async onunload() {
+            this.app.workspace.detachLeavesOfType(VIEW_TYPE_DM_CHAT);
+        }
+
+        async activateView() {
+            const { workspace } = this.app;
+            let leaf = null;
+            const leaves = workspace.getLeavesOfType(VIEW_TYPE_DM_CHAT);
+
+            if (leaves.length > 0) {
+                leaf = leaves[0];
+            } else {
+                leaf = workspace.getRightLeaf(false);
+                if (leaf) await leaf.setViewState({ type: VIEW_TYPE_DM_CHAT, active: true });
+            }
+            if (leaf) workspace.revealLeaf(leaf);
+        }
     }
 }

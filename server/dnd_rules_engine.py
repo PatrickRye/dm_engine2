@@ -1,6 +1,7 @@
 # AGENT_NOTE: When modifying this file, please use the test framework in `test_dnd_rules_engine.py` to validate your changes.
 # To run the tests, execute `python test_dnd_rules_engine.py` in your terminal.
 
+import asyncio
 import uuid
 import random
 import re
@@ -344,6 +345,12 @@ class EventBus:
         event.status = EventStatus.RESOLVED
         cls._notify(event)
         return event
+
+    @classmethod
+    async def adispatch(cls, event: "GameEvent") -> "GameEvent":
+        """Async-safe dispatch: offloads the synchronous handler chain to a worker thread
+        so it never blocks the asyncio event loop."""
+        return await asyncio.to_thread(cls.dispatch, event)
 
     @classmethod
     def _notify(cls, event: GameEvent):

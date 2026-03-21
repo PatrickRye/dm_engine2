@@ -32,16 +32,18 @@ REPO_LOCK_FILE = os.path.join(BASE_DIR, "repo_operation.lock")
 from pydantic import BaseModel, Field
 import uvicorn
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langgraph.prebuilt import tools_condition
+from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.runnables import RunnableConfig
 
+try:
+    import sqlite3 as _sqlite3
+    from langgraph.checkpoint.sqlite import SqliteSaver as _SqliteSaver
+    _SQLITE_AVAILABLE = True
+except ImportError:
+    _SQLITE_AVAILABLE = False
 from shapely.geometry import LineString
 from dnd_rules_engine import Creature
-from state import DMState, QAResult
+from state import DMState
 from vault_io import (
     write_audit_log,
     initialize_engine_from_vault,
@@ -169,6 +171,7 @@ VAULT_LOCKS = {}
 # MULTIPLAYER LOCKS: Maps character_name -> client_id
 CHARACTER_LOCKS = {}
 LAST_SEEN = {}  # client_id -> timestamp
+CHARACTER_LOCK_MUTEX = asyncio.Lock()  # Serializes mutations to CHARACTER_LOCKS / LAST_SEEN
 
 
 class EventBroadcaster:
@@ -194,253 +197,8 @@ class EventBroadcaster:
 broadcaster = EventBroadcaster()
 
 
-# 5. CODE
-# 5.1. THE PLANNER NODE
-
-# --- REPLACE YOUR EXISTING GRAPH NODES AND BUILDER WITH THIS ---
-
-
-async def planner_node(state: DMState, config: RunnableConfig):
-    sys_msg = SystemMessage(
-        content=(
-            "You are the D&D Tactical Planner. You are invisible to the player.\n"
-            "Your ONLY job is to translate the player's intent into Tool Calls.\n\n"
-            "TOOL ROUTING GUIDE:\n"
-            "1. MELEE WEAPONS: Always use `execute_melee_attack`. Never roll manually.\n"
-            "2. SPELLS & CLASS FEATURES: Always use `use_ability_or_spell`. Never roll manually. If the player "
-            "specifies an Area of Effect (AoE) with coordinates, pass `target_x`, `target_y`, `aoe_shape`, and "
-            "`aoe_size` to let the engine automatically resolve line-of-sight, calculate exact hits, and damage walls.\n"
-            "3. SKILL CHECKS & SAVES: Use `perform_ability_check_or_save` for jumping, sneaking, perception, etc.\n"
-            "4. DAMAGE/HEALING: Use `modify_health` for guaranteed/direct damage or healing (e.g., falling, potions).\n"
-            "5. TRAPS & HAZARDS: Always use `trigger_environmental_hazard` for AoE effects, traps, or weather that "
-            "require saving throws or attack rolls.\n"
-            "6. MAP & GEOMETRY: Use `manage_map_geometry` when players interact with physical obstacles.\n"
-            "7. OBJECT INTERACTION: Use `interact_with_object` to natively resolve lockpicking or disarming traps.\n"
-            "8. TRAPPING GEOMETRY: Use `manage_map_trap` to attach a trap to an existing door, wall, or terrain.\n"
-            "9. SKILL CHALLENGES: Use `manage_skill_challenge` to track multi-stage progress clocks.\n"
-            "10. RANDOM LOOT: Use `generate_random_loot` ONLY when improvising homebrew encounters.\n"
-            "11. MAP INGESTION: Use `ingest_battlemap_json` to bulk-load a complete battlemap JSON.\n"
-            "12. EXTREME WEATHER: Use `evaluate_extreme_weather` for resolving exposure to "
-            "extreme heat (>= 100F) or cold (<= 0F).\n"
-            "13. ENVIRONMENT: You can cast spells or cause effects that alter the environment. Use `manage_map_terrain`.\n"
-            "14. SUMMONS: Use `spawn_summon` to spawn creatures or familiars. "
-            "Use `use_ability_or_spell` with `proxy_caster_name` for familiar touch spells.\n\n"
-            "15. RULE DISPUTES: If the player challenges or disputes a mechanical ruling, immediately use `report_rule_challenge` to route it to the offline QA log.\n\n"
-            "MOVEMENT PARADIGMS:\n"
-            "- TRAVEL / TOWN (Out of Combat): Use `move_entity(movement_type='travel')`.\n"
-            "- DUNGEON CRAWL (Out of Combat): Use `move_entity(movement_type='walk')`.\n"
-            "- COMBAT: Use `move_entity(movement_type='walk')`. Strict 5ft grid speeds and Opportunity Attacks apply.\n\n"
-            "If you get a CACHE MISS on a spell or ability, use `query_rulebook` to find the rules, \n"
-            "then `encode_new_compendium_entry` to permanently save it to the engine.\n\n"
-            'Once all tool logic is complete and you have the "MECHANICAL TRUTH", \n'
-            "output a brief summary of the events. DO NOT write dialogue or narrative prose.\n"
-        )
-    )
-    llm_with_tools = draft_llm.bind_tools(MASTER_TOOLS_LIST)
-    response = await llm_with_tools.ainvoke([sys_msg] + state["messages"], config=config)
-    return {"messages": [response]}
-
-
-async def narrator_node(state: DMState, config: RunnableConfig):
-    """The Storyteller. Turns the mechanical truth into vivid prose."""
-
-    # 1. Check if we are in a revision loop
-    feedback_context = ""
-    if state.get("qa_feedback") and state["qa_feedback"] != "APPROVED":
-        feedback_context = (
-            f"\n\n[QA REJECTION FEEDBACK]: Your previous draft was rejected for the following reason:\n"
-            f"{state['qa_feedback']}\n\nYour rejected draft was:\n\"{state.get('draft_response')}\"\n\n"
-            f"Fix this in your new draft."
-        )
-
-    sys_msg = SystemMessage(
-        content=(
-            "You are the Dungeon Master. Read the history of the current interaction.\n"
-            "Look at the 'MECHANICAL TRUTH' outputs generated by the system tools.\n"
-            "Narrate these exact events vividly to the player. \n"
-            "DO NOT change the numbers, damage, or hit/miss outcomes. Do not roll dice.\n"
-            "Output only the narrative response.\n"
-            f"Do not violate player agency or do anything more than add color to an action dialogue. {feedback_context}\n\n"
-            "CRITICAL MULTIPLAYER RULE (PERSPECTIVE): \n"
-            "If characters are in different rooms, or if perception mechanics mean characters observe entirely "
-            "different things, you MUST divide your narrative using HTML tags.\n\n"
-            "Wrap narrative meant for EVERYONE in:\n"
-            '<div class="perspective" data-target="ALL">...</div>\n\n'
-            "Wrap secret or distinct observations meant for a SPECIFIC character in:\n"
-            '<div class="perspective" data-target="CharacterName">...</div>\n\n'
-            'Always default to "ALL" unless a split perspective is mechanically required by the engine\'s truths.\n'
-        )
-    )
-
-    # Invoke WITHOUT tools so it is forced to write a string
-    response = await draft_llm.ainvoke([sys_msg] + state["messages"], config=config)
-    return {"draft_response": response.content}
-
-
-def build_graph():
-    workflow = StateGraph(DMState)
-
-    workflow.add_node("planner", planner_node)
-
-    # ADD YOUR OTHER TOOLS HERE
-    workflow.add_node("action", ToolNode(MASTER_TOOLS_LIST))
-
-    workflow.add_node("narrator", narrator_node)
-    workflow.add_node("qa", qa_node)
-
-    workflow.set_entry_point("planner")
-    workflow.add_conditional_edges("planner", tools_condition, {"tools": "action", "__end__": "narrator"})
-    workflow.add_edge("action", "planner")
-    workflow.add_edge("narrator", "qa")
-    workflow.add_conditional_edges("qa", qa_router)
-
-    return workflow.compile(checkpointer=MemorySaver())
-
-
-async def qa_node(state: DMState, config: RunnableConfig):
-    vault, draft, revisions = state["vault_path"], state["draft_response"], state.get("revision_count", 0)
-
-    # --- ESCAPE CLAUSE 1: Allow DM to ask questions without being audited ---
-    if draft.strip().startswith("[OOC") or draft.strip().startswith("OOC:"):
-        await write_audit_log(vault, "QA Agent", "Bypass", "OOC Clarification detected. Auto-approving.")
-        return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
-
-    # --- ESCAPE CLAUSE 2: Max Revisions ---
-    if revisions >= 3:
-        await write_audit_log(vault, "QA Agent", "Force Approve", "Max revisions reached. Passing to prevent loop.")
-        return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
-
-    # --- GATHER CONTEXT (Tools & Mechanical Truths) ---
-    recent_tools = []
-    mechanical_truths = []
-
-    # Iterate backwards to find everything that happened THIS turn
-    for msg in reversed(state["messages"]):
-        # Stop searching when we hit the player's actual prompt
-        if isinstance(msg, HumanMessage) and not msg.content.startswith("[SYSTEM OVERRIDE"):
-            break
-
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tc in msg.tool_calls:
-                recent_tools.append(f"{tc['name']}({tc.get('args', {})})")
-
-        # NEW: Grab the math results from the deterministic engine!
-        if isinstance(msg, ToolMessage) and "MECHANICAL TRUTH" in msg.content:
-            mechanical_truths.append(msg.content)
-
-    tools_used_str = " | ".join(recent_tools) if recent_tools else "None"
-    truth_str = "\n".join(mechanical_truths) if mechanical_truths else "No combat math was executed this turn."
-
-    await write_audit_log(vault, "QA Agent", "Reviewing Draft", f"Tools audited this turn: {tools_used_str}")
-
-    # --- TONE CHECKING ---
-    try:
-        tone_rules = _get_config_tone(vault)
-    except Exception:
-        tone_rules = ""
-    tone_check = (
-        f"10. TONE & BOUNDARIES: Did the DM violate any of these boundaries: '{tone_rules}'? (If yes, REJECT).\n"
-        if tone_rules
-        else ""
-    )
-
-    # --- THE SUPER-PROMPT (Merged Old + New) ---
-    qa_prompt = (
-        "You are the strict QA Auditor for a D&D game. Review this DM Draft:\n"
-        f"DRAFT: '{draft}'\n"
-        f"TOOLS USED THIS TURN: {tools_used_str}\n"
-        f"ENGINE MECHANICAL TRUTHS:\n{truth_str}\n\n"
-        "RULES COMPLIANCE CHECKLIST:\n"
-        "1. MECHANICAL SYNC: Did the draft contradict the ENGINE MECHANICAL TRUTHS? (If yes, REJECT).\n"
-        "2. PLAYER AGENCY: Did the DM dictate what the player's character thinks or their actions? (If yes, REJECT).\n"
-        "3. DESCRIBE TO ME: Did the DM state factual NPC motives instead of physical sensory details? (If yes, REJECT).\n"
-        "4. META-GAMING: Did the DM leak mechanical stats like exact AC or HP numbers in the narrative? (If yes, REJECT).\n"
-        "5. FAIL FORWARD: If an action failed, did the DM introduce a dead end? (If yes, REJECT).\n"
-        "6. DICE MATH AUDIT: Did the DM hallucinate any dice rolls or damage? (If yes, REJECT).\n"
-        "7. FEATS & MECHANICS: Did the DM ignore a character's active feats or spells? (If yes, REJECT).\n"
-        "8. MAGIC ITEMS & ATTUNEMENT: Did the DM grant/use an item without tracking it? (If yes, REJECT).\n"
-        "9. OBSIDIAN FORMATTING: Did the DM fail to use [[Wikilinks]] for proper nouns? (If yes, REJECT).\n"
-        "10. COMPENDIUM AUDIT: If a feat was unsupported, did the DM notify the human player OOC? (If no, REJECT).\n"
-        "11. PARADIGMS: Did the DM force movement limits out of combat? (If yes, REJECT).\n"
-        "12. CRITICAL FAILURES: If a knowledge check resulted in a [NATURAL 1 - CRITICAL FAILURE],"
-        " did the DM accurately tell the player the truth? (If yes, REJECT. They MUST confidently narrate dangerously wrong facts).\n"
-        + tone_check
-        + "\nIf ANY rule is broken, set 'approved' to False and explain exactly what to rewrite. "
-        "If the DM applied a mechanic incorrectly, do not just tell them it is wrong. "
-        "You MUST provide the details of the game rules needed to fix it."
-    )
-
-    # We use structured output to enforce the QAResult schema
-    qa_chain = qa_llm.with_structured_output(QAResult)
-
-    try:
-        result: QAResult = await qa_chain.ainvoke([HumanMessage(content=qa_prompt)], config=config)
-    except Exception as e:
-        print(f"[QA Agent] Error during structured output parsing: {e}. Auto-approving.")
-        return {"qa_feedback": "APPROVED"}
-
-    # --- QA INTERCEPT: QA takes over and asks the player directly ---
-    if getattr(result, "requires_clarification", False):
-        await write_audit_log(vault, "QA Agent", "Clarification Intercept", result.clarification_message)
-        qa_logger.info(
-            "Clarification required from player.",
-            extra={
-                "agent_id": "QA_Agent",
-                "context": {
-                    "character": state.get("active_character"),
-                    "vault_path": vault,
-                    "clarification_message": result.clarification_message,
-                },
-            },
-        )
-        final_msg = f"**[OOC - Engine Supervisor]:** {result.clarification_message}"
-        return {
-            "draft_response": final_msg,
-            "qa_feedback": "APPROVED",  # Approving it forces the graph to end and output this clarification
-            "messages": [AIMessage(content=final_msg)],
-        }
-
-    elif result.approved:
-        await write_audit_log(vault, "QA Agent", "Result", "APPROVED")
-        qa_logger.info(
-            "Draft approved.",
-            extra={
-                "agent_id": "QA_Agent",
-                "context": {"character": state.get("active_character"), "vault_path": vault, "revisions_used": revisions},
-            },
-        )
-        return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
-
-    else:
-        await write_audit_log(vault, "QA Agent", "Result", f"REJECTED. Feedback: {result.feedback}")
-        qa_logger.warning(
-            "Rule inconsistency detected. Draft rejected.",
-            extra={
-                "agent_id": "QA_Agent",
-                "context": {
-                    "character": state.get("active_character"),
-                    "vault_path": vault,
-                    "feedback": result.feedback,
-                    "revision_count": revisions + 1,
-                },
-            },
-        )
-
-        return {"qa_feedback": result.feedback, "revision_count": revisions + 1}
-
-
-def qa_router(state: DMState) -> str:
-    # If approved, we are done!
-    if state.get("qa_feedback") == "APPROVED":
-        return END
-
-    # Prevent infinite loops. If it fails 3 times, force it to END anyway.
-    if state.get("revision_count", 0) >= 3:
-        print("[QA Agent] - Max revisions reached. Force approving.")
-        return END
-
-    # If rejected and under the limit, send it back to the Narrator to rewrite
-    return "narrator"
+# Graph nodes and build_graph() live in graph.py — imported below.
+from graph import build_graph  # noqa: E402
 
 
 @asynccontextmanager
@@ -448,6 +206,7 @@ async def lifespan(app: FastAPI):
     global dm_engine_app, draft_llm, qa_llm
     heartbeat_task = None
     qa_process = None
+    _checkpoint_conn = None
 
     def is_qa_running():
         for p in psutil.process_iter(["cmdline"]):
@@ -469,8 +228,19 @@ async def lifespan(app: FastAPI):
         draft_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.6)
         qa_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
 
+        # Build checkpointer: prefer SQLite (persistent across restarts) over in-memory
+        if _SQLITE_AVAILABLE:
+            db_path = os.path.join(BASE_DIR, "checkpoints.db")
+            _checkpoint_conn = _sqlite3.connect(db_path, check_same_thread=False)
+            checkpointer = _SqliteSaver(_checkpoint_conn)
+            print(f"Using SqliteSaver checkpoint store at {db_path}")
+        else:
+            checkpointer = MemorySaver()
+            print("WARNING: langgraph-checkpoint-sqlite not installed; using in-memory MemorySaver. "
+                  "Install with: pip install langgraph-checkpoint-sqlite")
+
         # Build and compile the multi-agent graph ONCE when the server boots
-        dm_engine_app = build_graph()
+        dm_engine_app = build_graph(draft_llm, qa_llm, MASTER_TOOLS_LIST, checkpointer=checkpointer)
 
         async def heartbeat_emitter():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -501,6 +271,8 @@ async def lifespan(app: FastAPI):
             heartbeat_task.cancel()
         if qa_process:
             qa_process.terminate()
+        if _checkpoint_conn is not None:
+            _checkpoint_conn.close()
 
 
 # --- 4. YOUR FAST API APP ---
@@ -510,7 +282,7 @@ app = FastAPI(title="AI DM Engine", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -688,34 +460,35 @@ async def apply_update_endpoint():
 @app.post("/ooc_move_entity")
 async def ooc_move_entity_endpoint(request: OOCMoveRequest):
     """OOC wrapper for the DM to drag and drop tokens without triggering combat rules."""
+    vault_lock = VAULT_LOCKS.setdefault(request.vault_path, asyncio.Lock())
+    async with vault_lock:
+        entity = await _get_entity_by_name(request.entity_name, request.vault_path)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
 
-    entity = await _get_entity_by_name(request.entity_name, request.vault_path)
-    if not entity:
-        raise HTTPException(status_code=404, detail="Entity not found")
+        if request.entity_name in spatial_service.active_paths.get(request.vault_path, {}):
+            del spatial_service.active_paths[request.vault_path][request.entity_name]
 
-    if request.entity_name in spatial_service.active_paths.get(request.vault_path, {}):
-        del spatial_service.active_paths[request.vault_path][request.entity_name]
+        entity.x, entity.y = round(request.x, 1), round(request.y, 1)
+        spatial_service.sync_entity(entity)
 
-    entity.x, entity.y = round(request.x, 1), round(request.y, 1)
-    spatial_service.sync_entity(entity)
+        file_path = os.path.join(get_journals_dir(request.vault_path), f"{entity.name}.md")
+        if os.path.exists(file_path):
+            try:
+                async with edit_markdown_entity(file_path) as state:
+                    state["yaml_data"]["x"], state["yaml_data"]["y"] = entity.x, entity.y
+            except Exception:
+                pass
 
-    file_path = os.path.join(get_journals_dir(request.vault_path), f"{entity.name}.md")
-    if os.path.exists(file_path):
-        try:
-            async with edit_markdown_entity(file_path) as state:
-                state["yaml_data"]["x"], state["yaml_data"]["y"] = entity.x, entity.y
-        except Exception:
-            pass
-
-    combat_file = os.path.join(get_journals_dir(request.vault_path), "ACTIVE_COMBAT.md")
-    if os.path.exists(combat_file):
-        try:
-            async with edit_markdown_entity(combat_file) as state:
-                for c in state["yaml_data"].get("combatants", []):
-                    if c.get("name", "").lower() == entity.name.lower():
-                        c["x"], c["y"] = entity.x, entity.y
-        except Exception:
-            pass
+        combat_file = os.path.join(get_journals_dir(request.vault_path), "ACTIVE_COMBAT.md")
+        if os.path.exists(combat_file):
+            try:
+                async with edit_markdown_entity(combat_file) as state:
+                    for c in state["yaml_data"].get("combatants", []):
+                        if c.get("name", "").lower() == entity.name.lower():
+                            c["x"], c["y"] = entity.x, entity.y
+            except Exception:
+                pass
     return {"status": "success", "x": entity.x, "y": entity.y}
 
 
@@ -763,9 +536,7 @@ async def ping_endpoint(request: PingRequest):
 async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
     """Analyzes a proposed movement path for collisions, opportunity attacks, and traps."""
 
-    if request.vault_path not in VAULT_LOCKS:
-        VAULT_LOCKS[request.vault_path] = asyncio.Lock()
-    vault_lock = VAULT_LOCKS[request.vault_path]
+    vault_lock = VAULT_LOCKS.setdefault(request.vault_path, asyncio.Lock())
 
     async with vault_lock:
         entity = await _get_entity_by_name(request.entity_name, request.vault_path)
@@ -1018,50 +789,53 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
             if oa_hit or trap_hit:
                 break
 
-        executed = False
+        # Build the execution plan inside the lock; run the actual tool calls outside it.
+        points_to_execute = []
+        exec_config = None
         if is_valid and len(executed_waypoints) > 1:
             if request.force_execute or (not opportunity_attacks and not traps_triggered):
-                config = {"configurable": {"thread_id": request.vault_path}}
-
-                points_to_execute = []
+                exec_config = {"configurable": {"thread_id": request.vault_path}}
                 for fw in foot_waypoints[1:]:
                     if fw in executed_waypoints:
                         points_to_execute.append(fw)
                 if executed_waypoints[-1] not in points_to_execute:
                     points_to_execute.append(executed_waypoints[-1])
 
-                for point in points_to_execute:
-                    await move_entity.ainvoke(
-                        {
-                            "entity_name": request.entity_name,
-                            "target_x": round(point[0], 2),
-                            "target_y": round(point[1], 2),
-                            "movement_type": "walk",
-                        },
-                        config=config,
-                    )
+    # --- vault_lock released here ---
+    # Execute move_entity outside the lock so the lock is not held during LLM/tool I/O.
+    executed = False
+    if points_to_execute and exec_config:
+        for point in points_to_execute:
+            await move_entity.ainvoke(
+                {
+                    "entity_name": request.entity_name,
+                    "target_x": round(point[0], 2),
+                    "target_y": round(point[1], 2),
+                    "movement_type": "walk",
+                },
+                config=exec_config,
+            )
+        executed = True
 
-                executed = True
+    if not executed:
+        spatial_service.active_paths.setdefault(request.vault_path, {})[request.entity_name] = {
+            "entity_name": request.entity_name,
+            "waypoints": request.waypoints,
+            "alternative_path": alternative_path,
+            "is_valid": is_valid,
+        }
 
-        if not executed:
-            spatial_service.active_paths.setdefault(request.vault_path, {})[request.entity_name] = {
-                "entity_name": request.entity_name,
-                "waypoints": request.waypoints,
-                "alternative_path": alternative_path,
-                "is_valid": is_valid,
-            }
-
-        return ProposeMoveResponse(
-            is_valid=is_valid,
-            opportunity_attacks=list(set(opportunity_attacks)),
-            traps_triggered=list(set(traps_triggered)),
-            alternative_path=alternative_path,
-            movement_cost=movement_cost,
-            invalid_reason=invalid_reason,
-            executed=executed,
-            final_x=final_x * pixels_per_foot,
-            final_y=final_y * pixels_per_foot,
-        )
+    return ProposeMoveResponse(
+        is_valid=is_valid,
+        opportunity_attacks=list(set(opportunity_attacks)),
+        traps_triggered=list(set(traps_triggered)),
+        alternative_path=alternative_path,
+        movement_cost=movement_cost,
+        invalid_reason=invalid_reason,
+        executed=executed,
+        final_x=final_x * pixels_per_foot,
+        final_y=final_y * pixels_per_foot,
+    )
 
 
 @app.post("/characters")
@@ -1118,14 +892,17 @@ async def character_sheet_endpoint(request: CharSheetRequest):
 
 
 @app.get("/vault_media")
-async def vault_media_endpoint(filepath: str):
+async def vault_media_endpoint(filepath: str, vault_path: str = ""):
     """Securely serves local image files from the Obsidian vault to the web client."""
-    if not os.path.exists(filepath):
+    # Resolve to absolute path and reject traversal attempts
+    resolved = os.path.realpath(os.path.normpath(filepath))
+    if vault_path:
+        vault_root = os.path.realpath(vault_path)
+        if not resolved.startswith(vault_root + os.sep) and resolved != vault_root:
+            raise HTTPException(status_code=403, detail="Access denied: path outside vault")
+    if not os.path.isfile(resolved):
         raise HTTPException(status_code=404, detail="File not found")
-    # Basic security check to prevent directory traversal
-    if ".." in filepath:
-        raise HTTPException(status_code=403, detail="Invalid path")
-    return FileResponse(filepath)
+    return FileResponse(resolved)
 
 
 @app.get("/maps")
@@ -1205,39 +982,41 @@ async def map_state_endpoint(request: VaultRequest):
 
 @app.post("/heartbeat")
 async def heartbeat_endpoint(request: HeartbeatRequest):
-    LAST_SEEN[request.client_id] = time.time()
+    async with CHARACTER_LOCK_MUTEX:
+        LAST_SEEN[request.client_id] = time.time()
 
-    # Purge stale clients (no heartbeat for 15 seconds)
-    current_time = time.time()
-    stale_clients = [cid for cid, ts in LAST_SEEN.items() if current_time - ts > 15]
+        # Purge stale clients (no heartbeat for 15 seconds)
+        current_time = time.time()
+        stale_clients = [cid for cid, ts in LAST_SEEN.items() if current_time - ts > 15]
 
-    for cid in stale_clients:
-        del LAST_SEEN[cid]
-        keys_to_del = [k for k, v in CHARACTER_LOCKS.items() if v == cid]
-        for k in keys_to_del:
-            del CHARACTER_LOCKS[k]
+        for cid in stale_clients:
+            del LAST_SEEN[cid]
+            keys_to_del = [k for k, v in CHARACTER_LOCKS.items() if v == cid]
+            for k in keys_to_del:
+                del CHARACTER_LOCKS[k]
 
-    # Reinforce the lock for the current character
-    if request.character != "Human DM":
-        update_roll_automations(request.character, request.roll_automations)
-        if request.character not in CHARACTER_LOCKS or CHARACTER_LOCKS[request.character] == request.client_id:
-            CHARACTER_LOCKS[request.character] = request.client_id
+        # Reinforce the lock for the current character
+        if request.character != "Human DM":
+            update_roll_automations(request.character, request.roll_automations)
+            if request.character not in CHARACTER_LOCKS or CHARACTER_LOCKS[request.character] == request.client_id:
+                CHARACTER_LOCKS[request.character] = request.client_id
 
-    locked_by_others = [k for k, v in CHARACTER_LOCKS.items() if v != request.client_id]
+        locked_by_others = [k for k, v in CHARACTER_LOCKS.items() if v != request.client_id]
     return {"locked_characters": locked_by_others}
 
 
 @app.post("/switch_character")
 async def switch_character_endpoint(request: SwitchRequest):
-    if request.old_character in CHARACTER_LOCKS and CHARACTER_LOCKS[request.old_character] == request.client_id:
-        del CHARACTER_LOCKS[request.old_character]
+    async with CHARACTER_LOCK_MUTEX:
+        if request.old_character in CHARACTER_LOCKS and CHARACTER_LOCKS[request.old_character] == request.client_id:
+            del CHARACTER_LOCKS[request.old_character]
 
-    if request.new_character in CHARACTER_LOCKS and CHARACTER_LOCKS[request.new_character] != request.client_id:
-        raise HTTPException(
-            status_code=403, detail=f"Character '{request.new_character}' is currently controlled by another player."
-        )
+        if request.new_character in CHARACTER_LOCKS and CHARACTER_LOCKS[request.new_character] != request.client_id:
+            raise HTTPException(
+                status_code=403, detail=f"Character '{request.new_character}' is currently controlled by another player."
+            )
 
-    CHARACTER_LOCKS[request.new_character] = request.client_id
+        CHARACTER_LOCKS[request.new_character] = request.client_id
     return {"status": "success"}
 
 
@@ -1272,12 +1051,13 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
         raise HTTPException(status_code=500, detail="DM Engine not initialized.")
 
     # MULTIPLAYER LOCK ENFORCEMENT
-    if request.character in CHARACTER_LOCKS and CHARACTER_LOCKS[request.character] != request.client_id:
-        raise HTTPException(
-            status_code=403,
-            detail=(f"Agency Error: '{request.character}' is currently " "being controlled by another player's connection."),
-        )
-    CHARACTER_LOCKS[request.character] = request.client_id
+    async with CHARACTER_LOCK_MUTEX:
+        if request.character in CHARACTER_LOCKS and CHARACTER_LOCKS[request.character] != request.client_id:
+            raise HTTPException(
+                status_code=403,
+                detail=(f"Agency Error: '{request.character}' is currently " "being controlled by another player's connection."),
+            )
+        CHARACTER_LOCKS[request.character] = request.client_id
 
     if request.character != "Human DM":
         update_roll_automations(request.character, request.roll_automations)
@@ -1313,9 +1093,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
     config = {"configurable": {"thread_id": request.vault_path}}
 
     # Retrieve or create a concurrency lock for this specific campaign vault
-    if request.vault_path not in VAULT_LOCKS:
-        VAULT_LOCKS[request.vault_path] = asyncio.Lock()
-    vault_lock = VAULT_LOCKS[request.vault_path]
+    vault_lock = VAULT_LOCKS.setdefault(request.vault_path, asyncio.Lock())
 
     async def stream_generator():
         # Lock acquired: Protects the Read -> Execute -> Write cycle

@@ -249,7 +249,7 @@ async def initialize_engine_from_vault(vault_path: str):
     await auto_ingest_maps_from_vault(vault_path)
 
     print("Loading core entities into Deterministic Engine...")
-    clear_registry()  # Reset memory for the new turn
+    clear_registry(vault_path)  # Reset memory for this vault only; other active vaults are unaffected
 
     j_dir = get_journals_dir(vault_path)
     if not os.path.exists(j_dir):

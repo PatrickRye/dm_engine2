@@ -8,6 +8,7 @@ from urllib.parse import quote
 import socket
 import json
 import re
+import glob
 from filelock import FileLock
 
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -215,17 +216,29 @@ def run_rules_agent():
             move_to_processed,
         ],
     )
-    while True:
-        state = {
-            "messages": [
-                SystemMessage(content=RULES_PROMPT),
-                HumanMessage(
-                    content="Check 'qa_audits' for unprocessed log files. Process them fully, create tasks, and move them to processed."
-                ),
-            ]
-        }
-        agent.invoke(state)
-        time.sleep(60)
+    try:
+        while True:
+            # Pre-flight check: Only wake the LLM if there are logs to process!
+            logs = glob.glob(os.path.join(LOGS_QA, "*.jsonl"))
+            if not logs:
+                time.sleep(60)
+                continue
+
+            state = {
+                "messages": [
+                    SystemMessage(content=RULES_PROMPT),
+                    HumanMessage(
+                        content="Check 'qa_audits' for unprocessed log files. Process them fully, create tasks, and move them to processed."
+                    ),
+                ]
+            }
+            try:
+                agent.invoke(state)
+            except Exception as e:
+                print(f"[Rules Agent] API Error encountered. Sleeping for 60s. Details: {e}")
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n[Rules Agent] Shutting down gracefully.")
 
 
 def run_system_agent():
@@ -243,17 +256,29 @@ def run_system_agent():
             move_to_processed,
         ],
     )
-    while True:
-        state = {
-            "messages": [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(
-                    content="Check 'active' for unprocessed log files. Process them fully, extract Python Exceptions/ERRORs into BUG tasks, and move them to processed."
-                ),
-            ]
-        }
-        agent.invoke(state)
-        time.sleep(60)
+    try:
+        while True:
+            # Pre-flight check: Only wake the LLM if there are logs to process!
+            logs = glob.glob(os.path.join(LOGS_ACTIVE, "*.jsonl"))
+            if not logs:
+                time.sleep(60)
+                continue
+
+            state = {
+                "messages": [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(
+                        content="Check 'active' for unprocessed log files. Process them fully, extract Python Exceptions/ERRORs into BUG tasks, and move them to processed."
+                    ),
+                ]
+            }
+            try:
+                agent.invoke(state)
+            except Exception as e:
+                print(f"[System Agent] API Error encountered. Sleeping for 60s. Details: {e}")
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n[System Agent] Shutting down gracefully.")
 
 
 def run_server_monitor():
@@ -265,41 +290,46 @@ def run_server_monitor():
     server_was_alive = False
     last_resource_alert = 0
 
-    while True:
-        try:
-            data, addr = sock.recvfrom(1024)
-            payload = json.loads(data.decode("utf-8"))
-            server_was_alive = True
+    try:
+        while True:
+            try:
+                data, addr = sock.recvfrom(1024)
+                payload = json.loads(data.decode("utf-8"))
+                server_was_alive = True
 
-            cpu = payload.get("cpu_percent", 0)
-            mem = payload.get("mem_mb", 0)
+                cpu = payload.get("cpu_percent", 0)
+                mem = payload.get("mem_mb", 0)
 
-            # Alert on high usage (throttle to once every 5 minutes so it doesn't flood inbox)
-            now = time.time()
-            if (cpu > 90.0 or mem > 1024.0) and (now - last_resource_alert > 300):
-                print(f"[System Monitor] Alerted on high resource usage: CPU {cpu}%, Mem {mem:.1f}MB")
-                create_github_issue.invoke(
-                    {
-                        "title": "High Resource Usage Detected",
-                        "body": f"Server PID {payload.get('pid')} is currently using {cpu}% CPU and {mem:.1f} MB RAM.\n\n**Requirements:**\n- Investigate memory leaks\n- Profile CPU usage",
-                        "labels": ["bug", "high-priority", "system"],
-                    }
-                )
-                last_resource_alert = now
+                # Alert on high usage (throttle to once every 5 minutes so it doesn't flood inbox)
+                now = time.time()
+                if (cpu > 90.0 or mem > 1024.0) and (now - last_resource_alert > 300):
+                    print(f"[System Monitor] Alerted on high resource usage: CPU {cpu}%, Mem {mem:.1f}MB")
+                    create_github_issue.invoke(
+                        {
+                            "title": "High Resource Usage Detected",
+                            "body": f"Server PID {payload.get('pid')} is currently using {cpu}% CPU and {mem:.1f} MB RAM.\n\n**Requirements:**\n- Investigate memory leaks\n- Profile CPU usage",
+                            "labels": ["bug", "high-priority", "system"],
+                        }
+                    )
+                    last_resource_alert = now
 
-        except socket.timeout:
-            if server_was_alive:
-                print("[System Monitor] CRITICAL: Server heartbeat lost! Possible crash.")
-                create_github_issue.invoke(
-                    {
-                        "title": "Server Crash Detected",
-                        "body": "The FastAPI server stopped emitting UDP heartbeats for over 5 seconds. It has likely crashed.\n\n**Requirements:**\n- Check active logs for exceptions\n- Restart the server process",
-                        "labels": ["bug", "critical", "system"],
-                    }
-                )
-                server_was_alive = False  # Reset so we don't spam crash reports endlessly
-        except Exception:
-            time.sleep(1)  # Prevent tight loop on malformed data
+            except socket.timeout:
+                if server_was_alive:
+                    print("[System Monitor] CRITICAL: Server heartbeat lost! Possible crash.")
+                    create_github_issue.invoke(
+                        {
+                            "title": "Server Crash Detected",
+                            "body": "The FastAPI server stopped emitting UDP heartbeats for over 5 seconds. It has likely crashed.\n\n**Requirements:**\n- Check active logs for exceptions\n- Restart the server process",
+                            "labels": ["bug", "critical", "system"],
+                        }
+                    )
+                    server_was_alive = False  # Reset so we don't spam crash reports endlessly
+            except Exception:
+                time.sleep(1)  # Prevent tight loop on malformed data
+    except KeyboardInterrupt:
+        print("\n[System Monitor] Shutting down gracefully.")
+    finally:
+        sock.close()
 
 
 if __name__ == "__main__":

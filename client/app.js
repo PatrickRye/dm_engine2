@@ -1,5 +1,5 @@
 const ui = {
-  status: document.getElementById("status-indicator"),
+  statusIndicator: document.getElementById("status-indicator"),
   vaultInput: document.getElementById("vault-path-input"),
   connectBtn: document.getElementById("connect-btn"),
   listenCheck: document.getElementById("listen-checkbox"),
@@ -17,7 +17,7 @@ const ui = {
   viewMaps: document.getElementById("view-maps"),
 };
 
-const clientCore = new DMEngineClientCore(ui, "web");
+const clientCore = new DMEngineClientCore({ ui: ui, viewSheet: ui.viewSheet, viewMaps: ui.viewMaps }, "web");
 
 // Initialization
 ui.vaultInput.value = clientCore.vaultPath;
@@ -27,14 +27,29 @@ clientCore.updatePerspectiveStyles();
 ui.connectBtn.addEventListener("click", async () => {
   clientCore.vaultPath = ui.vaultInput.value.trim();
   localStorage.setItem("dm_vault_path", clientCore.vaultPath);
-  await clientCore.fetchCharacters();
-  if (!clientCore.pollInterval) {
-    clientCore.pollInterval = setInterval(() => clientCore.syncState(), 5000);
-    clientCore.syncState();
+  clientCore.serverUrl = ui.serverUrlInput.value.trim().replace(/\/+$/, "");
+  localStorage.setItem("dm_server_url_web", clientCore.serverUrl);
+
+  try {
+    // Test the connection immediately
+    const res = await fetch(`${clientCore.serverUrl}/characters`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vault_path: clientCore.vaultPath })
+    });
+    if (!res.ok) throw new Error("Server returned " + res.status);
+
+    await clientCore.fetchCharacters();
+    if (!clientCore.pollInterval) {
+      clientCore.pollInterval = setInterval(() => clientCore.syncState(), 5000);
+      clientCore.syncState();
+    }
+    ui.chatInput.disabled = false;
+    ui.sendBtn.disabled = false;
+    clientCore.appendMessage("System", `Connected to Vault: ${clientCore.vaultPath}`);
+  } catch (e) {
+    alert("Failed to connect to server at " + clientCore.serverUrl + "\n\nCheck the browser console (F12) for details.");
+    console.error("Connection error:", e);
   }
-  ui.chatInput.disabled = false;
-  ui.sendBtn.disabled = false;
-  clientCore.appendMessage("System", `Connected to Vault: ${clientCore.vaultPath}`);
 });
 
 ui.listenCheck.addEventListener("change", (e) => {

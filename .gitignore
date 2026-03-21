@@ -20,3 +20,4 @@ tasks/active_locks.json
 
 # Environment Variables
 .env
+.gitnexus
