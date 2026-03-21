@@ -1,0 +1,126 @@
+# DM Engine — GitLab CI Pipeline
+#
+# Agent jobs are triggered via the GitLab pipeline trigger API with AGENT_ROLE set.
+# Example webhook → trigger call:
+#   curl -X POST "$CI_API_V4_URL/projects/$CI_PROJECT_ID/trigger/pipeline" \
+#        -F "token=$PIPELINE_TRIGGER_TOKEN" \
+#        -F "ref=main" \
+#        -F "variables[AGENT_ROLE]=triager" \
+#        -F "variables[ISSUE_NUMBER]=42" \
+#        -F "variables[ISSUE_TITLE]=Bug title" \
+#        -F "variables[ISSUE_BODY]=Bug description"
+#
+# Required CI/CD secrets (set in GitLab → Settings → CI/CD → Variables):
+#   GEMINI_API_KEY          — Google Gemini API key
+#   GITLAB_TOKEN            — GitLab PAT with api + write_repository scopes
+#   PIPELINE_TRIGGER_TOKEN  — Token for programmatic pipeline triggers
+#
+# Auto-injected by GitLab (no action needed):
+#   CI_PROJECT_PATH, CI_DEFAULT_BRANCH, CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+
+variables:
+  REPO_PLATFORM: "gitlab"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+
+default:
+  image: python:3.11-slim
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths:
+      - .pip-cache/
+  before_script:
+    - pip install --quiet -r requirements.txt
+
+stages:
+  - triage
+  - plan
+  - test
+  - review
+  - bugs
+
+
+# ---------------------------------------------------------------------------
+# Triager — fires when a new issue is created/labeled (webhook → trigger)
+# ---------------------------------------------------------------------------
+triager:
+  stage: triage
+  rules:
+    - if: '$AGENT_ROLE == "triager"'
+  variables:
+    ISSUE_NUMBER: $ISSUE_NUMBER
+    ISSUE_TITLE: $ISSUE_TITLE
+    ISSUE_BODY: $ISSUE_BODY
+  script:
+    - cd qa && python triager_agent.py
+
+
+# ---------------------------------------------------------------------------
+# Planner — fires when an issue is labeled 'status: backlog' (webhook → trigger)
+# ---------------------------------------------------------------------------
+planner:
+  stage: plan
+  rules:
+    - if: '$AGENT_ROLE == "planner"'
+  variables:
+    ISSUE_NUMBER: $ISSUE_NUMBER
+    ISSUE_TITLE: $ISSUE_TITLE
+    ISSUE_BODY: $ISSUE_BODY
+  script:
+    - cd qa && python planner_agent.py
+
+
+# ---------------------------------------------------------------------------
+# Tests — runs automatically on every MR
+# ---------------------------------------------------------------------------
+test:
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - pip install --quiet pytest pytest-asyncio
+    - pytest test/server/ -v --tb=short
+  artifacts:
+    when: always
+    reports:
+      junit: test-results.xml
+    expire_in: 7 days
+
+
+# ---------------------------------------------------------------------------
+# Reviewer — runs after tests on MR pipelines; handles both pass and fail
+# ---------------------------------------------------------------------------
+reviewer-pass:
+  stage: review
+  needs: [test]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+  variables:
+    TARGET_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+    TEST_CONCLUSION: "success"
+  script:
+    - cd qa && python reviewer_agent.py
+
+reviewer-fail:
+  stage: review
+  needs: [test]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_failure
+  variables:
+    TARGET_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+    TEST_CONCLUSION: "failure"
+  script:
+    - cd qa && python reviewer_agent.py
+
+
+# ---------------------------------------------------------------------------
+# Bug Reporters — runs on schedule OR via explicit trigger
+# ---------------------------------------------------------------------------
+bug-reporters:
+  stage: bugs
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$AGENT_ROLE == "bugs"'
+  script:
+    - cd qa && python bug_reporters.py

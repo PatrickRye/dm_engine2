@@ -1,7 +1,8 @@
 import uuid
 import math
-from typing import List, Tuple, Dict, Optional, Protocol
-from pydantic import BaseModel, Field
+from collections import OrderedDict
+from typing import Any, List, Tuple, Dict, Optional, Protocol
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class SpatialObject(Protocol):
@@ -15,6 +16,7 @@ class SpatialObject(Protocol):
 
 try:
     from shapely.geometry import Point, LineString, Polygon, box
+    from shapely.ops import unary_union
     from rtree import index
 
     HAS_GIS = True
@@ -86,11 +88,18 @@ class TerrainZone(BaseModel):
     duration_seconds: int = -1
     applied_initiative: int = 0
 
+    # Cached Shapely geometry — points are immutable after creation
+    _cached_polygon: Any = PrivateAttr(default=None)
+
+    def model_post_init(self, __context: Any) -> None:
+        if HAS_GIS and len(self.points) >= 3:
+            self._cached_polygon = Polygon(self.points)
+
     @property
     def polygon(self):
         if not HAS_GIS or len(self.points) < 3:
             return None
-        return Polygon(self.points)
+        return self._cached_polygon
 
 
 class LightSource(BaseModel):
@@ -154,14 +163,22 @@ class SpatialQueryService:
             self.entity_idx: Dict[str, index.Index] = {}
             self.wall_idx: Dict[str, index.Index] = {}
             self.terrain_idx: Dict[str, index.Index] = {}
+            self.light_idx: Dict[str, index.Index] = {}  # R-tree for static (non-attached) lights
             self._entities: Dict[str, Dict[uuid.UUID, SpatialObject]] = {}
             self._uuid_to_id: Dict[str, Dict[uuid.UUID, int]] = {}
             self._id_to_uuid: Dict[str, Dict[int, uuid.UUID]] = {}
             self._uuid_to_bbox: Dict[str, Dict[uuid.UUID, Tuple[float, float, float, float]]] = {}
+            self._uuid_to_shape: Dict[str, Dict[uuid.UUID, Any]] = {}  # Cached Shapely boxes per entity
             self._wall_map: Dict[str, Dict[int, Wall]] = {}
             self._terrain_map: Dict[str, Dict[int, TerrainZone]] = {}
+            self._light_map: Dict[str, Dict[int, LightSource]] = {}  # R-tree id -> LightSource
             self._next_id: Dict[str, int] = {}
-            self._raycast_cache: Dict[str, Dict[Tuple, any]] = {}
+            # OrderedDict preserves insertion order for FIFO eviction (evict oldest 20% at limit)
+            self._raycast_cache: Dict[str, OrderedDict] = {}
+            # Cached unary_union of ground-level difficult terrain for fast path-cost queries
+            self._terrain_union_cache: Dict[str, Any] = {}
+            # Per-entity list of terrain zones currently occupied (updated in sync_entity)
+            self._entity_terrain_occupancy: Dict[str, Dict[uuid.UUID, List[TerrainZone]]] = {}
 
     @property
     def map_data(self) -> MapData:
@@ -183,14 +200,19 @@ class SpatialQueryService:
                 self.entity_idx[vault_path] = index.Index(properties=p)
                 self.wall_idx[vault_path] = index.Index(properties=p)
                 self.terrain_idx[vault_path] = index.Index(properties=p)
+                self.light_idx[vault_path] = index.Index(properties=p)
                 self._entities[vault_path] = {}
                 self._uuid_to_id[vault_path] = {}
                 self._id_to_uuid[vault_path] = {}
                 self._uuid_to_bbox[vault_path] = {}
+                self._uuid_to_shape[vault_path] = {}
                 self._wall_map[vault_path] = {}
                 self._terrain_map[vault_path] = {}
+                self._light_map[vault_path] = {}
                 self._next_id[vault_path] = 0
-                self._raycast_cache[vault_path] = {}
+                self._raycast_cache[vault_path] = OrderedDict()
+                self._terrain_union_cache[vault_path] = None
+                self._entity_terrain_occupancy[vault_path] = {}
         return self._map_data[vault_path]
 
     def clear(self, vault_path: str = None):  # noqa: C901
@@ -203,28 +225,15 @@ class SpatialQueryService:
             if vault_path in self.active_combatants:
                 del self.active_combatants[vault_path]
             if HAS_GIS:
-                if vault_path in self.entity_idx:
-                    del self.entity_idx[vault_path]
-                if vault_path in self.wall_idx:
-                    del self.wall_idx[vault_path]
-                if vault_path in self.terrain_idx:
-                    del self.terrain_idx[vault_path]
-                if vault_path in self._entities:
-                    del self._entities[vault_path]
-                if vault_path in self._uuid_to_id:
-                    del self._uuid_to_id[vault_path]
-                if vault_path in self._id_to_uuid:
-                    del self._id_to_uuid[vault_path]
-                if vault_path in self._uuid_to_bbox:
-                    del self._uuid_to_bbox[vault_path]
-                if vault_path in self._wall_map:
-                    del self._wall_map[vault_path]
-                if vault_path in self._terrain_map:
-                    del self._terrain_map[vault_path]
-                if vault_path in self._next_id:
-                    del self._next_id[vault_path]
-                if vault_path in self._raycast_cache:
-                    del self._raycast_cache[vault_path]
+                for d in (
+                    self.entity_idx, self.wall_idx, self.terrain_idx, self.light_idx,
+                    self._entities, self._uuid_to_id, self._id_to_uuid,
+                    self._uuid_to_bbox, self._uuid_to_shape,
+                    self._wall_map, self._terrain_map, self._light_map,
+                    self._next_id, self._raycast_cache,
+                    self._terrain_union_cache, self._entity_terrain_occupancy,
+                ):
+                    d.pop(vault_path, None)
         else:
             self._map_data.clear()
             self.active_paths.clear()
@@ -233,14 +242,19 @@ class SpatialQueryService:
                 self.entity_idx.clear()
                 self.wall_idx.clear()
                 self.terrain_idx.clear()
+                self.light_idx.clear()
                 self._entities.clear()
                 self._uuid_to_id.clear()
                 self._id_to_uuid.clear()
                 self._uuid_to_bbox.clear()
+                self._uuid_to_shape.clear()
                 self._wall_map.clear()
                 self._terrain_map.clear()
+                self._light_map.clear()
                 self._next_id.clear()
                 self._raycast_cache.clear()
+                self._terrain_union_cache.clear()
+                self._entity_terrain_occupancy.clear()
 
     def get_wall_by_id(self, wall_id: uuid.UUID, vault_path: str = "default") -> Optional[Wall]:
         """Retrieves a specific wall object from the active layers."""
@@ -267,30 +281,55 @@ class SpatialQueryService:
         md.explored_areas.append((qx, qy, qr))
 
     def _rebuild_indices(self, vault_path: str = "default"):
-        """Rebuilds the R-tree indices for static map geometry (Walls & Terrain)."""
+        """Rebuilds all R-tree indices and derived caches when map geometry changes."""
         if not HAS_GIS:
             return
-        self.get_map_data(vault_path)
+        md = self.get_map_data(vault_path)
         p = index.Property()
+
+        # --- Walls ---
         self.wall_idx[vault_path] = index.Index(properties=p)
         self._wall_map[vault_path].clear()
-        for i, w in enumerate(self.get_map_data(vault_path).active_walls):
+        for i, w in enumerate(md.active_walls):
             if w.line:
                 self.wall_idx[vault_path].insert(i, w.line.bounds)
                 self._wall_map[vault_path][i] = w
 
+        # --- Terrain ---
         self.terrain_idx[vault_path] = index.Index(properties=p)
         self._terrain_map[vault_path].clear()
-        for i, t in enumerate(self.get_map_data(vault_path).active_terrain):
+        ground_difficult_polys = []
+        for i, t in enumerate(md.active_terrain):
             if t.polygon:
                 self.terrain_idx[vault_path].insert(i, t.polygon.bounds)
                 self._terrain_map[vault_path][i] = t
+                # Collect ground-level difficult terrain for the union cache
+                if t.is_difficult and t.z <= 0.1 and t.height <= 1.0:
+                    ground_difficult_polys.append(t.polygon)
+
+        # Pre-compute terrain union for flat (ground-level) path cost queries
+        self._terrain_union_cache[vault_path] = (
+            unary_union(ground_difficult_polys) if ground_difficult_polys else None
+        )
+
+        # --- Static Lights (non-entity-attached) ---
+        self.light_idx[vault_path] = index.Index(properties=p)
+        self._light_map[vault_path].clear()
+        for i, light in enumerate(md.active_lights):
+            if not light.attached_to_entity_uuid:
+                r = light.dim_radius
+                self.light_idx[vault_path].insert(i, (light.x - r, light.y - r, light.x + r, light.y + r))
+                self._light_map[vault_path][i] = light
+
+        # Invalidate caches that depend on geometry
+        self._raycast_cache.setdefault(vault_path, OrderedDict()).clear()
+        # Entity-terrain occupancy is now stale — will be refreshed on next sync_entity calls
+        self._entity_terrain_occupancy.setdefault(vault_path, {}).clear()
 
     def invalidate_cache(self, vault_path: str = "default"):
         """Clears the raycast cache and rebuilds spatial geometry indices when map geometry changes."""
         if HAS_GIS:
             self.get_map_data(vault_path)
-            self._raycast_cache.setdefault(vault_path, {}).clear()
             self._rebuild_indices(vault_path)
 
     def add_wall(self, wall: Wall, is_temporary: bool = False, vault_path: str = "default"):
@@ -378,6 +417,7 @@ class SpatialQueryService:
 
         self._entities[vp][entity.entity_uuid] = entity
         new_bbox = self._get_bbox(entity)
+        new_shape = box(*new_bbox)
 
         if entity.entity_uuid not in self._uuid_to_id[vp]:
             curr_id = self._next_id[vp]
@@ -392,6 +432,17 @@ class SpatialQueryService:
 
         self.entity_idx[vp].insert(curr_id, new_bbox)
         self._uuid_to_bbox[vp][entity.entity_uuid] = new_bbox
+        self._uuid_to_shape[vp][entity.entity_uuid] = new_shape  # Cache Shapely box
+
+        # Update terrain occupancy — which zones is this entity currently standing in?
+        if vp in self.terrain_idx and self._terrain_map.get(vp):
+            zone_candidates = list(self.terrain_idx[vp].intersection(new_bbox))
+            occupying = []
+            for cid in zone_candidates:
+                zone = self._terrain_map[vp].get(cid)
+                if zone and zone.polygon and new_shape.intersects(zone.polygon):
+                    occupying.append(zone)
+            self._entity_terrain_occupancy[vp][entity.entity_uuid] = occupying
 
     def remove_entity(self, entity_uuid: uuid.UUID, vault_path: str = "default"):
         """Removes an entity from the spatial index."""
@@ -406,8 +457,14 @@ class SpatialQueryService:
         del self._id_to_uuid[vp][curr_id]
         del self._uuid_to_id[vp][entity_uuid]
         del self._uuid_to_bbox[vp][entity_uuid]
+        self._uuid_to_shape[vp].pop(entity_uuid, None)
+        self._entity_terrain_occupancy.get(vp, {}).pop(entity_uuid, None)
         if entity_uuid in self._entities[vp]:
             del self._entities[vp][entity_uuid]
+
+    def get_entity_terrain_zones(self, entity_uuid: uuid.UUID, vault_path: str = "default") -> List[TerrainZone]:
+        """Returns the list of terrain zones the entity is currently occupying (O(1) lookup)."""
+        return self._entity_terrain_occupancy.get(vault_path, {}).get(entity_uuid, [])
 
     def calculate_distance(
         self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float, vault_path: str = "default"
@@ -426,8 +483,14 @@ class SpatialQueryService:
         return (entity.x - half_size, entity.y - half_size, entity.x + half_size, entity.y + half_size)
 
     def _get_entity_bbox(self, entity: SpatialObject):
+        """Returns a cached Shapely box for the entity, or constructs one on first access."""
         if not HAS_GIS:
             return None
+        vp = getattr(entity, "vault_path", "default") or "default"
+        cached = self._uuid_to_shape.get(vp, {}).get(entity.entity_uuid)
+        if cached is not None:
+            return cached
+        # Fallback for entities not yet synced (e.g., during construction)
         return box(*self._get_bbox(entity))
 
     def _get_entity_spatial_hash(self, entity: SpatialObject) -> Tuple:
@@ -440,10 +503,16 @@ class SpatialQueryService:
             round(getattr(entity, "height", 5.0), 1),
         )
 
-    def _cache_set(self, vault_path: str, key: Tuple, value: any):
-        cache = self._raycast_cache.setdefault(vault_path, {})
-        if len(cache) > 10000:
-            cache.clear()  # Fast clear if memory bounds are exceeded
+    def _cache_set(self, vault_path: str, key: Tuple, value: Any):
+        cache = self._raycast_cache.setdefault(vault_path, OrderedDict())
+        if len(cache) >= 10000:
+            # Evict oldest 20% to keep hot entries warm rather than clearing everything
+            evict_count = 2000
+            for _ in range(evict_count):
+                try:
+                    cache.popitem(last=False)
+                except KeyError:
+                    break
         cache[key] = value
 
     def get_targets_in_radius(
@@ -462,18 +531,13 @@ class SpatialQueryService:
         candidate_ids = list(self.entity_idx[vault_path].intersection(search_area.bounds))
 
         hit_uuids = []
-        origin_z = 0.0  # Default flat if not specified
         for cid in candidate_ids:
             ent_uuid = self._id_to_uuid[vault_path][cid]
             entity = self._entities[vault_path].get(ent_uuid)
             if entity:
-                ent_poly = self._get_entity_bbox(entity)
-                if search_area.intersects(ent_poly):
-                    if (
-                        self.calculate_distance(entity.x, entity.y, entity.z, origin_x, origin_y, origin_z, vault_path)
-                        <= radius
-                    ):
-                        hit_uuids.append(ent_uuid)
+                # search_area is already the exact shape (circle or square), so intersects() is sufficient
+                if search_area.intersects(self._get_entity_bbox(entity)):
+                    hit_uuids.append(ent_uuid)
 
         return hit_uuids
 
@@ -510,8 +574,7 @@ class SpatialQueryService:
             ent_uuid = self._id_to_uuid[vault_path][cid]
             entity = self._entities[vault_path].get(ent_uuid)
             if entity:
-                ent_poly = self._get_entity_bbox(entity)
-                if cone_poly.intersects(ent_poly):
+                if cone_poly.intersects(self._get_entity_bbox(entity)):
                     hit_uuids.append(ent_uuid)
 
         return hit_uuids
@@ -593,12 +656,14 @@ class SpatialQueryService:
             ent_uuid = self._id_to_uuid[vault_path][cid]
             entity = self._entities[vault_path].get(ent_uuid)
             if entity and aoe_poly.intersects(self._get_entity_bbox(entity)):
+                # Hoist height to avoid repeated getattr calls
+                ent_height = getattr(entity, "height", 5.0)
                 ent_min_z = entity.z
-                ent_max_z = entity.z + getattr(entity, "height", 5.0)
+                ent_max_z = entity.z + ent_height
+                ent_center_z = entity.z + (ent_height / 2.0)
 
                 is_hit = True
                 if shape == "sphere":
-                    ent_center_z = entity.z + (getattr(entity, "height", 5.0) / 2.0)
                     dist = self.calculate_distance(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z, vault_path)
                     if dist - (entity.size / 2.0) > size:
                         is_hit = False
@@ -615,7 +680,6 @@ class SpatialQueryService:
                     if ent_max_z < min_cyl_z or ent_min_z > max_cyl_z:
                         is_hit = False
                 elif shape == "cone":
-                    ent_center_z = entity.z + (getattr(entity, "height", 5.0) / 2.0)
                     dist = self.calculate_distance(origin_x, origin_y, origin_z, entity.x, entity.y, ent_center_z, vault_path)
                     if dist - (entity.size / 2.0) > size:
                         is_hit = False
@@ -629,7 +693,6 @@ class SpatialQueryService:
                             if cos_theta < 0.85:
                                 is_hit = False
                 elif shape == "line":
-                    ent_center_z = entity.z + (getattr(entity, "height", 5.0) / 2.0)
                     ax, ay, az = origin_x, origin_y, origin_z
                     bx, by, bz = origin_x + vx * size, origin_y + vy * size, origin_z + vz * size
                     ex, ey, ez = entity.x, entity.y, ent_center_z
@@ -649,7 +712,6 @@ class SpatialQueryService:
                         is_hit = False
 
                 if is_hit:
-                    ent_center_z = entity.z + (getattr(entity, "height", 5.0) / 2.0)
                     if ignore_walls:
                         hit_entities.append(ent_uuid)
                     else:
@@ -727,19 +789,23 @@ class SpatialQueryService:
                 wall_candidates = list(self.wall_idx[vault_path].intersection(line.bounds))
                 for cid in wall_candidates:
                     wall = self._wall_map[vault_path][cid]
-                    if wall.is_solid and line.intersects(wall.line):
-                        inter = line.intersection(wall.line)
-                        if inter.is_empty:
-                            continue
-                        if line.length > 0:
-                            fraction = Point(s_corner).distance(inter) / line.length
-                        else:
-                            fraction = 0.0
+                    if not wall.is_solid:
+                        continue
+                    # Use intersection() directly — avoids the redundant intersects() pre-check
+                    inter = line.intersection(wall.line)
+                    if inter.is_empty:
+                        continue
+                    if line.length > 0:
+                        # math.hypot avoids allocating a Shapely Point just for distance
+                        frac_dist = math.hypot(inter.x - s_corner[0], inter.y - s_corner[1])
+                        fraction = frac_dist / line.length
+                    else:
+                        fraction = 0.0
 
-                        ray_z = s_z + fraction * (t_z - s_z)
-                        if wall.z <= ray_z <= wall.z + wall.height:
-                            blocked = True
-                            break
+                    ray_z = s_z + fraction * (t_z - s_z)
+                    if wall.z <= ray_z <= wall.z + wall.height:
+                        blocked = True
+                        break
                 if not blocked:
                     visible_corners += 1
 
@@ -780,8 +846,7 @@ class SpatialQueryService:
             e_obj = self._entities[vault_path][e_uuid]
             if getattr(e_obj, "hp", None) and e_obj.hp.base_value <= 0:
                 continue
-            e_poly = self._get_entity_bbox(e_obj)
-            if path.intersects(e_poly):
+            if path.intersects(self._get_entity_bbox(e_obj)):
                 interveners.append(e_uuid)
         return interveners
 
@@ -814,20 +879,24 @@ class SpatialQueryService:
         min_z = min(start_z, end_z)
         max_z = max(start_z, end_z)
 
-        difficult_polys = []
-        terrain_candidates = list(self.terrain_idx[vault_path].intersection(path.bounds))
-        for cid in terrain_candidates:
-            zone = self._terrain_map[vault_path][cid]
-            if zone.is_difficult and (max_z >= zone.z and min_z <= zone.z + max(zone.height, 0.1)):
-                if zone.polygon:
-                    difficult_polys.append(zone.polygon)
+        # Fast path: use pre-built terrain union for flat ground-level movement (covers ~99% of calls)
+        is_flat_path = min_z <= 0.1 and max_z <= 5.0
+        cached_union = self._terrain_union_cache.get(vault_path)
+        if is_flat_path and cached_union is not None:
+            union_poly = cached_union
+        else:
+            # Elevated or non-standard path: build union from per-z-filtered candidates
+            terrain_candidates = list(self.terrain_idx[vault_path].intersection(path.bounds))
+            difficult_polys = []
+            for cid in terrain_candidates:
+                zone = self._terrain_map[vault_path][cid]
+                if zone.is_difficult and (max_z >= zone.z and min_z <= zone.z + max(zone.height, 0.1)):
+                    if zone.polygon:
+                        difficult_polys.append(zone.polygon)
+            if not difficult_polys:
+                return total_distance, 0.0
+            union_poly = unary_union(difficult_polys)
 
-        if not difficult_polys:
-            return total_distance, 0.0
-
-        from shapely.ops import unary_union
-
-        union_poly = unary_union(difficult_polys)
         intersection = path.intersection(union_poly)
 
         difficult_distance = 0.0
@@ -912,21 +981,26 @@ class SpatialQueryService:
 
         md = self.get_map_data(vault_path)
         highest_illum = "darkness"
+
         for light in md.active_lights:
-            lx, ly, lz = light.x, light.y, light.z
+            # Resolve light position: entity-attached follows entity, static uses own coords
             if light.attached_to_entity_uuid:
                 ent = self._entities.get(vault_path, {}).get(light.attached_to_entity_uuid)
-                if ent:
-                    lx, ly, lz = ent.x, ent.y, ent.z
-
+                if not ent:
+                    continue
+                lx, ly, lz = ent.x, ent.y, ent.z
+            else:
+                lx, ly, lz = light.x, light.y, light.z
             dist = self.calculate_distance(lx, ly, lz, target_x, target_y, target_z, vault_path)
             if dist <= light.dim_radius:
                 if not self.check_path_collision(
-                    lx, ly, lz, target_x, target_y, target_z, entity_height=0.1, check_vision=True, vault_path=vault_path
+                    lx, ly, lz, target_x, target_y, target_z,
+                    entity_height=0.1, check_vision=True, vault_path=vault_path,
                 ):
                     if dist <= light.bright_radius:
                         return "bright"
                     highest_illum = "dim"
+
         return highest_illum
 
     def has_line_of_sight_to_point(

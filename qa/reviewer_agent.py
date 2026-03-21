@@ -1,15 +1,10 @@
 import os
-import asyncio
+import sys
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
-from github import Auth, Github
-
-# MCP Imports
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from langchain_mcp_adapters.tools import load_mcp_tools
 
 from dotenv import dotenv_values
 
@@ -21,103 +16,107 @@ if os.path.exists(env_path):
         if v and v not in defaults:
             os.environ[k] = v
 
-
-def _get_repo():
-    token = os.environ.get("GITHUB_PAT")
-    # GitHub Actions automatically injects GITHUB_REPOSITORY
-    repo_name = os.environ.get("GITHUB_REPO", os.environ.get("GITHUB_REPOSITORY"))
-    if not token or not repo_name:
-        raise ValueError("GITHUB_PAT or GITHUB_REPO/GITHUB_REPOSITORY env variables are missing.")
-    return Github(auth=Auth.Token(token)).get_repo(repo_name)
+from repo_client import get_repo_client
 
 
 @tool
 def get_pr_by_branch(branch_name: str) -> str:
-    """Finds the open Pull Request associated with a specific branch."""
+    """Finds the open PR/MR for a branch and returns its diff, body, and linked issue number."""
     try:
-        repo = _get_repo()
-        # Assumes branches are pushed to the same repository
-        prs = repo.get_pulls(state="open", head=f"{repo.owner.login}:{branch_name}")
-        if prs.totalCount == 0:
+        client = get_repo_client()
+        mrs = client.list_open_mrs(source_branch=branch_name)
+        if not mrs:
             return f"No open PR found for branch {branch_name}."
-        pr = prs[0]
-
-        issue_num = "Unknown"
-        if "ISSUE-" in branch_name:
-            issue_num = branch_name.split("ISSUE-")[1]
-
-        return f"PR Number: {pr.number}\nTitle: {pr.title}\nBody: {pr.body}\nLinked Issue: #{issue_num}"
+        mr_detail = client.get_mr(mrs[0]["number"])
+        issue_num = branch_name.split("ISSUE-")[1] if "ISSUE-" in branch_name else "Unknown"
+        return (
+            f"PR Number: {mr_detail['number']}\n"
+            f"Title: {mr_detail['title']}\n"
+            f"Body: {mr_detail['body']}\n"
+            f"Linked Issue: #{issue_num}\n"
+            f"Mergeable: {mr_detail['mergeable']}\n\n"
+            f"Diff:\n{mr_detail['diff']}"
+        )
     except Exception as e:
         return f"Error finding PR: {e}"
 
 
 @tool
-def update_issue_status(issue_number: int, new_label: str, comment: str = "") -> str:
-    """Updates the status label on the original GitHub issue and adds an optional comment."""
+def get_file_from_branch(filepath: str, branch: str) -> str:
+    """Reads the contents of a file from a specific branch for deeper review context."""
     try:
-        repo = _get_repo()
-        issue = repo.get_issue(number=issue_number)
-        current_labels = [l.name for l in issue.labels if not l.name.startswith("status:")]
-        issue.set_labels(*(current_labels + [new_label]))
+        return get_repo_client().get_file_contents(filepath, branch=branch)
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+
+@tool
+def merge_pull_request(mr_number: int, commit_message: str = "") -> str:
+    """Merges an approved pull request into the default branch."""
+    try:
+        success = get_repo_client().merge_mr(mr_number, message=commit_message)
+        return f"PR #{mr_number} merged successfully." if success else f"Failed to merge PR #{mr_number}."
+    except Exception as e:
+        return f"Error merging PR: {e}"
+
+
+@tool
+def update_issue_status(issue_number: int, new_label: str, comment: str = "") -> str:
+    """Updates the status label on the original issue and adds an optional comment."""
+    try:
+        client = get_repo_client()
+        client.set_status_label(issue_number, new_label)
         if comment:
-            issue.create_comment(comment)
+            client.post_comment(issue_number, comment)
         return f"Issue #{issue_number} updated to '{new_label}'."
     except Exception as e:
         return f"Error updating issue: {e}"
 
 
 REVIEWER_PROMPT = """
-Role: You are the Reviewer Agent, acting as a strict Senior Software Engineer. Your job is to audit GitHub Pull Requests, validate CI test results, and merge compliant code into the main branch. 
+Role: You are the Reviewer Agent, acting as a strict Senior Software Engineer. Your job is to audit Pull Requests, validate CI test results, and merge compliant code into the main branch.
 You trust the Triager and Planner for scoping and categorizing; your focus is purely on execution completeness, consistency, and code quality.
 
 Allowed Actions:
-1. Use `get_pr_by_branch` to find the PR number and linked issue for the tested branch.
-2. Read PR diffs and resolve conflicts using GitHub MCP tools (`get_pull_request`, `get_file_contents`, `push_files`).
-3. Merge or reject PRs via the MCP `merge_pull_request` tool.
-4. Update the original issue using `update_issue_status`.
+1. Use `get_pr_by_branch` to find the PR number, linked issue, and full diff for the tested branch.
+2. Use `get_file_from_branch` to read specific files from the PR branch if you need deeper context.
+3. Use `merge_pull_request` to merge an approved PR.
+4. Use `update_issue_status` to update the original issue label and leave feedback comments.
 
 Execution Rules:
 - You are reviewing the branch `{TARGET_BRANCH}`. The automated test suite result is: `{TEST_CONCLUSION}`.
-- If `TEST_CONCLUSION` is 'failure': 
-  * DO NOT merge. 
+- If `TEST_CONCLUSION` is 'failure':
+  * DO NOT merge.
   * Use `update_issue_status` to add a comment detailing the test failure, and change the label to `status: backlog`.
 - If `TEST_CONCLUSION` is 'success':
-  * Use `get_pull_request` via MCP to read the diff.
+  * Use `get_pr_by_branch` to read the diff.
   * Verify the task requirements (as defined in the linked issue) were completely and consistently executed.
   * Verify the code strictly aligns with the requirements without scope creep.
   * Enforce clean code, good software architecture, and extensible design patterns.
   * Verify that the test suite was updated consistently with the new requirements/logic.
-  * If approved, use `merge_pull_request` via MCP. Then use `update_issue_status` to change the issue label to `status: archived` (which signals it's complete).
+  * If approved, use `merge_pull_request`. Then use `update_issue_status` to change the issue label to `status: archived`.
   * If unapproved, reject the merge and use `update_issue_status` to send it back to `status: backlog` with detailed rejection feedback explaining the missing tests, poor architecture, or incomplete execution.
 """
 
 
-async def main():
+def main():
     target_branch = os.environ.get("TARGET_BRANCH", "")
     test_conclusion = os.environ.get("TEST_CONCLUSION", "unknown")
     if not target_branch:
         print("No TARGET_BRANCH provided. Exiting.")
-        return
+        sys.exit(1)
 
     print(f"Reviewing Branch: {target_branch} (Tests: {test_conclusion})")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0)
-    local_tools = [get_pr_by_branch, update_issue_status]
+    tools = [get_pr_by_branch, get_file_from_branch, merge_pull_request, update_issue_status]
     prompt = REVIEWER_PROMPT.replace("{TARGET_BRANCH}", target_branch).replace("{TEST_CONCLUSION}", test_conclusion)
 
-    server_params = StdioServerParameters(
-        command="npx",
-        args=["-y", "@modelcontextprotocol/server-github"],
-        env={**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": os.environ.get("GITHUB_PAT", "")},
+    agent = create_react_agent(llm, tools)
+    agent.invoke(
+        {"messages": [SystemMessage(content=prompt), HumanMessage(content="Begin your review process.")]},
+        {"recursion_limit": 20},
     )
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            mcp_tools = await load_mcp_tools(session)
-            agent = create_react_agent(llm, local_tools + mcp_tools)
-            await agent.ainvoke(
-                {"messages": [SystemMessage(content=prompt), HumanMessage(content="Begin your review process.")]}
-            )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

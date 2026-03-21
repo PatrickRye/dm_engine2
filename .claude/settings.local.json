@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep -E \"\\\\.py$\")"
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(python -m pytest test/server/test_unit_dnd_features.py::test_spatial_line_of_sight_and_cover test/server/test_unit_dnd_features.py::test_spatial_illumination_and_walls test/server/test_system_dnd_features.py::test_system_dynamic_lighting_and_combat test/server/test_system_dnd_features.py::test_system_dynamic_light_movement_and_static_torches test/server/test_system_dnd_features.py::test_system_disarm_and_drop_light test/server/test_system_dnd_features.py::test_system_snuff_light_source test/server/test_system_dnd_features.py::test_system_spell_illumination_areas test/server/test_dnd_reqs.py::test_req_stl_001_and_002_passive_perception_and_hiding test/server/test_dnd_reqs.py::test_req_vis_006_and_007_dim_light_and_darkvision test/server/test_dnd_reqs.py::test_req_vis_008_sunlight_sensitivity -v)",
+      "Bash(python -m pytest test/server/test_unit_dnd_features.py::test_spatial_illumination_and_walls test/server/test_system_dnd_features.py::test_system_disarm_and_drop_light test/server/test_system_dnd_features.py::test_system_snuff_light_source test/server/test_system_dnd_features.py::test_system_spell_illumination_areas test/server/test_system_dnd_features.py::test_system_dynamic_lighting_and_combat test/server/test_system_dnd_features.py::test_system_dynamic_light_movement_and_static_torches -v --tb=long)",
+      "Bash(python -m pytest test/server/test_unit_dnd_features.py::test_spatial_illumination_and_walls -v -s)"
     ]
   }
 }

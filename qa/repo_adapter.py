@@ -53,11 +53,14 @@ def local_write_file(filepath: str, content: str) -> str:
 # --- ADAPTER FACTORY ---
 
 def get_codebase_tools() -> list:
-    """Returns the correct set of LangChain tools based on the environment."""
+    """Returns the correct set of LangChain tools based on the environment.
+
+    Both modes use local file tools — the implementer checks out the feature branch
+    via execute_shell_command, then reads/writes files locally before committing.
+    The difference is that live-patch mode skips git entirely and triggers Uvicorn hot-reload.
+    """
     if is_live_patch_mode():
         print("[Adapter] Running in LOCAL LIVE PATCH mode.")
-        return [local_read_file, local_write_file]
     else:
-        print("[Adapter] Running in CLOUD GITHUB mode.")
-        # Return the MCP wrappers or GitHub API tools here instead
-        return []
+        print("[Adapter] Running in CLOUD GIT mode.")
+    return [local_read_file, local_write_file]
