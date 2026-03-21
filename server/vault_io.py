@@ -30,14 +30,29 @@ from prompts import VISION_MAP_INGESTION_PROMPT
 import base64
 import json
 
+# -------------------------------------------------------------------
+# Module-level mtime watermarks to avoid redundant expensive work
+# -------------------------------------------------------------------
+# Maps vault_path -> mtime of journals dir at last full init
+_VAULT_INIT_MTIMES: dict[str, float] = {}
+# Vaults whose map scan is complete (sidecar already exists for all maps)
+_MAP_SCAN_DONE: set[str] = set()
+# Maps filepath -> mtime at time of last entity load (for incremental sync)
+_FILE_LOAD_TIMES: dict[str, float] = {}
+
 
 async def auto_ingest_maps_from_vault(vault_path: str):
     """
     Scans the vault for images that look like battlemaps.
     If a .json sidecar doesn't exist, it uses the Vision API to extract geometry.
+    Skips the expensive full glob if every image in the vault already has a sidecar.
     """
+    if vault_path in _MAP_SCAN_DONE:
+        return
+
     print("Scanning vault for un-processed battlemaps...")
     vision_llm = None
+    all_have_sidecars = True  # optimistic; set False if any sidecar is missing
 
     search_pattern = os.path.join(vault_path, "**", "*")
     for filepath in glob.glob(search_pattern, recursive=True):
@@ -46,6 +61,7 @@ async def auto_ingest_maps_from_vault(vault_path: str):
             json_sidecar = f"{filepath}.json"
 
             if not os.path.exists(json_sidecar):
+                all_have_sidecars = False
                 print(f"[Vision AI] Processing new map: {os.path.basename(filepath)}...")
                 if not vision_llm:
                     vision_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
@@ -102,6 +118,10 @@ async def auto_ingest_maps_from_vault(vault_path: str):
                     print(f"Loaded {os.path.basename(filepath)} into active spatial memory.")
                 except Exception:
                     pass
+
+    # Mark as fully scanned only when no sidecar was missing (all maps were already processed)
+    if all_have_sidecars:
+        _MAP_SCAN_DONE.add(vault_path)
 
 
 async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Creature]:
@@ -235,6 +255,11 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
                             )
 
         entity._filepath = filepath
+        entity.store_snapshot()  # Baseline — is_dirty will be False until engine mutates state
+        try:
+            _FILE_LOAD_TIMES[filepath] = os.path.getmtime(filepath)
+        except OSError:
+            pass
         print(f"Loaded to Engine: {entity.name} (HP: {entity.hp.base_value})")
 
         spatial_service.sync_entity(entity)
@@ -248,12 +273,22 @@ async def initialize_engine_from_vault(vault_path: str):
     """Reads characters and active combatants from the vault into the Deterministic Engine. Employs lazy hydration for everything else."""
     await auto_ingest_maps_from_vault(vault_path)
 
-    print("Loading core entities into Deterministic Engine...")
-    clear_registry(vault_path)  # Reset memory for this vault only; other active vaults are unaffected
-
     j_dir = get_journals_dir(vault_path)
     if not os.path.exists(j_dir):
         return
+
+    # Skip full re-init if the journals directory hasn't changed since last load
+    try:
+        current_mtime = os.path.getmtime(j_dir)
+        if _VAULT_INIT_MTIMES.get(vault_path) == current_mtime:
+            print(f"[vault_io] Journals unchanged for vault '{os.path.basename(vault_path)}', skipping re-init.")
+            return
+        _VAULT_INIT_MTIMES[vault_path] = current_mtime
+    except OSError:
+        pass
+
+    print("Loading core entities into Deterministic Engine...")
+    clear_registry(vault_path)  # Reset memory for this vault only; other active vaults are unaffected
 
     # 1. Determine active combatants to eagerly load
     active_combatants = set()
@@ -294,6 +329,10 @@ async def sync_engine_to_vault(vault_path: str):
     print("Syncing Engine state back to Vault...")
     for uid, entity in get_all_entities(vault_path).items():
         if not hasattr(entity, "_filepath"):
+            continue
+
+        # Skip entities that haven't changed since last load — avoids redundant disk writes
+        if isinstance(entity, Creature) and not entity.is_dirty:
             continue
 
         filepath = entity._filepath
@@ -338,8 +377,43 @@ async def sync_engine_to_vault(vault_path: str):
 
             async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
                 await f.write(new_content)
+
+            # Reset dirty flag so subsequent syncs skip this entity until it changes again
+            if isinstance(entity, Creature):
+                entity.store_snapshot()
+            try:
+                _FILE_LOAD_TIMES[filepath] = os.path.getmtime(filepath)
+            except OSError:
+                pass
         except Exception as e:
             print(f"Failed to save {entity.name}: {e}")
+
+
+async def sync_engine_from_vault_updates(vault_path: str) -> str:
+    """Incrementally reloads only journal files that changed on disk since last load."""
+    j_dir = get_journals_dir(vault_path)
+    if not os.path.exists(j_dir):
+        return "No journals directory found."
+
+    reloaded = []
+    for filename in os.listdir(j_dir):
+        if not filename.endswith(".md"):
+            continue
+        if filename in ["ACTIVE_COMBAT.md", "CAMPAIGN_MASTER.md", "DM_CONFIG.md"]:
+            continue
+        filepath = os.path.join(j_dir, filename)
+        try:
+            current_mtime = os.path.getmtime(filepath)
+        except OSError:
+            continue
+        if current_mtime > _FILE_LOAD_TIMES.get(filepath, 0):
+            entity = await load_entity_into_engine(filepath, vault_path)
+            if entity:
+                reloaded.append(entity.name)
+
+    if reloaded:
+        return f"Reloaded {len(reloaded)} changed entities: {', '.join(reloaded)}"
+    return "No changed entity files detected."
 
 
 def get_journals_dir(vault_path: str):

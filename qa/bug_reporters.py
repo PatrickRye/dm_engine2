@@ -9,7 +9,15 @@ import socket
 import json
 import re
 import glob
+import threading
 from filelock import FileLock
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileCreatedEvent
+    _WATCHDOG_AVAILABLE = True
+except ImportError:
+    _WATCHDOG_AVAILABLE = False
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -200,6 +208,14 @@ Execution Rules:
 """
 
 
+def _invoke_agent_safe(agent, state, agent_label: str):
+    """Invoke agent and swallow API errors with logging."""
+    try:
+        agent.invoke(state)
+    except Exception as e:
+        print(f"[{agent_label}] API Error: {e}")
+
+
 def run_rules_agent():
     print("[Rules Agent] Started process. Monitoring /logs/qa_audits")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2)
@@ -216,29 +232,52 @@ def run_rules_agent():
             move_to_processed,
         ],
     )
-    try:
-        while True:
-            # Pre-flight check: Only wake the LLM if there are logs to process!
-            logs = glob.glob(os.path.join(LOGS_QA, "*.jsonl"))
-            if not logs:
-                time.sleep(60)
-                continue
+    state_template = {
+        "messages": [
+            SystemMessage(content=RULES_PROMPT),
+            HumanMessage(
+                content="Check 'qa_audits' for unprocessed log files. Process them fully, create tasks, and move them to processed."
+            ),
+        ]
+    }
 
-            state = {
-                "messages": [
-                    SystemMessage(content=RULES_PROMPT),
-                    HumanMessage(
-                        content="Check 'qa_audits' for unprocessed log files. Process them fully, create tasks, and move them to processed."
-                    ),
-                ]
-            }
-            try:
-                agent.invoke(state)
-            except Exception as e:
-                print(f"[Rules Agent] API Error encountered. Sleeping for 60s. Details: {e}")
-            time.sleep(60)
-    except KeyboardInterrupt:
-        print("\n[Rules Agent] Shutting down gracefully.")
+    def _run_once():
+        _invoke_agent_safe(agent, state_template, "Rules Agent")
+
+    if _WATCHDOG_AVAILABLE:
+        class _RulesHandler(FileSystemEventHandler):
+            def on_created(self, event):
+                if not event.is_directory and event.src_path.endswith(".jsonl"):
+                    print(f"[Rules Agent] New log detected: {os.path.basename(event.src_path)}")
+                    _run_once()
+
+        observer = Observer()
+        observer.schedule(_RulesHandler(), LOGS_QA, recursive=False)
+        observer.start()
+        print("[Rules Agent] watchdog observer active — firing on new .jsonl files only.")
+
+        # Process any files that already existed before the observer started
+        if glob.glob(os.path.join(LOGS_QA, "*.jsonl")):
+            _run_once()
+
+        try:
+            while observer.is_alive():
+                observer.join(timeout=1)
+        except KeyboardInterrupt:
+            print("\n[Rules Agent] Shutting down gracefully.")
+        finally:
+            observer.stop()
+            observer.join()
+    else:
+        # Fallback: polling with pre-flight check (watchdog not installed)
+        print("[Rules Agent] watchdog not installed — falling back to 60s polling.")
+        try:
+            while True:
+                if glob.glob(os.path.join(LOGS_QA, "*.jsonl")):
+                    _run_once()
+                time.sleep(60)
+        except KeyboardInterrupt:
+            print("\n[Rules Agent] Shutting down gracefully.")
 
 
 def run_system_agent():
@@ -256,29 +295,52 @@ def run_system_agent():
             move_to_processed,
         ],
     )
-    try:
-        while True:
-            # Pre-flight check: Only wake the LLM if there are logs to process!
-            logs = glob.glob(os.path.join(LOGS_ACTIVE, "*.jsonl"))
-            if not logs:
-                time.sleep(60)
-                continue
+    state_template = {
+        "messages": [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(
+                content="Check 'active' for unprocessed log files. Process them fully, extract Python Exceptions/ERRORs into BUG tasks, and move them to processed."
+            ),
+        ]
+    }
 
-            state = {
-                "messages": [
-                    SystemMessage(content=SYSTEM_PROMPT),
-                    HumanMessage(
-                        content="Check 'active' for unprocessed log files. Process them fully, extract Python Exceptions/ERRORs into BUG tasks, and move them to processed."
-                    ),
-                ]
-            }
-            try:
-                agent.invoke(state)
-            except Exception as e:
-                print(f"[System Agent] API Error encountered. Sleeping for 60s. Details: {e}")
-            time.sleep(60)
-    except KeyboardInterrupt:
-        print("\n[System Agent] Shutting down gracefully.")
+    def _run_once():
+        _invoke_agent_safe(agent, state_template, "System Agent")
+
+    if _WATCHDOG_AVAILABLE:
+        class _SystemHandler(FileSystemEventHandler):
+            def on_created(self, event):
+                if not event.is_directory and event.src_path.endswith(".jsonl"):
+                    print(f"[System Agent] New log detected: {os.path.basename(event.src_path)}")
+                    _run_once()
+
+        observer = Observer()
+        observer.schedule(_SystemHandler(), LOGS_ACTIVE, recursive=False)
+        observer.start()
+        print("[System Agent] watchdog observer active — firing on new .jsonl files only.")
+
+        # Process any files that already existed before the observer started
+        if glob.glob(os.path.join(LOGS_ACTIVE, "*.jsonl")):
+            _run_once()
+
+        try:
+            while observer.is_alive():
+                observer.join(timeout=1)
+        except KeyboardInterrupt:
+            print("\n[System Agent] Shutting down gracefully.")
+        finally:
+            observer.stop()
+            observer.join()
+    else:
+        # Fallback: polling with pre-flight check (watchdog not installed)
+        print("[System Agent] watchdog not installed — falling back to 60s polling.")
+        try:
+            while True:
+                if glob.glob(os.path.join(LOGS_ACTIVE, "*.jsonl")):
+                    _run_once()
+                time.sleep(60)
+        except KeyboardInterrupt:
+            print("\n[System Agent] Shutting down gracefully.")
 
 
 def run_server_monitor():

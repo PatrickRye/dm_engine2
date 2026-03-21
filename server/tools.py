@@ -48,21 +48,45 @@ class VaultCache:
         self.bestiary_cache = {}  # vault_path -> [ (filename, content) ]
         self.chunk_cache = {}  # vault_path -> category -> [ (filename, chunk) ]
         self.indexed_vaults = []  # ordered list; front = oldest, back = most-recently indexed
+        self._index_mtimes: dict[str, float] = {}  # vault_path -> max mtime at last build
 
     def _evict_oldest(self):
         while len(self.indexed_vaults) >= _MAX_CACHED_VAULTS:
             oldest = self.indexed_vaults.pop(0)
             self.bestiary_cache.pop(oldest, None)
             self.chunk_cache.pop(oldest, None)
+            self._index_mtimes.pop(oldest, None)
+
+    def _get_max_mtime(self, vault_path: str) -> float:
+        """Stat-only walk to find the newest mtime among all compendium .md files."""
+        max_mtime = 0.0
+        for cat in ["bestiary", "rules", "modules"]:
+            for d in _get_config_dirs(vault_path, cat):
+                for root, _, files in os.walk(d):
+                    for file in files:
+                        if file.endswith(".md"):
+                            try:
+                                mtime = os.path.getmtime(os.path.join(root, file))
+                                if mtime > max_mtime:
+                                    max_mtime = mtime
+                            except OSError:
+                                pass
+        return max_mtime
 
     def build_index(self, vault_path: str, force: bool = False):
         if vault_path in self.indexed_vaults and not force:
-            return
-        if force:
+            # Fast mtime check: only rebuild if any compendium file changed
+            current_max = self._get_max_mtime(vault_path)
+            if current_max <= self._index_mtimes.get(vault_path, 0):
+                return
+            # Files changed — fall through to rebuild
+            self.indexed_vaults = [v for v in self.indexed_vaults if v != vault_path]
+        elif force:
             self.indexed_vaults = [v for v in self.indexed_vaults if v != vault_path]
 
         self.bestiary_cache[vault_path] = []
         self.chunk_cache[vault_path] = {"rules": [], "modules": [], "bestiary": []}
+        max_mtime = 0.0
 
         for cat in ["bestiary", "rules", "modules"]:
             dirs = _get_config_dirs(vault_path, cat)
@@ -71,7 +95,11 @@ class VaultCache:
                     for file in files:
                         if file.endswith(".md"):
                             try:
-                                with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+                                filepath = os.path.join(root, file)
+                                mtime = os.path.getmtime(filepath)
+                                if mtime > max_mtime:
+                                    max_mtime = mtime
+                                with open(filepath, "r", encoding="utf-8") as f:
                                     content = f.read().replace("\r\n", "\n")
                                     if cat == "bestiary":
                                         self.bestiary_cache[vault_path].append((file, content))
@@ -90,6 +118,7 @@ class VaultCache:
 
                             except Exception:
                                 pass
+        self._index_mtimes[vault_path] = max_mtime
         self._evict_oldest()
         self.indexed_vaults.append(vault_path)
 

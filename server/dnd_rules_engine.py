@@ -273,6 +273,33 @@ class Creature(BaseGameEntity):
     spell_slots_expended_this_turn: int = 0
     summoned_by_uuid: Optional[uuid.UUID] = None
     summon_spell: str = ""
+    _load_snapshot: int = PrivateAttr(default=0)
+
+    def _compute_snapshot(self) -> int:
+        return hash((
+            self.hp.base_value,
+            self.temp_hp,
+            self.x,
+            self.y,
+            self.z,
+            self.concentrating_on,
+            self.reaction_used,
+            self.movement_remaining,
+            self.death_saves_successes,
+            self.death_saves_failures,
+            self.exhaustion_level,
+            tuple(sorted(c.name for c in self.active_conditions)),
+            tuple(sorted(self.resources.items())),
+        ))
+
+    def store_snapshot(self):
+        """Record current state as the clean baseline. Call after loading from disk."""
+        object.__setattr__(self, "_load_snapshot", self._compute_snapshot())
+
+    @property
+    def is_dirty(self) -> bool:
+        """True if any tracked field changed since store_snapshot() was last called."""
+        return self._compute_snapshot() != self._load_snapshot
 
     @property
     def character_level(self) -> int:
