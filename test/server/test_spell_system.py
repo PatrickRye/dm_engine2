@@ -23,6 +23,7 @@ def test_spell_mechanics_defaults():
     assert mechanics.damage_type == ""
     assert mechanics.half_damage_on_save is False
     assert mechanics.requires_concentration is False
+    assert mechanics.exclude_self is True
     assert mechanics.granted_tags == []
     assert mechanics.conditions_applied == []
     assert mechanics.modifiers == []

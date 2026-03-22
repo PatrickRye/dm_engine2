@@ -25,6 +25,7 @@ class MechanicEffect(BaseModel):
         default_factory=list
     )  # e.g., ["ignore_difficult_terrain", "ignore_ranged_melee_disadvantage"]
     requires_concentration: bool = False
+    exclude_self: bool = True
     terrain_effect: Optional[Dict[str, Any]] = None
     trigger_event: str = ""  # e.g., "on_hit", "on_miss"
     resource_cost: str = ""  # e.g., "Second Wind Uses [SR]:1" — consumed after successful use

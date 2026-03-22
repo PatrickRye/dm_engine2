@@ -37,6 +37,7 @@ class SpellMechanics(BaseModel):
     healing_dice: str = ""  # e.g., "1d10" — applied to each target after hit/save
     half_damage_on_save: bool = False
     requires_concentration: bool = False
+    exclude_self: bool = True
     granted_tags: List[str] = Field(default_factory=list)
     conditions_applied: List[AppliedCondition] = Field(default_factory=list)
     modifiers: List[StatModifier] = Field(default_factory=list)

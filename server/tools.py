@@ -3361,17 +3361,30 @@ async def use_ability_or_spell(  # noqa: C901
             return f"SYSTEM ERROR: {caster.name} has already expended a spell slot this turn. (REQ-SPL-001)"
 
     ox, oy, oz, tx, ty, tz = None, None, None, None, None, None
-    if aoe_shape and aoe_size and target_x is not None and target_y is not None:
+    range_val = getattr(spell_def, "range_str", "").lower() if spell_def else ""
+
+    if aoe_shape and aoe_size and (target_x is not None and target_y is not None or "self" in range_val):
         shape = aoe_shape.lower()
         tz = target_z
-        if shape in ["circle", "sphere", "cylinder", "cube"]:
-            ox, oy, tx, ty = target_x, target_y, target_x, target_y
-            oz = target_z if target_z is not None else 0.0
-        else:  # cone, line originate from the caster
-            ox, oy, tx, ty = origin_ent.x, origin_ent.y, target_x, target_y
-            oz = origin_ent.z
-            if tz is None:
-                tz = origin_ent.z
+
+        if "self" in range_val:
+            ox, oy, oz = origin_ent.x, origin_ent.y, origin_ent.z
+            if shape in ["circle", "sphere", "cylinder", "cube"]:
+                tx, ty, tz = ox, oy, oz
+            else:
+                tx = target_x if target_x is not None else origin_ent.x
+                ty = target_y if target_y is not None else origin_ent.y
+                if tz is None:
+                    tz = oz
+        else:
+            if shape in ["circle", "sphere", "cylinder", "cube"]:
+                ox, oy, tx, ty = target_x, target_y, target_x, target_y
+                oz = target_z if target_z is not None else 0.0
+            else:  # cone, line originate from the caster
+                ox, oy, tx, ty = origin_ent.x, origin_ent.y, target_x, target_y
+                oz = origin_ent.z
+                if tz is None:
+                    tz = origin_ent.z
 
         hits, walls, terrains = spatial_service.get_aoe_targets(
             shape,
@@ -3387,13 +3400,37 @@ async def use_ability_or_spell(  # noqa: C901
             vault_path=vault_path,
         )
         target_uuids.extend(hits)
+
+        if "self" in range_val and origin_ent.entity_uuid in target_uuids:
+            if isinstance(mechanics_dump, dict) and mechanics_dump.get("exclude_self", True):
+                target_uuids.remove(origin_ent.entity_uuid)
+
         target_wall_ids.extend(walls)
         target_terrain_ids.extend(terrains)
-        target_string = f"{aoe_size}ft {shape} at coordinates ({target_x}, {target_y})"
+        if "self" in range_val:
+            target_string = f"{aoe_size}ft {shape} originating from {origin_ent.name}"
+        else:
+            target_string = f"{aoe_size}ft {shape} at coordinates ({target_x}, {target_y})"
     else:
         for name in target_names or []:
             ent = await _get_entity_by_name(name, vault_path)
             if ent:
+                if "touch" in range_val:
+                    dist = spatial_service.calculate_distance(
+                        origin_ent.x, origin_ent.y, origin_ent.z, ent.x, ent.y, ent.z, vault_path
+                    )
+                    if dist > 7.5:
+                        return f"SYSTEM ERROR: {ent.name} is out of Touch range ({dist:.1f}ft > 5ft). (REQ-SPL-020)"
+
+                    is_caster_pc = any(t in origin_ent.tags for t in ["pc", "player", "party_npc"])
+                    is_target_pc = any(t in ent.tags for t in ["pc", "player", "party_npc"])
+                    is_unwilling = is_caster_pc != is_target_pc
+
+                    if is_unwilling:
+                        requires_attack_roll = True
+                        if isinstance(mechanics_dump, dict):
+                            mechanics_dump["requires_attack_roll"] = True
+
                 if hasattr(spatial_service, "check_path_collision") and not ignore_walls:
                     collision = spatial_service.check_path_collision(
                         origin_ent.x,

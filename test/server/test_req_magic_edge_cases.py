@@ -156,3 +156,122 @@ async def test_req_edg_007_illusion_bypass(setup):
     assert "REQ-ILL-001" in res
     assert "revealed to them as an illusion" in res
     assert str(hero.entity_uuid) in wall.revealed_for
+
+
+@pytest.mark.asyncio
+async def test_req_spl_020_touch_unwilling(setup, mock_dice):
+    """
+    Trace: REQ-SPL-020
+    Validates that Touch spells against unwilling targets enforce range and require an attack roll.
+    """
+    vp = setup
+    caster = Creature(
+        name="Cleric",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        tags=["pc"],
+        x=0.0,
+        y=0.0,
+    )
+    target = Creature(
+        name="Goblin",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        tags=["monster"],
+        x=10.0,
+        y=0.0,
+    )
+    register_entity(caster)
+    register_entity(target)
+    spatial_service.sync_entity(caster)
+    spatial_service.sync_entity(target)
+
+    # 1. Out of range touch spell
+    spell = SpellDefinition(
+        name="Inflict Wounds", level=1, range_str="Touch", mechanics=SpellMechanics(damage_dice="3d10", damage_type="necrotic")
+    )
+    await SpellCompendium.save_spell(vp, spell)
+
+    config = {"configurable": {"thread_id": vp}}
+    res1 = await use_ability_or_spell.ainvoke(
+        {"caster_name": "Cleric", "ability_name": "Inflict Wounds", "target_names": ["Goblin"]}, config=config
+    )
+    assert "SYSTEM ERROR" in res1
+    assert "out of Touch range" in res1
+    assert "REQ-SPL-020" in res1
+
+    # 2. In range, hostile -> forces attack roll
+    target.x = 5.0
+    spatial_service.sync_entity(target)
+    with mock_dice(default=15):
+        res2 = await use_ability_or_spell.ainvoke(
+            {"caster_name": "Cleric", "ability_name": "Inflict Wounds", "target_names": ["Goblin"], "force_auto_roll": True},
+            config=config,
+        )
+    assert "Hit" in res2 or "Miss" in res2
+    assert "Auto-hit" not in res2
+
+
+@pytest.mark.asyncio
+async def test_req_spl_021_self_area_excludes_caster(setup, mock_dice):
+    """
+    Trace: REQ-SPL-021
+    Validates that Self (Area) spells originate from the caster and exclude them from damage by default.
+    """
+    vp = setup
+    caster = Creature(
+        name="Paladin",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        tags=["pc"],
+        x=10.0,
+        y=10.0,
+    )
+    target = Creature(
+        name="Ghoul",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        tags=["monster"],
+        x=15.0,
+        y=10.0,
+    )
+    register_entity(caster)
+    register_entity(target)
+    spatial_service.sync_entity(caster)
+    spatial_service.sync_entity(target)
+
+    spell = SpellDefinition(
+        name="Spirit Guardians",
+        level=3,
+        range_str="Self (15-foot radius)",
+        mechanics=SpellMechanics(damage_dice="3d8", damage_type="radiant", save_required="wisdom"),
+    )
+    await SpellCompendium.save_spell(vp, spell)
+
+    config = {"configurable": {"thread_id": vp}}
+    with mock_dice(default=5):
+        res = await use_ability_or_spell.ainvoke(
+            {
+                "caster_name": "Paladin",
+                "ability_name": "Spirit Guardians",
+                "aoe_shape": "sphere",
+                "aoe_size": 15.0,
+            },
+            config=config,
+        )
+
+    assert "originating from Paladin" in res
+    assert "Ghoul" in res
+    assert "Paladin] Saved" not in res and "Paladin] Failed" not in res  # Paladin is excluded
