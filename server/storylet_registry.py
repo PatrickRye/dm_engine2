@@ -171,6 +171,14 @@ class StoryletRegistry:
     def get(self, storylet_id: uuid.UUID) -> Optional[Storylet]:
         return self._storylets.get(storylet_id)
 
+    def get_by_name(self, name: str) -> Optional[Storylet]:
+        """Find a storylet by exact name (case-insensitive)."""
+        name_lower = name.lower()
+        for s in self._storylets.values():
+            if s.name.lower() == name_lower:
+                return s
+        return None
+
     def get_all(self) -> List[Storylet]:
         return list(self._storylets.values())
 

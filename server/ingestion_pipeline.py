@@ -495,6 +495,460 @@ async def run_ingestion_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Generic DM Notes → KG Entities + Edges (Task 3.3 / Phase 1 NLP)
+# ---------------------------------------------------------------------------
+
+async def extract_entities_from_text(
+    raw_notes: str,
+    vault_path: str = "default",
+    llm=None,
+) -> tuple[List[KnowledgeGraphNode], List[KnowledgeGraphEdge]]:
+    """
+    Parse raw DM notes (meeting notes, session prep, lore fragments) into
+    KG entities and edges.
+
+    This is the Phase 1 NLP entry point — works on arbitrary freeform text,
+    not just structured NPC bios. Extracts any named characters, locations,
+    items, or factions, plus inferred relationships.
+
+    With LLM: uses structured extraction for high-quality output.
+    Without LLM: falls back to deterministic heuristics (limited but functional).
+
+    Returns (nodes, edges) — caller adds them to the KG.
+    """
+    import re
+
+    if llm is not None:
+        return await _extract_entities_llm(raw_notes, vault_path, llm)
+
+    # Deterministic fallback: keyword-based extraction
+    return _extract_entities_deterministic(raw_notes, vault_path)
+
+
+def _extract_entities_deterministic(
+    raw_notes: str,
+    vault_path: str,
+) -> tuple[List[KnowledgeGraphNode], List[KnowledgeGraphEdge]]:
+    """
+    Deterministic fallback for entity extraction from raw notes.
+
+    Heuristics:
+    - Capitalized multi-word sequences → potential entity names
+    - Section headers: "## NPC:", "## Location:", "## Item:", "## Faction:" → node type
+    - Relationship patterns: "owns", "hates", "serves", "allied with", "leads", etc.
+    """
+    import re
+
+    nodes: List[KnowledgeGraphNode] = []
+    edges: List[KnowledgeGraphEdge] = []
+    seen_names: set[str] = set()
+
+    # Node type markers
+    type_markers = {
+        re.compile(r"##?\s*NPC[s]?\s*[:\-]?\s*(.+)", re.I): GraphNodeType.NPC,
+        re.compile(r"##?\s*Character[s]?\s*[:\-]?\s*(.+)", re.I): GraphNodeType.NPC,
+        re.compile(r"##?\s*Location[s]?\s*[:\-]?\s*(.+)", re.I): GraphNodeType.LOCATION,
+        re.compile(r"##?\s*Place[s]?\s*[:\-]?\s*(.+)", re.I): GraphNodeType.LOCATION,
+        re.compile(r"##?\s*Item[s]?\s*[:\-]?\s*(.+)", re.I): GraphNodeType.ITEM,
+        re.compile(r"##?\s*Faction[s]?\s*[:\-]?\s*(.+)", re.I): GraphNodeType.FACTION,
+        re.compile(r"##?\s*Quest[s]?\s*[:\-]?\s*(.+)", re.I): GraphNodeType.QUEST,
+    }
+
+    relationship_patterns = [
+        (re.compile(r"\b(\w[\w\s]+?)\s+(?:owns|possesses|holds)\s+the\s+(\w[\w\s]+)", re.I), "possesses"),
+        (re.compile(r"\b(\w[\w\s]+?)\s+is\s+(?:allied|allies)\s+with\s+(?:the\s+)?(\w[\w\s]+)", re.I), "allied_with"),
+        (re.compile(r"\b(\w[\w\s]+?)\s+is\s+(?:an?\s+)?enemy\s+of\s+(?:the\s+)?(\w[\w\s]+)", re.I), "hostile_toward"),
+        (re.compile(r"\b(\w[\w\s]+?)\s+(?:hates|despises)\s+(?:the\s+)?(\w[\w\s]+)", re.I), "hostile_toward"),
+        (re.compile(r"\b(\w[\w\s]+?)\s+(?:serves|works for|loyal to)\s+(?:the\s+)?(\w[\w\s]+)", re.I), "serves"),
+        (re.compile(r"\b(\w[\w\s]+?)\s+(?:leads|commands|rules)\s+(?:the\s+)?(\w[\w\s]+)", re.I), "leads"),
+        (re.compile(r"\b(\w[\w\s]+?)\s+is\s+(?:a\s+)?member\s+of\s+(?:the\s+)?(\w[\w\s]+)", re.I), "member_of"),
+        (re.compile(r"\b(\w[\w\s]+?)\s+(?:located\s+in|situated\s+in|lives?\s+in)\s+(?:the\s+)?(\w[\w\s]+)", re.I), "located_in"),
+        (re.compile(r"\b(\w[\w\s]+?)\s+(?:knows about|knows)\s+(?:the\s+)?(\w[\w\s]+)", re.I), "knows_about"),
+    ]
+
+    default_node_type = GraphNodeType.NPC
+
+    # Pass 1: collect named entities from section headers and body
+    named_entities: Dict[tuple[str, GraphNodeType], str] = {}
+
+    for line in raw_notes.split("\n"):
+        # Detect section headers for type
+        node_type = default_node_type
+        extracted_name = None
+        for pattern, ntype in type_markers.items():
+            m = pattern.match(line.strip())
+            if m:
+                node_type = ntype
+                extracted_name = m.group(1).strip()
+                break
+
+        # Extract capitalized multi-word names
+        for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", line):
+            name = m.group(1).strip()
+            if len(name) < 2:
+                continue
+            # Skip common non-entity words
+            if name.lower() in {
+                "the", "and", "but", "for", "with", "you", "your",
+                "session", "chapter", "scene", "notes", " dm ", "goblin",
+                "dragon", "king", "queen", "lord", "lady", "sir",
+            }:
+                continue
+            key = (name.lower(), node_type)
+            if key not in named_entities:
+                named_entities[key] = name
+
+    # Create KG nodes for each extracted entity
+    name_to_uuid: Dict[str, uuid.UUID] = {}
+    for (name_lower, _), canonical_name in named_entities.items():
+        if name_lower in seen_names:
+            continue
+        seen_names.add(name_lower)
+        node_uuid = uuid.uuid4()
+        name_to_uuid[name_lower] = node_uuid
+        node = KnowledgeGraphNode(
+            node_uuid=node_uuid,
+            node_type=GraphNodeType.NPC,
+            name=canonical_name,
+            attributes={"source": "deterministic_extraction"},
+            tags={"extracted"},
+        )
+        nodes.append(node)
+
+    # Pass 2: extract relationship edges
+    kg = get_knowledge_graph(vault_path)
+    for pattern, predicate in relationship_patterns:
+        for m in pattern.finditer(raw_notes):
+            subj_name = m.group(1).strip()
+            obj_name = m.group(2).strip()
+
+            # Look up subject UUID
+            subj_uuid = name_to_uuid.get(subj_name.lower())
+            if subj_uuid is None:
+                found = kg.get_node_by_name(subj_name)
+                if found:
+                    subj_uuid = found.node_uuid
+                else:
+                    # Create the node on the fly
+                    new_node = KnowledgeGraphNode(
+                        node_uuid=uuid.uuid4(),
+                        node_type=GraphNodeType.NPC,
+                        name=subj_name,
+                        attributes={"source": "relationship_inference"},
+                        tags={"inferred"},
+                    )
+                    kg.add_node(new_node)
+                    subj_uuid = new_node.node_uuid
+                    name_to_uuid[subj_name.lower()] = subj_uuid
+                    nodes.append(new_node)
+
+            # Look up object UUID
+            obj_uuid = name_to_uuid.get(obj_name.lower())
+            if obj_uuid is None:
+                found = kg.get_node_by_name(obj_name)
+                if found:
+                    obj_uuid = found.node_uuid
+                else:
+                    new_node = KnowledgeGraphNode(
+                        node_uuid=uuid.uuid4(),
+                        node_type=GraphNodeType.NPC,
+                        name=obj_name,
+                        attributes={"source": "relationship_inference"},
+                        tags={"inferred"},
+                    )
+                    kg.add_node(new_node)
+                    obj_uuid = new_node.node_uuid
+                    name_to_uuid[obj_name.lower()] = obj_uuid
+                    nodes.append(new_node)
+
+            if subj_uuid and obj_uuid:
+                try:
+                    pred = GraphPredicate(predicate)
+                except ValueError:
+                    pred = GraphPredicate.CONNECTED_TO
+                edges.append(
+                    KnowledgeGraphEdge(
+                        subject_uuid=subj_uuid,
+                        predicate=pred,
+                        object_uuid=obj_uuid,
+                    )
+                )
+
+    return nodes, edges
+
+
+async def _extract_entities_llm(
+    raw_notes: str,
+    vault_path: str,
+    llm,
+) -> tuple[List[KnowledgeGraphNode], List[KnowledgeGraphEdge]]:
+    """LLM-powered extraction of entities and edges from raw notes."""
+
+    class EntityListSpec(BaseModel):
+        entities: List[NPCEntitySpec] = Field(description="List of extracted entities")
+        edges: List[KGEdgeSpec] = Field(description="List of inferred relationship edges")
+
+    prompt = (
+        "You are a D&D world-builder. Parse the raw DM notes below and extract ALL "
+        "named entities and their relationships.\n\n"
+        "For each entity extract an NPCEntitySpec:\n"
+        "  - name: canonical name (use Title Case)\n"
+        "  - node_type: npc | location | item | faction | quest\n"
+        "  - tags: faction affiliations, location, role\n"
+        "  - is_immutable: True for key NPCs, quest-givers, major factions\n"
+        "  - description: brief note if provided\n\n"
+        "For each relationship extract a KGEdgeSpec:\n"
+        "  - subject_name: name of subject entity (must match an extracted entity)\n"
+        "  - predicate: connected_to | located_in | member_of | allied_with | "
+        "hostile_toward | controls | leads | serves | rival_of | owned_by | "
+        "possesses | knows_about | rules\n"
+        "  - object_name: name of object entity\n"
+        "  - weight: 0.0-1.0 (confidence in the inference)\n\n"
+        "RULES:\n"
+        "1. Be CONSERVATIVE — only extract entities EXPLICITLY named.\n"
+        "2. Only infer relationships when clearly implied by the text.\n"
+        "3. node_type should be inferred from context (a city = location, a guild = faction, etc.)\n"
+        "4. Output a valid JSON object with 'entities' (list) and 'edges' (list).\n"
+        f"RAW NOTES:\n{raw_notes}"
+    )
+
+    result = await _call_llm_structured(llm, prompt, "", EntityListSpec)
+    if result is None:
+        return [], []
+
+    kg = get_knowledge_graph(vault_path)
+    nodes: List[KnowledgeGraphNode] = []
+    edges: List[KnowledgeGraphEdge] = []
+    name_to_uuid: Dict[str, uuid.UUID] = {}
+
+    for spec in result.entities:
+        try:
+            ntype = GraphNodeType(spec.node_type)
+        except ValueError:
+            ntype = GraphNodeType.NPC
+
+        node_uuid = uuid.uuid4()
+        name_to_uuid[spec.name.lower()] = node_uuid
+
+        attrs: Dict[str, Any] = {
+            "description": spec.description,
+            "bio": spec.bio,
+            "connections": spec.connections,
+            "misc_notes": spec.misc_notes,
+        }
+
+        node = KnowledgeGraphNode(
+            node_uuid=node_uuid,
+            node_type=ntype,
+            name=spec.name,
+            attributes=attrs,
+            tags=set(spec.tags),
+            is_immutable=spec.is_immutable,
+        )
+        nodes.append(node)
+
+    for edge_spec in result.edges:
+        # Resolve subject
+        subj_uuid = name_to_uuid.get(edge_spec.subject_name.lower())
+        if subj_uuid is None:
+            found = kg.get_node_by_name(edge_spec.subject_name)
+            subj_uuid = found.node_uuid if found else None
+
+        # Resolve object
+        obj_uuid = name_to_uuid.get(edge_spec.object_name.lower())
+        if obj_uuid is None:
+            found = kg.get_node_by_name(edge_spec.object_name)
+            obj_uuid = found.node_uuid if found else None
+
+        if subj_uuid and obj_uuid:
+            try:
+                pred = GraphPredicate(edge_spec.predicate)
+            except ValueError:
+                pred = GraphPredicate.CONNECTED_TO
+            edges.append(
+                KnowledgeGraphEdge(
+                    subject_uuid=subj_uuid,
+                    predicate=pred,
+                    object_uuid=obj_uuid,
+                    weight=edge_spec.weight,
+                )
+            )
+
+    return nodes, edges
+
+
+# ---------------------------------------------------------------------------
+# Effect Annotation Pipeline (Task 3.3)
+# ---------------------------------------------------------------------------
+
+class EffectAnnotationPipeline:
+    """
+    LLM-powered pipeline for converting storylet resolution prose into
+    GraphMutation effects.
+
+    Usage:
+        pipeline = EffectAnnotationPipeline(llm)
+        result = await pipeline.annotate("Lord Vader joins the party.")
+        mutations = result.mutations  # List[GraphMutation]
+
+        # Apply to KG directly:
+        for mut in mutations:
+            pipeline.apply_mutation(kg, mut)
+
+        # Or attach to a storylet:
+        pipeline.attach_to_storylet(storylet_name, mutations, vault_path)
+    """
+
+    def __init__(self, llm) -> None:
+        self.llm = llm
+
+    async def annotate(
+        self,
+        resolution_text: str,
+        vault_path: str = "default",
+    ) -> EffectAnnotationSpec:
+        """Parse resolution prose and return an EffectAnnotationSpec."""
+        return await annotate_storylet_effects(
+            resolution_text=resolution_text,
+            vault_path=vault_path,
+            llm=self.llm,
+        )
+
+    async def annotate_batch(
+        self,
+        resolutions: Dict[str, str],
+        vault_path: str = "default",
+    ) -> Dict[str, EffectAnnotationSpec]:
+        """
+        Annotate multiple storylet resolutions concurrently.
+
+        Args:
+            resolutions: Dict[storylet_name, resolution_text]
+        Returns:
+            Dict[storylet_name, EffectAnnotationSpec]
+        """
+        import asyncio
+
+        async def _annotate_one(name: str, text: str) -> tuple[str, EffectAnnotationSpec]:
+            spec = await self.annotate(text, vault_path)
+            return name, spec
+
+        results = await asyncio.gather(
+            *[_annotate_one(n, t) for n, t in resolutions.items()]
+        )
+        return dict(results)
+
+    def apply_mutation(
+        self,
+        kg: KnowledgeGraph,
+        mutation: GraphMutation,
+    ) -> bool:
+        """
+        Apply a single GraphMutation to the KG.
+
+        Returns True if the mutation was applied successfully,
+        False if it could not be resolved or executed.
+        """
+        try:
+            mutation.execute(kg)
+            return True
+        except Exception:
+            return False
+
+    def apply_effects(
+        self,
+        kg: KnowledgeGraph,
+        mutations: List[GraphMutation],
+    ) -> tuple[int, int]:
+        """
+        Apply a list of GraphMutations to the KG.
+
+        Returns (applied_count, failed_count).
+        """
+        applied = 0
+        failed = 0
+        for mut in mutations:
+            if self.apply_mutation(kg, mut):
+                applied += 1
+            else:
+                failed += 1
+        return applied, failed
+
+    def attach_to_storylet(
+        self,
+        storylet_name: str,
+        mutations: List[GraphMutation],
+        vault_path: str = "default",
+    ) -> bool:
+        """
+        Attach GraphMutations as effects to a registered storylet.
+
+        Returns True if the storylet was found and updated.
+        """
+        from storylet import StoryletEffect
+
+        reg = get_storylet_registry(vault_path)
+        storylet = reg.get_by_name(storylet_name)
+        if storylet is None:
+            return False
+
+        for mut in mutations:
+            storylet.effects.append(StoryletEffect(graph_mutations=[mut]))
+        return True
+
+    async def run(
+        self,
+        storylet_resolutions: Dict[str, str],
+        vault_path: str = "default",
+    ) -> Dict[str, Any]:
+        """
+        Run the full effect annotation pipeline.
+
+        1. Annotate all resolutions concurrently
+        2. Apply mutations to KG
+        3. Attach mutations to storylets
+
+        Returns a summary dict with counts and any failures.
+        """
+        kg = get_knowledge_graph(vault_path)
+
+        annotated = await self.annotate_batch(storylet_resolutions, vault_path)
+
+        mutations_applied = 0
+        mutations_failed = 0
+        storylets_updated = 0
+
+        for sl_name, spec in annotated.items():
+            if not spec.mutations:
+                continue
+
+            # Convert dicts → GraphMutation objects
+            mutations: List[GraphMutation] = []
+            for mut_dict in spec.mutations:
+                try:
+                    mutations.append(GraphMutation(**mut_dict))
+                except Exception:
+                    pass
+
+            # Apply to KG
+            a, f = self.apply_effects(kg, mutations)
+            mutations_applied += a
+            mutations_failed += f
+
+            # Attach to storylet
+            if self.attach_to_storylet(sl_name, mutations, vault_path):
+                storylets_updated += 1
+
+        return {
+            "storylets_annotated": sum(1 for s in annotated.values() if s.mutations),
+            "mutations_applied": mutations_applied,
+            "mutations_failed": mutations_failed,
+            "storylets_updated": storylets_updated,
+            "summaries": {n: s.summary for n, s in annotated.items() if s.summary},
+        }
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 

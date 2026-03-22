@@ -112,7 +112,7 @@ class TestSVOGuardrail:
         guardrails = HardGuardrails(self.kg)
 
         prose = (
-            "King Aldric presses [[Excalibur]] into your hands. "
+            "King Aldric gives [[Excalibur]] to the party. "
             "The blade feels warm with ancient power."
         )
 
@@ -127,22 +127,21 @@ class TestSVOGuardrail:
         """
         guardrails = HardGuardrails(self.kg)
 
+        # Use "gives" which maps to POSSESSES — the mutation predicate matches.
         prose = (
-            "King Aldric presses [[Excalibur]] into your hands. "
+            "King Aldric gives [[Excalibur]] to the party. "
             "The blade feels warm with ancient power."
         )
 
         mutation = GraphMutation(
             mutation_type="add_edge",
             node_name="Excalibur",
-            predicate="owned_by",
+            predicate="possesses",
             target_name="The Party",
         )
 
         result = guardrails.validate_svo_claims(prose, [mutation], {})
-        # The mutation involves both Excalibur (object) - it should be covered
-        # Note: our _mutation_covers_svo checks subject+object involvement
-        # King Aldric and Excalibur both involved in "gives" triple
+        # The mutation involves Excalibur (object of "gives") - it should be covered
         assert result.allowed, f"Mutation-covered prose should be allowed: {result.reason}"
 
     def test_mutation_without_prose_transfer_is_allowed(self):
@@ -173,7 +172,7 @@ class TestSVOGuardrail:
         guardrails = HardGuardrails(self.kg)
 
         prose = (
-            "King Aldric presses [[Excalibur]] into your hands. "
+            "King Aldric gives [[Excalibur]] to the party. "
             "The blade feels warm with ancient power."
         )
 
@@ -184,11 +183,12 @@ class TestSVOGuardrail:
         """validate_full_pipeline allows prose + mutation when mutation covers the claim."""
         guardrails = HardGuardrails(self.kg)
 
-        prose = "King Aldric presses [[Excalibur]] into your hands."
+        # Use "gives" which maps to POSSESSES — the mutation predicate matches.
+        prose = "King Aldric gives [[Excalibur]] to the party."
         mutation = GraphMutation(
             mutation_type="add_edge",
             node_name="Excalibur",
-            predicate="owned_by",
+            predicate="possesses",
             target_name="The Party",
         )
 

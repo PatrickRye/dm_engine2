@@ -27,9 +27,10 @@ from tools import _get_config_tone
 MAX_QA_REVISIONS = 3
 
 # ---------------------------------------------------------------------
-# TTL Cache: GraphRAG context (invalidated on KG writes)
+# TTL + LRU Cache: GraphRAG context (invalidated on KG writes)
 # ---------------------------------------------------------------------
 _GRAG_CACHE_TTL_SECONDS = 60.0
+_GRAG_CACHE_MAX_SIZE = 32
 # { (vault_path, active_character): (timestamp, result_str) }
 _grag_cache: Dict[Tuple[str, str], Tuple[float, str]] = {}
 
@@ -104,20 +105,27 @@ def _get_grag_context(kg, vault_path: str = None, active_character: str = None, 
 
     Results are cached for 60 seconds per (vault_path, active_character) key.
     Cache is invalidated by _invalidate_grag_cache() after KG writes.
+    Cache is bounded to _GRAG_CACHE_MAX_SIZE entries with LRU eviction.
 
     This is prepended to the narrator's system prompt to give the LLM
     dynamic world-state grounding rather than static rules.
     """
-    from knowledge_graph import GraphNodeType
-
-    # Task 4: TTL-based memoization cache
+    # Opt E: TTL + LRU cache with max size
     if vault_path and active_character:
         cache_key = (vault_path, active_character)
         now = time.monotonic()
         if cache_key in _grag_cache:
             ts, cached = _grag_cache[cache_key]
             if now - ts < _GRAG_CACHE_TTL_SECONDS:
+                # LRU: promote to fresh entry on hit
+                _grag_cache[cache_key] = (now, cached)
                 return cached
+
+        # Evict oldest entry if at capacity
+        if len(_grag_cache) >= _GRAG_CACHE_MAX_SIZE:
+            oldest_key = min(_grag_cache, key=lambda k: _grag_cache[k][0])
+            del _grag_cache[oldest_key]
+
         # Compute and cache
         result = _compute_grag_context(kg, vault_path, active_character, max_hops)
         _grag_cache[cache_key] = (now, result)
@@ -157,8 +165,13 @@ def _compute_grag_context(kg, vault_path: str, active_character: str, max_hops: 
                             lines.append(f"  {pred.replace('_', ' ')}: {', '.join(names)}")
 
     # All NPC nodes with their edges
+    # Opt A: skip the active character if they're in the NPC list (already rendered above)
+    char_uuid = kg.find_node_uuid(active_character) if active_character else None
     npc_nodes = kg.query_nodes(node_type=GraphNodeType.NPC)
     for npc in npc_nodes[:5]:  # Limit to 5 NPCs to avoid prompt bloat
+        # Deduplicate: if active character is an NPC, skip them (already rendered)
+        if char_uuid and npc.node_uuid == char_uuid:
+            continue
         ctx = kg.get_context_for_node(npc.node_uuid, max_hops=1)
         if ctx:
             attrs = ctx.get("attributes", {})
@@ -410,10 +423,15 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                 "Narrative Rejected",
                 f"Reason: {guard_result.reason}",
             )
+            revisions_list = (
+                "; ".join(f"{i+1}. {r}" for i, r in enumerate(guard_result.required_revisions))
+                if guard_result.required_revisions
+                else "Rewrite the narrative to address the violations above."
+            )
             return {
                 "qa_feedback": (
                     f"[HARD GUARDRAIL REJECTED]: {guard_result.reason}\n\n"
-                    f"Required revisions: {'; '.join(guard_result.required_revisions)}\n\n"
+                    f"Required revisions:\n{revisions_list}\n\n"
                     f"Your draft: {draft}"
                 ),
                 "revision_count": state.get("revision_count", 0) + 1,

@@ -176,85 +176,172 @@ class HardGuardrails:
         return GuardrailResult(allowed=True)
 
     # ------------------------------------------------------------------
-    # Gap 4: SVO (Subject-Verb-Object) claim validation
+    # Gap 4 / Gap 5: SVO (Subject-Verb-Object) claim validation
     # ------------------------------------------------------------------
     # Verb patterns that imply KG relationship transfers or changes.
     # Maps natural-language verbs to the GraphPredicate that would need to exist.
+    # None = no KG predicate (e.g., "kills"), but still a world-state claim.
     _TRANSFER_VERBS = {
+        # Ownership / possession transfer
         "gives": GraphPredicate.POSSESSES,
         "gives you": GraphPredicate.POSSESSES,
         "hands": GraphPredicate.POSSESSES,
         "hands you": GraphPredicate.POSSESSES,
-        "presses": GraphPredicate.POSSESSES,
         "grants": GraphPredicate.POSSESSES,
         "offers": GraphPredicate.POSSESSES,
         "bequeaths": GraphPredicate.POSSESSES,
         "transfers": GraphPredicate.POSSESSES,
+        "receives": GraphPredicate.POSSESSES,
+        "loses": None,
         "takes": GraphPredicate.POSSESSES,
         "steals": GraphPredicate.POSSESSES,
+        "pawns": GraphPredicate.POSSESSES,
+        "awards": GraphPredicate.POSSESSES,
+        "frees": GraphPredicate.POSSESSES,
+        # Alliance / hostility transitions
         "betrays": GraphPredicate.HOSTILE_TOWARD,
         "turns on": GraphPredicate.HOSTILE_TOWARD,
+        "renounces": GraphPredicate.HOSTILE_TOWARD,
         "joins": GraphPredicate.MEMBER_OF,
         "leaves": GraphPredicate.MEMBER_OF,
         "becomes ally": GraphPredicate.ALLIED_WITH,
         "allies with": GraphPredicate.ALLIED_WITH,
+        "pledges to": GraphPredicate.ALLIED_WITH,
+        "vows to": GraphPredicate.ALLIED_WITH,
         "attacks": GraphPredicate.HOSTILE_TOWARD,
+        "assaults": GraphPredicate.HOSTILE_TOWARD,
+        "murders": None,
         "kills": None,
         "slays": None,
         "destroys": None,
+        "exiles": GraphPredicate.HOSTILE_TOWARD,
+        "banishes": GraphPredicate.HOSTILE_TOWARD,
+        "imprisons": GraphPredicate.HOSTILE_TOWARD,
     }
+
+    def _extract_entity_names_from_text(self, text: str) -> List[str]:
+        """
+        Extract potential entity names from freeform prose (no Wikilinks needed).
+
+        Strategy: capitalized multi-word sequences AND single capitalized words
+        that correspond to KG node names. We scan the text for Title-Case
+        sequences and filter out common non-entity words.
+        """
+        # Multi-word Title-Case: "King Aldric", "Queen Kaya", "Lord Varyk"
+        multi_re = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b")
+        # Single capitalized word (min 3 chars): "Lyra", "Excalibur", "Aldric"
+        single_re = re.compile(r"\b([A-Z][a-z]{2,})\b")
+
+        candidates: List[Tuple[int, int, str]] = []
+        for m in multi_re.finditer(text):
+            candidates.append((m.start(), m.end(), m.group(1).strip()))
+        # Add single words not already captured by multi-word regex
+        for m in single_re.finditer(text):
+            if not any(s == m.start() for s, _, _ in candidates):
+                candidates.append((m.start(), m.end(), m.group(1).strip()))
+
+        # Filter out common non-entity patterns (title-case titles, pronouns, etc.)
+        filtered: List[Tuple[int, int, str]] = []
+        for start, end, name in candidates:
+            if name.lower() in (
+                "the party", "the group", "the player", "the dm", "the dungeon master",
+                "the narrator", "the dm", "you", "your", "i", "he", "she", "they",
+                "it", "we", "us", "them", "his", "her", "their", "a", "an",
+                "chapter", "scene", "session", "episode", "turn", "round",
+                "the", "and", "but", "or", "so", "yet", "for", "nor",
+                "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+                "king", "queen", "lord", "sir", "lady", "saint", "dragon",
+            ):
+                continue
+            if len(name) < 2:
+                continue
+            filtered.append((start, end, name))
+
+        # Cross-reference with KG: only keep candidates that match a KG node name
+        matched: List[str] = []
+        for start, end, name in filtered:
+            if self.kg.get_node_by_name(name):
+                matched.append(name)
+            else:
+                # Try case-insensitive match
+                found = self.kg.get_node_by_name(name.lower())
+                if found:
+                    matched.append(found.name)  # Use KG's canonical casing
+
+        return matched
 
     def _extract_svo_triples(self, text: str) -> List[Tuple[str, str, str]]:
         """
         Extract (subject, verb, object) triples from narrative text.
 
+        Gap 5 improvement: works with both [[Wikilinks]] AND freeform entity names
+        that match KG nodes. This means the SVO backstop catches prose like:
+          "King Aldric gives Excalibur to the party"
+        even without Wikilinks.
+
         Approach:
-        1. For each known transfer verb, find all occurrences
-        2. For each occurrence, find the sentence bounds (between punctuation)
-        3. Collect Wikilinks in that sentence
-        4. Pair Wikilinks before verb as subject, Wikilinks after as object
-           If only one Wikilink exists, record it as the object (subject="")
+        1. Collect Wikilinks AND KG-matching freeform names from the text
+        2. For each known transfer verb, find all occurrences
+        3. For each occurrence, find the sentence bounds
+        4. Pair entities before verb as subject, entities after as object
         """
         triples = []
 
+        # Collect Wikilinks
         wikilinks: List[Tuple[int, int, str]] = []
         for m in re.finditer(r"\[\[([^\]]+)\]\]", text):
             wikilinks.append((m.start(), m.end(), m.group(1).strip()))
 
-        if not wikilinks:
+        # Collect KG-matching freeform entity names
+        kg_names: List[Tuple[int, int, str]] = []
+        for name in self._extract_entity_names_from_text(text):
+            node = self.kg.get_node_by_name(name)
+            if not node:
+                continue
+            # Find all occurrences of this name in text
+            for m in re.finditer(rf"\b{re.escape(name)}\b", text):
+                kg_names.append((m.start(), m.end(), name))
+
+        if not wikilinks and not kg_names:
             return []
 
-        wl_starts = {s for s, e, n in wikilinks}
-        wl_ends = {e for s, e, n in wikilinks}
+        # Merge and deduplicate (prefer Wikilinks for canonical casing)
+        wikilink_names = {n for _, _, n in wikilinks}
+        all_entities: List[Tuple[int, int, str]] = []
+        for t in wikilinks:
+            all_entities.append(t)
+        for t in kg_names:
+            # Don't duplicate if a Wikilink with the same canonical name exists
+            if t[2] not in wikilink_names:
+                all_entities.append(t)
+
+        all_entities.sort(key=lambda x: x[0])
 
         for verb_phrase in self._TRANSFER_VERBS:
             for m in re.finditer(rf"\b{re.escape(verb_phrase)}\b", text, re.IGNORECASE):
                 verb_start, verb_end = m.start(), m.end()
 
-                # Find sentence boundaries: before the verb, after the verb
-                # Look backward for [.!?] from verb_start
+                # Find sentence boundaries
                 sent_start = 0
                 for i in range(verb_start - 1, max(verb_start - 200, -1), -1):
                     if text[i] in '.!?':
                         sent_start = i + 1
                         break
-                # Look forward for [.!?] from verb_end
                 sent_end = len(text)
                 for i in range(verb_end, min(verb_end + 200, len(text))):
                     if text[i] in '.!?':
                         sent_end = i + 1
                         break
 
-                # Filter wikilinks to this sentence
-                in_sent = [(s, e, n) for s, e, n in wikilinks
+                # Filter entities to this sentence
+                in_sent = [(s, e, n) for s, e, n in all_entities
                             if s >= sent_start and e <= sent_end]
 
-                # Classify by position relative to verb (using original text positions)
+                # Classify by position relative to verb
                 before = [n for s, e, n in in_sent if e <= verb_start]
                 after = [n for s, e, n in in_sent if s >= verb_end]
 
                 if after:
-                    # Object Wikilink found (appears during or after the verb)
                     obj = after[0]
                     subj = before[-1] if before else ""
                     triples.append((subj, verb_phrase, obj))
@@ -268,18 +355,53 @@ class HardGuardrails:
     ) -> bool:
         """
         Check if any proposed mutation accounts for the implied SVO relationship.
-        A mutation 'covers' the triple if it mentions both the subject and the object.
+
+        For most verbs: mutation must mention both subject AND object.
+        For transfer verbs (POSSESSES, ALLIED_WITH, HOSTILE_TOWARD): mutation's
+        node_name must match the transferred entity (SVO object) and predicate
+        must match — the old owner (SVO subject) is implicitly removed from
+        possession and needs no separate mutation.
         """
         subject, verb, obj = svo
         if not subject or not obj:
             return False
+
+        transfer_predicate = self._TRANSFER_VERBS.get(verb)
 
         for mutation in proposed_mutations:
             mut_node = (mutation.node_name or "").lower()
             mut_target = (mutation.target_name or "").lower()
             mut_attr = (mutation.attribute or "").lower()
 
-            # Check if both subject and object appear in mutation fields
+            # For transfer verbs (POSSESSES, ALLIED_WITH, HOSTILE_TOWARD):
+            # - SVO subject = old owner/actor (implicit, no mutation needed)
+            # - SVO object = transferred entity (must be in node_name)
+            # - predicate must match the transfer type
+            if transfer_predicate is not None:
+                pred = (mutation.predicate or "").lower()
+                pred_matches = pred == transfer_predicate.value.lower()
+
+                if transfer_predicate == GraphPredicate.POSSESSES:
+                    # Transfer: node_name = transferred entity (SVO object)
+                    if obj.lower() in mut_node and pred_matches:
+                        return True
+                elif transfer_predicate == GraphPredicate.MEMBER_OF:
+                    # Membership: node_name = joiner (SVO subject)
+                    if subject.lower() in mut_node and pred_matches:
+                        return True
+                elif transfer_predicate in (
+                    GraphPredicate.ALLIED_WITH,
+                    GraphPredicate.HOSTILE_TOWARD,
+                ):
+                    # Alliance/hostility: node_name = actor (SVO subject),
+                    # target_name = target (SVO object)
+                    if (subject.lower() in mut_node and obj.lower() in mut_target
+                            and pred_matches):
+                        return True
+                continue
+
+            # For non-transfer verbs (None predicate like "kills"): both subject
+            # and object must appear in mutation fields
             subject_present = (
                 subject.lower() in mut_node
                 or subject.lower() in mut_target
@@ -303,12 +425,15 @@ class HardGuardrails:
         ctx: Dict[str, Any],
     ) -> GuardrailResult:
         """
-        Gap 4 fix: Detect narrative-implied world state changes and verify
+        Gap 4 / Gap 5 fix: Detect narrative-implied world state changes and verify
         that corresponding mutations have been emitted.
 
         For example:
           "King Aldric gives [[Excalibur]] to the party"
           → No mutation touching both King Aldric and Excalibur = REJECTED.
+
+        Also handles freeform prose (no Wikilinks required) as long as entity
+        names match nodes in the KG.
 
         Returns GuardrailResult.disallowed if any SVO claim lacks a covering mutation.
         """
@@ -334,7 +459,18 @@ class HardGuardrails:
 
         uncovered = []
         for svo in triples:
-            if svo[0] and svo[2] and not self._mutation_covers_svo(svo, proposed_mutations):
+            subj, verb, obj = svo
+            if not subj or not obj:
+                continue
+            # Verbs with None predicate (kills, destroys) don't map to KG edges
+            # but still imply a world-state claim — flag them as needing a mutation
+            # if any proposed mutation touches the same entities
+            if self._TRANSFER_VERBS.get(verb) is None:
+                # No KG predicate, but verify at least one mutation mentions both entities
+                if not self._mutation_covers_svo(svo, proposed_mutations):
+                    uncovered.append(svo)
+                continue
+            if not self._mutation_covers_svo(svo, proposed_mutations):
                 uncovered.append(svo)
 
         if uncovered:
@@ -359,21 +495,28 @@ class HardGuardrails:
         ctx: Dict[str, Any],
     ) -> GuardrailResult:
         """
-        Run all hard guardrail checks.
+        Run all hard guardrail checks and aggregate ALL failures into a single result.
 
-        Returns the first rejection found (fail-fast), or allows if all pass.
+        This replaces the previous fail-fast approach (return on first rejection).
+        Returning all violations at once lets the LLM fix everything in one revision
+        instead of cycling through one issue per QA loop.
         """
+        all_reasons: List[str] = []
+        all_revisions: List[str] = []
+
         # 1. Narrative claim check (Wikilinks only — entity existence)
         claim_result = self.validate_narrative_claim(narrative_text, ctx)
         if not claim_result.allowed:
-            return claim_result
+            all_reasons.append(claim_result.reason)
+            all_revisions.extend(claim_result.required_revisions)
 
-        # 2. Gap 4: SVO claim validation — cross-reference implied world changes vs mutations
+        # 2. Gap 4 / Gap 5: SVO claim validation — cross-reference implied world changes vs mutations
         svo_result = self.validate_svo_claims(narrative_text, proposed_mutations, ctx)
         if not svo_result.allowed:
-            return svo_result
+            all_reasons.append(svo_result.reason)
+            all_revisions.extend(svo_result.required_revisions)
 
-        # 3. Validate each mutation
+        # 3. Validate each mutation (collect all failures)
         for mutation in proposed_mutations:
             node_uuid = mutation._resolve_node_uuid(self.kg)
 
@@ -381,12 +524,21 @@ class HardGuardrails:
             if node_uuid:
                 imm_result = self.validate_immutable_violation(node_uuid, mutation)
                 if not imm_result.allowed:
-                    return imm_result
+                    all_reasons.append(imm_result.reason)
+                    all_revisions.extend(imm_result.required_revisions)
 
             # Consistency check
             cons_result = self.validate_graph_consistency(mutation)
             if not cons_result.allowed:
-                return cons_result
+                all_reasons.append(cons_result.reason)
+                all_revisions.extend(cons_result.required_revisions)
+
+        if all_reasons:
+            return GuardrailResult(
+                allowed=False,
+                reason="; ".join(all_reasons),
+                required_revisions=all_revisions,
+            )
 
         return GuardrailResult(allowed=True)
 

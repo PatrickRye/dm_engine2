@@ -118,17 +118,13 @@ class TestMutationCapture:
         # Prose claims the king gives Excalibur to the player
         # but NO mutation was emitted (empty list)
         result = guardrails.validate_full_pipeline(
-            narrative_text="King Aldric presses Excalibur into your hands. "
+            narrative_text="King Aldric gives Excalibur to the party. "
                           "The blade feels warm with ancient power.",
             proposed_mutations=[],  # NO mutation — prose implies world change without mutation
             ctx={},
         )
-        # The current implementation only checks Wikilinks and entity existence.
-        # It does NOT detect SVO claims (king GIVES sword) vs KG state.
-        # This test documents the CURRENT behavior (passes) and the DESIRED behavior (should fail).
-        # After implementing Gap 1 (SVO validation), this should be changed to:
-        # assert not result.allowed
-        assert result.allowed, "Current implementation does not catch unmutated prose claims"
+        # Gap 5 (SVO validation): rejects prose claiming world state changes without mutations
+        assert not result.allowed, "SVO validation should reject unmutated prose claims"
 
 
 class TestMutationExecution:
@@ -332,7 +328,7 @@ class TestNarrativeMutationBinding:
         assert self.kg.get_node_by_name("Excalibur") is not None
 
         prose = (
-            "King Aldric presses [[Excalibur]] into your hands. "
+            "King Aldric gives [[Excalibur]] to the party. "
             "The blade feels warm with ancient power."
         )
 
