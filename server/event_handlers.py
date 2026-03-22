@@ -1593,6 +1593,12 @@ def resolve_movement_handler(event: GameEvent):  # noqa: C901
         if not has_reaction and not has_legendary:
             continue
 
+        if any(
+            c.name.lower() in ["incapacitated", "unconscious", "stunned", "paralyzed", "petrified", "dead"]
+            for c in potential_attacker.active_conditions
+        ):
+            continue
+
         # Check hostility
         is_entity_pc = any(t in entity.tags for t in ["pc", "player", "party_npc"])
         is_attacker_pc = any(t in potential_attacker.tags for t in ["pc", "player", "party_npc"])

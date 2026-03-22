@@ -2544,20 +2544,57 @@ async def move_entity(  # noqa: C901
             if getattr(ent, "mounted_on_uuid", None) == entity.entity_uuid:
                 riders.append(ent)
 
-    # --- REQ-GEO-006: Cannot end movement in an occupied space ---
-    if movement_type.lower() not in ["teleport", "forced", "fall"]:
+    # --- REQ-GEO-006 & REQ-SPC-003: Cannot end movement in an occupied space ---
+    forced_collision_msg = ""
+    if movement_type.lower() not in ["teleport", "fall"]:
         dragged_uuids = {d.entity_uuid for d in dragged_entities}
         rider_uuids = {r.entity_uuid for r in riders}
         occupants = spatial_service.get_entities_at_position(
             target_x, target_y, entity.size, vault_path, exclude_uuid=entity.entity_uuid
         )
-        for occ in occupants:
-            if occ.entity_uuid in dragged_uuids or occ.entity_uuid in rider_uuids:
-                continue
-            if hasattr(occ, "hp") and getattr(occ.hp, "base_value", 0) > 0:
+        valid_occupants = [
+            occ
+            for occ in occupants
+            if occ.entity_uuid not in dragged_uuids
+            and occ.entity_uuid not in rider_uuids
+            and hasattr(occ, "hp")
+            and getattr(occ.hp, "base_value", 0) > 0
+        ]
+
+        if valid_occupants:
+            if movement_type.lower() == "forced":
+                # REQ-SPC-003: Forced Displacement Collision (Shunt and Prone)
+                dx, dy = target_x - old_x, target_y - old_y
+                dist_val = math.hypot(dx, dy)
+                if dist_val > 0:
+                    nx, ny = dx / dist_val, dy / dist_val
+                    for step in range(1, int(dist_val) + 5):
+                        check_x = target_x - (nx * step)
+                        check_y = target_y - (ny * step)
+                        occ = spatial_service.get_entities_at_position(
+                            check_x, check_y, entity.size, vault_path, exclude_uuid=entity.entity_uuid
+                        )
+                        v_occ = [
+                            o
+                            for o in occ
+                            if o.entity_uuid not in dragged_uuids
+                            and o.entity_uuid not in rider_uuids
+                            and hasattr(o, "hp")
+                            and getattr(o.hp, "base_value", 0) > 0
+                        ]
+                        if not v_occ:
+                            target_x, target_y = check_x, check_y
+                            break
+                if not any(c.name.lower() == "prone" for c in entity.active_conditions):
+                    entity.active_conditions.append(ActiveCondition(name="Prone", source_name="Forced Collision"))
+                forced_collision_msg = (
+                    f"\nSYSTEM ALERT (REQ-SPC-003): {entity.name} was forced into an occupied space! "
+                    f"They were shunted to ({round(target_x, 1)}, {round(target_y, 1)}) and fell Prone."
+                )
+            else:
                 return (
                     f"SYSTEM ERROR (REQ-GEO-006): {entity.name} cannot end their movement in "
-                    f"{occ.name}'s occupied space. Choose an adjacent unoccupied square instead."
+                    f"{valid_occupants[0].name}'s occupied space. Choose an adjacent unoccupied square instead."
                 )
 
     # --- Check for Wall Collisions ---
@@ -2780,6 +2817,8 @@ async def move_entity(  # noqa: C901
         base_msg += f" Their riders {', '.join(rider_msg_parts)} moved with them."
     for msg in forced_dismount_msgs:
         base_msg += msg
+    if forced_collision_msg:
+        base_msg += forced_collision_msg
 
     for aura_msg in terrain_aura_msgs:
         base_msg += aura_msg

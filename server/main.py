@@ -680,6 +680,14 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                     is_entity_pc = any(t in entity.tags for t in ["pc", "player", "party_npc"])
                     is_other_pc = any(t in other_entity.tags for t in ["pc", "player", "party_npc"])
 
+                    is_other_incapacitated = any(
+                        c.name.lower() in ["incapacitated", "unconscious", "stunned", "paralyzed", "petrified", "dead"]
+                        for c in getattr(other_entity, "active_conditions", [])
+                    )
+                    is_other_tiny = (
+                        "tiny" in [t.lower() for t in getattr(other_entity, "tags", [])] or other_entity.size <= 2.5
+                    )
+
                     def size_cat(size: float, tags: list):
                         tags_lower = [t.lower() for t in tags]
                         if "tiny" in tags_lower:
@@ -705,7 +713,13 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                     cat_e = size_cat(entity.size, getattr(entity, "tags", []))
                     cat_o = size_cat(other_entity.size, getattr(other_entity, "tags", []))
 
-                    if is_entity_pc != is_other_pc and abs(cat_e - cat_o) < 2:
+                    # REQ-MOV-012: Tiny/Incapacitated allow passage. Otherwise check size diff.
+                    if (
+                        is_entity_pc != is_other_pc
+                        and abs(cat_e - cat_o) < 2
+                        and not is_other_incapacitated
+                        and not is_other_tiny
+                    ):
                         is_valid = False
                         invalid_reason = (
                             f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
@@ -769,6 +783,12 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                     and getattr(other_entity.hp, "base_value", 0) > 0
                 ):
                     if is_disengaging and "ignores_disengage" not in getattr(other_entity, "tags", []):
+                        continue
+
+                    if any(
+                        c.name.lower() in ["incapacitated", "unconscious", "stunned", "paralyzed", "petrified", "dead"]
+                        for c in getattr(other_entity, "active_conditions", [])
+                    ):
                         continue
 
                     base_reach = _calculate_reach(other_entity, is_active_turn=False)
