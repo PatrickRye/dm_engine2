@@ -1454,6 +1454,35 @@ def validate_movement_handler(event: GameEvent):
     if event.payload.get("dragged_uuids"):
         cost_multiplier += 1  # Dragging halves speed (costs 1 extra foot per foot)
 
+    # REQ-GEO-007/008: Moving through another creature's space counts as Difficult Terrain.
+    # Only applies to active combatants; excludes entities already occupying the mover's
+    # start position (stacked PCs) and the dragged entity.
+    entity_cross_dist = 0.0
+    if movement_type not in ["teleport", "forced", "fall", "travel"]:
+        dragged_set = set(event.payload.get("dragged_uuids", []))
+        vault_combatants = set(spatial_service.active_combatants.get(event.vault_path, []))
+        start_x, start_y = entity.x, entity.y
+        target_x = event.payload.get("target_x", start_x)
+        target_y = event.payload.get("target_y", start_y)
+        for cross_ent, cross_len in spatial_service.get_entities_on_path(
+            start_x, start_y, target_x, target_y,
+            event.vault_path,
+            exclude_uuid=event.source_uuid,
+        ):
+            if cross_ent.entity_uuid in dragged_set:
+                continue
+            if cross_ent.name not in vault_combatants:
+                continue
+            if not (getattr(cross_ent, "hp", None) and getattr(cross_ent.hp, "base_value", 0) > 0):
+                continue
+            # Skip entities whose bbox already contains the mover's start position (stacked)
+            half = getattr(cross_ent, "size", 5.0) / 2
+            if (cross_ent.x - half <= start_x <= cross_ent.x + half and
+                    cross_ent.y - half <= start_y <= cross_ent.y + half):
+                continue
+            entity_cross_dist += cross_len
+    diff_dist += entity_cross_dist
+
     raw_dist = (normal_dist * cost_multiplier) + (diff_dist * (cost_multiplier + 1))
     total_cost = math.ceil(int(raw_dist * 100) / 100.0)
 

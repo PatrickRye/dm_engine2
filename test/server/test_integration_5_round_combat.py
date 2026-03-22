@@ -51,19 +51,20 @@ def mock_5_round_vault(mock_obsidian_vault):
                 f"equipment: {{main_hand: {weapon}}}\nx: 0.0\ny: 0.0\n---\n"
             )
 
-    # NPCs
+    # NPCs — y-positions match the test's spatial_service.sync_entity overrides so JIT loads
+    # get the same coordinates even if loaded fresh from vault.
     npc_data = [
-        ("Troll", 84, 15, 4, 1, "Claws", "vulnerabilities: [fire]"),
-        ("Orc1", 30, 13, 3, 1, "Greataxe", ""),
-        ("Orc2", 30, 13, 3, 1, "Greataxe", ""),
-        ("Goblin", 15, 15, -1, 2, "Scimitar", "tags: [nimble_escape]"),
+        ("Troll",  84, 15,  4, 1, "Claws",    "vulnerabilities: [fire]", 30.0,   0.0),
+        ("Orc1",   30, 13,  3, 1, "Greataxe", "",                        30.0,  -5.0),
+        ("Orc2",   30, 13,  3, 1, "Greataxe", "",                        30.0, -10.0),
+        ("Goblin", 15, 15, -1, 2, "Scimitar", "tags: [nimble_escape]",   30.0,   5.0),
     ]
-    for name, hp, ac, str_mod, dex_mod, weapon, extra in npc_data:
+    for name, hp, ac, str_mod, dex_mod, weapon, extra, nx, ny in npc_data:
         with open(os.path.join(journals_dir, f"{name}.md"), "w", encoding="utf-8") as f:
             f.write(
                 f"---\nname: {name}\ntags: [monster]\nhp: {hp}\nmax_hp: {hp}\nac: {ac}\n"
                 f"strength_mod: {str_mod}\ndexterity_mod: {dex_mod}\n"
-                f"equipment: {{main_hand: {weapon}}}\nx: 30.0\ny: 0.0\n{extra}\n---\n"
+                f"equipment: {{main_hand: {weapon}}}\nx: {nx}\ny: {ny}\n{extra}\n---\n"
             )
 
     with open(os.path.join(journals_dir, "CAMPAIGN_MASTER.md"), "w", encoding="utf-8") as f:

@@ -436,9 +436,10 @@ async def execute_melee_attack(
     dist = spatial_service.calculate_distance(attacker.x, attacker.y, attacker.z, target.x, target.y, target.z, vault_path)
     is_active_turn = not (is_reaction or is_opportunity_attack or is_legendary_action)
     base_reach = _calculate_reach(attacker, is_active_turn=is_active_turn)
-    eff_reach = base_reach + max(0, (attacker.size - 5.0) / 2.0) + max(0, (target.size - 5.0) / 2.0)
+    # REQ-GEO-011: Reach from bounding-box edge — eff_reach = weapon_reach + attacker_radius + target_radius
+    eff_reach = base_reach + (attacker.size / 2.0) + (target.size / 2.0)
 
-    if dist > eff_reach:
+    if dist >= eff_reach:
         return (
             f"SYSTEM ERROR: Target '{target.name}' is out of range. "
             f"Distance is {dist:.1f}ft, but {attacker.name}'s effective reach is {eff_reach:.1f}ft."
@@ -2405,6 +2406,22 @@ async def move_entity(  # noqa: C901
                     if cond.name.lower() == "grappled" and cond.source_uuid == entity.entity_uuid:
                         dragged_entities.append(ent)
 
+    # --- REQ-GEO-006: Cannot end movement in an occupied space ---
+    if movement_type.lower() not in ["teleport", "forced", "fall"]:
+        # dragged_entities are grappled by this mover — they travel with us, not a blocker
+        dragged_uuids = {d.entity_uuid for d in dragged_entities}
+        occupants = spatial_service.get_entities_at_position(
+            target_x, target_y, entity.size, vault_path, exclude_uuid=entity.entity_uuid
+        )
+        for occ in occupants:
+            if occ.entity_uuid in dragged_uuids:
+                continue
+            if hasattr(occ, "hp") and getattr(occ.hp, "base_value", 0) > 0:
+                return (
+                    f"SYSTEM ERROR (REQ-GEO-006): {entity.name} cannot end their movement in "
+                    f"{occ.name}'s occupied space. Choose an adjacent unoccupied square instead."
+                )
+
     # --- Check for Wall Collisions ---
     if movement_type.lower() in ["walk", "crawl", "disengage"]:
         if dz > 1.5:
@@ -2478,11 +2495,69 @@ async def move_entity(  # noqa: C901
             f"(call `use_dash_action`), pick a shorter route, or do something else."
         )
 
+    # REQ-ENV-011: Save terrain zones BEFORE position update to detect enter/leave
+    old_terrain_zones = list(spatial_service.get_entity_terrain_zones(entity.entity_uuid, vault_path))
+
     entity.x = target_x
     entity.y = target_y
     entity.z = target_z
 
     spatial_service.sync_entity(entity)
+
+    # REQ-ENV-011: Terrain aura — apply/remove conditions based on zone tags like "aura:Deafened"
+    terrain_aura_msgs = []
+    new_terrain_zones = list(spatial_service.get_entity_terrain_zones(entity.entity_uuid, vault_path))
+    old_zone_ids = {z.zone_id for z in old_terrain_zones}
+    new_zone_ids = {z.zone_id for z in new_terrain_zones}
+    entered_zones = [z for z in new_terrain_zones if z.zone_id not in old_zone_ids]
+    left_zones = [z for z in old_terrain_zones if z.zone_id not in new_zone_ids]
+    for zone in entered_zones:
+        for tag in zone.tags:
+            if tag.startswith("aura:"):
+                cond_name = tag[5:]
+                already = any(
+                    c.name.lower() == cond_name.lower() and c.source_name == zone.label
+                    for c in entity.active_conditions
+                )
+                if not already:
+                    entity.active_conditions.append(
+                        ActiveCondition(name=cond_name, source_name=zone.label, duration_seconds=-1)
+                    )
+                    terrain_aura_msgs.append(
+                        f"\nSYSTEM ALERT (REQ-ENV-011): {entity.name} entered '{zone.label}' "
+                        f"— gained {cond_name} condition (aura). Will be removed when they leave."
+                    )
+    for zone in left_zones:
+        for tag in zone.tags:
+            if tag.startswith("aura:"):
+                cond_name = tag[5:]
+                before = len(entity.active_conditions)
+                entity.active_conditions = [
+                    c for c in entity.active_conditions
+                    if not (c.name.lower() == cond_name.lower() and c.source_name == zone.label)
+                ]
+                if len(entity.active_conditions) < before:
+                    terrain_aura_msgs.append(
+                        f"\nSYSTEM ALERT (REQ-ENV-011): {entity.name} left '{zone.label}' "
+                        f"— lost {cond_name} condition (aura)."
+                    )
+
+    # REQ-ILL-001: Physical intersection auto-reveals non-phantasm illusion walls the entity passed through
+    illusion_reveal_msgs = []
+    if movement_type.lower() not in ["teleport", "fall"] and HAS_GIS:
+        from shapely.geometry import LineString as _LineString
+        path_line = _LineString([(old_x, old_y), (target_x, target_y)])
+        entity_uuid_str = str(entity.entity_uuid)
+        for illusion_wall in spatial_service.get_illusion_walls(vault_path):
+            if illusion_wall.is_phantasm:
+                continue  # Phantasm: physical pass-through doesn't auto-reveal (REQ-ILL-004)
+            if entity_uuid_str not in illusion_wall.revealed_for and illusion_wall.line and path_line.intersects(illusion_wall.line):
+                illusion_wall.revealed_for.append(entity_uuid_str)
+                spatial_service.invalidate_cache(vault_path)
+                illusion_reveal_msgs.append(
+                    f"\nSYSTEM ALERT (REQ-ILL-001): {entity.name} physically passed through illusion "
+                    f"'{illusion_wall.label}' — it is now revealed to them as an illusion."
+                )
 
     # Apply movement to dragged entities
     dx, dy = target_x - old_x, target_y - old_y
@@ -2526,6 +2601,12 @@ async def move_entity(  # noqa: C901
     if drag_msg_parts:
         base_msg += f" They automatically dragged {', '.join(drag_msg_parts)} with them."
 
+    for aura_msg in terrain_aura_msgs:
+        base_msg += aura_msg
+
+    for ill_msg in illusion_reveal_msgs:
+        base_msg += ill_msg
+
     if movement_type.lower() == "teleport":
         can_see = spatial_service.has_line_of_sight_to_point(entity.entity_uuid, target_x, target_y)
         if not can_see:
@@ -2547,7 +2628,8 @@ async def move_entity(  # noqa: C901
             ):
                 if other_entity.name not in attackers:
                     base_reach = _calculate_reach(other_entity, is_active_turn=False)
-                    eff_reach = base_reach + max(0, (other_entity.size - 5.0) / 2.0) + max(0, (entity.size - 5.0) / 2.0)
+                    # REQ-GEO-011: Reach from bounding-box edge
+                    eff_reach = base_reach + (other_entity.size / 2.0) + (entity.size / 2.0)
 
                     dist_before = spatial_service.calculate_distance(
                         old_x, old_y, old_z, other_entity.x, other_entity.y, other_entity.z, vault_path
@@ -2555,7 +2637,7 @@ async def move_entity(  # noqa: C901
                     dist_after = spatial_service.calculate_distance(
                         target_x, target_y, target_z, other_entity.x, other_entity.y, other_entity.z, vault_path
                     )
-                    if dist_before <= eff_reach and dist_after > eff_reach:
+                    if dist_before < eff_reach and dist_after >= eff_reach:
                         attackers.append(other_entity.name)
 
     if attackers:
@@ -4456,3 +4538,159 @@ async def ingest_battlemap_json(map_json_str: str, *, config: Annotated[Runnable
         )
     except Exception as e:
         return f"SYSTEM ERROR: Failed to ingest battlemap JSON. Error: {str(e)}"
+
+
+# ===== REQ-ILL: Illusion Wall Tools =====
+
+
+@tool
+async def create_illusion_wall(
+    label: str,
+    start_x: float,
+    start_y: float,
+    end_x: float,
+    end_y: float,
+    spell_dc: int = 13,
+    is_phantasm: bool = False,
+    z: float = 0.0,
+    height: float = 10.0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-ILL: Creates an illusory wall segment.
+    The illusion blocks line of sight (is_visible=True) but NOT physical movement or attacks (is_solid=False).
+    is_phantasm=True means physical intersection by others does NOT auto-reveal it (mental-only illusion).
+    spell_dc is the Investigation DC to see through it (REQ-ILL-002)."""
+    vault_path = config["configurable"].get("thread_id")
+    wall = Wall(
+        label=label,
+        start=(start_x, start_y),
+        end=(end_x, end_y),
+        z=z,
+        height=height,
+        is_solid=False,
+        is_visible=True,
+        is_illusion=True,
+        is_phantasm=is_phantasm,
+        illusion_spell_dc=spell_dc,
+    )
+    spatial_service.add_wall(wall, is_temporary=True, vault_path=vault_path)
+    kind = "phantasm (mental only)" if is_phantasm else "illusion"
+    return (
+        f"MECHANICAL TRUTH (REQ-ILL): Created {kind} wall '{label}' "
+        f"from ({start_x}, {start_y}) to ({end_x}, {end_y}). "
+        f"It blocks line of sight but NOT physical movement or attacks. "
+        f"Investigation DC {spell_dc} to disbelieve (REQ-ILL-002). "
+        f"Wall ID: {wall.wall_id}"
+    )
+
+
+@tool
+async def investigate_illusion(
+    entity_name: str,
+    illusion_label: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-ILL-002: Entity spends an action to investigate a suspected illusion.
+    Performs an Intelligence (Investigation) check vs the illusion's spell DC.
+    On success the illusion is revealed to that entity (they see through it)."""
+    vault_path = config["configurable"].get("thread_id")
+    entity = await _get_entity_by_name(entity_name, vault_path)
+    if not entity:
+        return f"SYSTEM ERROR: Entity '{entity_name}' not found."
+
+    # REQ-ILL-006: Truesight auto-succeeds
+    has_truesight = any(
+        t == "truesight" or t.startswith("truesight_") for t in getattr(entity, "tags", [])
+    )
+
+    illusion_walls = spatial_service.get_illusion_walls(vault_path)
+    target_wall = None
+    for w in illusion_walls:
+        if w.label.lower() == illusion_label.lower():
+            target_wall = w
+            break
+    if not target_wall:
+        return (
+            f"SYSTEM ERROR: No illusion wall named '{illusion_label}' found. "
+            f"Available illusions: {[w.label for w in illusion_walls] or 'none'}"
+        )
+
+    entity_uuid_str = str(entity.entity_uuid)
+    if entity_uuid_str in target_wall.revealed_for:
+        return f"MECHANICAL TRUTH: {entity.name} already sees through '{illusion_label}' — it is revealed to them."
+
+    if has_truesight:
+        target_wall.revealed_for.append(entity_uuid_str)
+        spatial_service.invalidate_cache(vault_path)
+        return (
+            f"MECHANICAL TRUTH (REQ-ILL-006): {entity.name} has Truesight — "
+            f"they automatically see through '{illusion_label}'. It is now revealed to them."
+        )
+
+    # Roll Intelligence (Investigation)
+    int_mod = getattr(entity, "intelligence_mod", None)
+    int_bonus = int_mod.total if int_mod else 0
+    roll = random.randint(1, 20)
+    total = roll + int_bonus
+    dc = target_wall.illusion_spell_dc
+
+    if total >= dc:
+        target_wall.revealed_for.append(entity_uuid_str)
+        spatial_service.invalidate_cache(vault_path)
+        return (
+            f"MECHANICAL TRUTH (REQ-ILL-002): {entity.name} investigates '{illusion_label}': "
+            f"rolled {roll} + {int_bonus} = {total} vs DC {dc}. SUCCESS — they see through the illusion! "
+            f"'{illusion_label}' is now transparent to {entity.name}."
+        )
+    else:
+        return (
+            f"MECHANICAL TRUTH (REQ-ILL-002): {entity.name} investigates '{illusion_label}': "
+            f"rolled {roll} + {int_bonus} = {total} vs DC {dc}. FAILURE — the illusion holds."
+        )
+
+
+@tool
+async def reveal_illusion(
+    illusion_label: str,
+    entity_name: str = "",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-ILL-003: Reveals an illusion wall (post-reveal = transparent, no longer blocks LOS).
+    If entity_name is provided, reveals it only to that entity; otherwise reveals it globally (all entities).
+    Use this when an illusion is dispelled, the caster is incapacitated, or a DM narrative event reveals it."""
+    vault_path = config["configurable"].get("thread_id")
+    illusion_walls = spatial_service.get_illusion_walls(vault_path)
+    target_wall = None
+    for w in illusion_walls:
+        if w.label.lower() == illusion_label.lower():
+            target_wall = w
+            break
+    if not target_wall:
+        return (
+            f"SYSTEM ERROR: No illusion wall named '{illusion_label}'. "
+            f"Available: {[w.label for w in illusion_walls] or 'none'}"
+        )
+
+    if entity_name:
+        entity = await _get_entity_by_name(entity_name, vault_path)
+        if not entity:
+            return f"SYSTEM ERROR: Entity '{entity_name}' not found."
+        uid_str = str(entity.entity_uuid)
+        if uid_str not in target_wall.revealed_for:
+            target_wall.revealed_for.append(uid_str)
+        spatial_service.invalidate_cache(vault_path)
+        return (
+            f"MECHANICAL TRUTH (REQ-ILL-003): '{illusion_label}' has been revealed to {entity.name}. "
+            f"It is now transparent to them (no longer blocks their line of sight)."
+        )
+    else:
+        # Global reveal: make wall no longer block vision for anyone
+        target_wall.is_visible = False
+        spatial_service.invalidate_cache(vault_path)
+        return (
+            f"MECHANICAL TRUTH (REQ-ILL-003): '{illusion_label}' has been globally revealed — "
+            f"it is now transparent to all creatures (no longer blocks line of sight)."
+        )

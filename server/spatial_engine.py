@@ -58,6 +58,12 @@ class Wall(BaseModel):
     interact_dc: Optional[int] = None
     trap: Optional[TrapDefinition] = None
 
+    # REQ-ILL: Illusion fields
+    is_illusion: bool = False      # True = illusion wall (blocks LOS/perception, not attacks)
+    is_phantasm: bool = False      # True = mental only (physical pass-through doesn't auto-reveal)
+    illusion_spell_dc: int = 0     # DC for Investigation check to disbelieve
+    revealed_for: List[str] = Field(default_factory=list)  # entity UUID strings that have seen through it
+
     hp: Optional[int] = None
     max_hp: Optional[int] = None
     ac: int = 10
@@ -465,6 +471,81 @@ class SpatialQueryService:
     def get_entity_terrain_zones(self, entity_uuid: uuid.UUID, vault_path: str = "default") -> List[TerrainZone]:
         """Returns the list of terrain zones the entity is currently occupying (O(1) lookup)."""
         return self._entity_terrain_occupancy.get(vault_path, {}).get(entity_uuid, [])
+
+    def get_entities_at_position(
+        self,
+        x: float,
+        y: float,
+        size: float,
+        vault_path: str = "default",
+        exclude_uuid: Optional[uuid.UUID] = None,
+    ) -> list:
+        """REQ-GEO-006: Returns entities whose bounding box meaningfully overlaps the given position+size box.
+        Edge-touching is NOT counted as occupation (area must be > 0). exclude_uuid skips that entity."""
+        if not HAS_GIS:
+            return []
+        self.get_map_data(vault_path)
+        if vault_path not in self.entity_idx:
+            return []
+        half = size / 2.0
+        query_bbox = (x - half, y - half, x + half, y + half)
+        query_shape = box(x - half, y - half, x + half, y + half)
+        candidates = list(self.entity_idx[vault_path].intersection(query_bbox))
+        result = []
+        for cid in candidates:
+            uid = self._id_to_uuid[vault_path].get(cid)
+            if uid is None or uid == exclude_uuid:
+                continue
+            entity = self._entities[vault_path].get(uid)
+            if entity is None:
+                continue
+            entity_shape = self._uuid_to_shape[vault_path].get(uid)
+            if entity_shape is None:
+                entity_shape = box(*self._get_bbox(entity))
+            # Use area > 0: edge-touching is legal (adjacent), actual overlap is not (REQ-GEO-006)
+            if query_shape.intersection(entity_shape).area > 0:
+                result.append(entity)
+        return result
+
+    def get_illusion_walls(self, vault_path: str = "default") -> List[Wall]:
+        """Returns all illusion walls currently in the map (REQ-ILL)."""
+        return [w for w in self.get_map_data(vault_path).active_walls if w.is_illusion]
+
+    def get_entities_on_path(
+        self,
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+        vault_path: str = "default",
+        exclude_uuid: Optional[uuid.UUID] = None,
+    ) -> list:
+        """REQ-GEO-007/008: Returns (entity, overlap_length) pairs for living entities whose bounding box
+        the path line passes through with non-zero intersection length."""
+        if not HAS_GIS:
+            return []
+        self.get_map_data(vault_path)
+        if vault_path not in self.entity_idx:
+            return []
+        path = LineString([(start_x, start_y), (end_x, end_y)])
+        if path.length == 0:
+            return []
+        candidates = list(self.entity_idx[vault_path].intersection(path.bounds))
+        result = []
+        for cid in candidates:
+            uid = self._id_to_uuid[vault_path].get(cid)
+            if uid is None or uid == exclude_uuid:
+                continue
+            entity = self._entities[vault_path].get(uid)
+            if entity is None:
+                continue
+            entity_shape = self._uuid_to_shape[vault_path].get(uid)
+            if entity_shape is None:
+                entity_shape = box(*self._get_bbox(entity))
+            inter = path.intersection(entity_shape)
+            if not inter.is_empty and inter.length > 0:
+                result.append((entity, inter.length))
+        return result
 
     def calculate_distance(
         self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float, vault_path: str = "default"
@@ -931,13 +1012,16 @@ class SpatialQueryService:
         end_z: float,
         entity_height: float = 5.0,
         check_vision: bool = False,
+        viewer_uuid: Optional[uuid.UUID] = None,
         vault_path: str = "default",
     ) -> Optional[Wall]:
-        """Returns the Wall object if the straight 3D line between start and end intersects it."""
+        """Returns the Wall object if the straight 3D line between start and end intersects it.
+        viewer_uuid: if set and check_vision=True, illusion walls revealed for this viewer are skipped (REQ-ILL)."""
         if not HAS_GIS:
             return False
         self.get_map_data(vault_path)
 
+        viewer_str = str(viewer_uuid) if viewer_uuid else None
         cache_key = (
             "path",
             round(start_x, 1),
@@ -948,6 +1032,7 @@ class SpatialQueryService:
             round(end_z, 1),
             round(entity_height, 1),
             check_vision,
+            viewer_str,
         )
         if cache_key in self._raycast_cache.get(vault_path, {}):
             return self._raycast_cache[vault_path][cache_key]
@@ -957,6 +1042,9 @@ class SpatialQueryService:
         for cid in wall_candidates:
             wall = self._wall_map[vault_path][cid]
             blocks = wall.is_visible if check_vision else wall.is_solid
+            # REQ-ILL: Skip illusion walls that have been revealed for this viewer
+            if check_vision and wall.is_illusion and viewer_str and viewer_str in wall.revealed_for:
+                continue
             if blocks and path.intersects(wall.line):
                 inter = path.intersection(wall.line)
                 if inter.is_empty:
