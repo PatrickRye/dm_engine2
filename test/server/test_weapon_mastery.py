@@ -1,6 +1,6 @@
 import pytest
 
-from dnd_rules_engine import Creature, ModifiableValue
+from dnd_rules_engine import Creature, ModifiableValue, GameEvent, EventBus
 from item_system import WeaponItem, ItemCompendium
 from compendium_manager import CompendiumEntry, MechanicEffect, CompendiumManager
 from registry import clear_registry, register_entity
@@ -264,3 +264,390 @@ async def test_req_mst_008_vex_mastery(setup_system, mock_dice):
     assert event.payload.get("advantage") is True
     assert event.payload.get("hit") is False
     assert not any(c.name == "Vexed" for c in target.active_conditions)
+
+
+@pytest.mark.asyncio
+async def test_req_mst_006_slow_mastery_on_hit(setup_system, mock_dice):
+    """
+    REQ-MST-006: Slow. On hit, reduce target's speed by 10ft. Doesn't stack.
+    Condition expires at start of attacker's next turn.
+    """
+    vault_path = setup_system
+    config = {"configurable": {"thread_id": vault_path}}
+
+    fighter = Creature(
+        name="Fighter",
+        vault_path=vault_path,
+        tags=["pc", "weapon_mastery"],
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=3),
+        dexterity_mod=ModifiableValue(base_value=0),
+        speed=30,
+        movement_remaining=30,
+    )
+    target = Creature(
+        name="Orc",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=30),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        speed=30,
+        movement_remaining=30,
+    )
+    register_entity(fighter)
+    register_entity(target)
+    spatial_service.sync_entity(fighter)
+    spatial_service.sync_entity(target)
+
+    os.makedirs(get_journals_dir(vault_path), exist_ok=True)
+    with open(os.path.join(get_journals_dir(vault_path), "Fighter.md"), "w") as f:
+        f.write("---\nequipment:\n  main_hand: None\n---")
+
+    slow_entry = CompendiumEntry(
+        name="Slow",
+        category="mastery",
+        action_type="Passive",
+        description="Slow the enemy.",
+        mechanics=MechanicEffect(trigger_event="on_hit", mastery_type="slow", speed_reduction=10),
+    )
+    await CompendiumManager.save_entry(vault_path, slow_entry)
+
+    longsword = WeaponItem(name="Longsword", damage_dice="1d8", damage_type="slashing", mastery_name="Slow")
+    await ItemCompendium.save_item(vault_path, longsword)
+    await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Longsword", "item_slot": "main_hand"}, config=config)
+
+    with mock_dice(15, 5):
+        res = await execute_melee_attack.ainvoke({"attacker_name": "Fighter", "target_name": "Orc"}, config=config)
+
+    assert "HIT!" in res
+    assert "Slow Mastery Triggered" in res
+    assert any(c.name == "Slowed" for c in target.active_conditions)
+    assert target.movement_remaining == 20  # 30 - 10
+
+    # Second hit on same target should not stack
+    with mock_dice(15, 5):
+        res2 = await execute_melee_attack.ainvoke({"attacker_name": "Fighter", "target_name": "Orc"}, config=config)
+    slowed_count = sum(1 for c in target.active_conditions if c.name == "Slowed")
+    assert slowed_count == 1  # no stacking
+
+    # Start of Fighter's next turn clears the Slowed condition they imposed
+    sot_event = GameEvent(event_type="StartOfTurn", source_uuid=fighter.entity_uuid, vault_path=vault_path)
+    EventBus.dispatch(sot_event)
+    assert not any(c.name == "Slowed" for c in target.active_conditions)
+
+
+@pytest.mark.asyncio
+async def test_req_mst_004_push_mastery_on_hit(setup_system, mock_dice):
+    """
+    REQ-MST-004: Push. On hit, push target 10ft away. Target must be ≤ 1 size larger.
+    """
+    vault_path = setup_system
+    config = {"configurable": {"thread_id": vault_path}}
+
+    fighter = Creature(
+        name="Fighter",
+        vault_path=vault_path,
+        tags=["pc", "weapon_mastery"],
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=3),
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=0.0, y=0.0, size=5.0,
+    )
+    target = Creature(
+        name="Orc",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=30),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=5.0, y=0.0, size=5.0,
+    )
+    register_entity(fighter)
+    register_entity(target)
+    spatial_service.sync_entity(fighter)
+    spatial_service.sync_entity(target)
+
+    os.makedirs(get_journals_dir(vault_path), exist_ok=True)
+    with open(os.path.join(get_journals_dir(vault_path), "Fighter.md"), "w") as f:
+        f.write("---\nequipment:\n  main_hand: None\n---")
+
+    push_entry = CompendiumEntry(
+        name="Push",
+        category="mastery",
+        action_type="Passive",
+        description="Push the enemy.",
+        mechanics=MechanicEffect(trigger_event="on_hit", mastery_type="push", push_distance=10),
+    )
+    await CompendiumManager.save_entry(vault_path, push_entry)
+
+    pike = WeaponItem(name="Pike", damage_dice="1d10", damage_type="piercing", mastery_name="Push")
+    await ItemCompendium.save_item(vault_path, pike)
+    await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Pike", "item_slot": "main_hand"}, config=config)
+
+    initial_x = target.x
+    with mock_dice(15, 6):
+        res = await execute_melee_attack.ainvoke({"attacker_name": "Fighter", "target_name": "Orc"}, config=config)
+
+    assert "HIT!" in res
+    assert "Push Mastery Triggered" in res
+    # Target should have moved 10ft away (positive x direction from attacker)
+    assert target.x > initial_x
+
+
+@pytest.mark.asyncio
+async def test_req_mst_004_push_blocked_by_size(setup_system, mock_dice):
+    """REQ-MST-004: Push fails if target is more than 1 size category larger."""
+    vault_path = setup_system
+    config = {"configurable": {"thread_id": vault_path}}
+
+    fighter = Creature(
+        name="Fighter",
+        vault_path=vault_path,
+        tags=["pc", "weapon_mastery"],
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=3),
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=0.0, y=0.0, size=5.0,
+    )
+    giant = Creature(
+        name="Giant",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=100),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=5.0, y=0.0, size=15.0,  # Huge (2 categories larger)
+    )
+    register_entity(fighter)
+    register_entity(giant)
+    spatial_service.sync_entity(fighter)
+    spatial_service.sync_entity(giant)
+
+    os.makedirs(get_journals_dir(vault_path), exist_ok=True)
+    with open(os.path.join(get_journals_dir(vault_path), "Fighter.md"), "w") as f:
+        f.write("---\nequipment:\n  main_hand: None\n---")
+
+    push_entry = CompendiumEntry(
+        name="Push",
+        category="mastery",
+        action_type="Passive",
+        description="Push the enemy.",
+        mechanics=MechanicEffect(trigger_event="on_hit", mastery_type="push", push_distance=10),
+    )
+    await CompendiumManager.save_entry(vault_path, push_entry)
+    pike = WeaponItem(name="Pike", damage_dice="1d10", damage_type="piercing", mastery_name="Push")
+    await ItemCompendium.save_item(vault_path, pike)
+    await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Pike", "item_slot": "main_hand"}, config=config)
+
+    initial_x = giant.x
+    with mock_dice(15, 6):
+        res = await execute_melee_attack.ainvoke({"attacker_name": "Fighter", "target_name": "Giant"}, config=config)
+
+    assert "HIT!" in res
+    assert giant.x == initial_x  # not pushed
+
+
+@pytest.mark.asyncio
+async def test_req_mst_001_cleave_mastery_extra_attack(setup_system, mock_dice):
+    """
+    REQ-MST-001: Cleave. On hit, make one extra attack against an adjacent creature
+    within 5ft of the primary target and within attacker reach. Once per turn.
+    Damage does not include ability modifier (unless negative).
+    """
+    vault_path = setup_system
+    config = {"configurable": {"thread_id": vault_path}}
+
+    fighter = Creature(
+        name="Fighter",
+        vault_path=vault_path,
+        tags=["pc", "weapon_mastery", "darkvision"],
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=4),  # +4 mod — should NOT appear in cleave damage
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=0.0, y=0.0, size=5.0,
+    )
+    primary_target = Creature(
+        name="Orc",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=30),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        tags=["darkvision"],
+        x=5.0, y=0.0, size=5.0,
+    )
+    cleave_target = Creature(
+        name="Goblin",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=8),  # low AC, easy to cleave
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        tags=["darkvision"],
+        x=5.0, y=5.0, size=5.0,  # 5ft from primary target, within fighter reach
+    )
+    register_entity(fighter)
+    register_entity(primary_target)
+    register_entity(cleave_target)
+    spatial_service.sync_entity(fighter)
+    spatial_service.sync_entity(primary_target)
+    spatial_service.sync_entity(cleave_target)
+
+    os.makedirs(get_journals_dir(vault_path), exist_ok=True)
+    with open(os.path.join(get_journals_dir(vault_path), "Fighter.md"), "w") as f:
+        f.write("---\nequipment:\n  main_hand: None\n---")
+
+    cleave_entry = CompendiumEntry(
+        name="Cleave",
+        category="mastery",
+        action_type="Passive",
+        description="Cleave into adjacent foe.",
+        mechanics=MechanicEffect(trigger_event="on_hit", mastery_type="cleave"),
+    )
+    await CompendiumManager.save_entry(vault_path, cleave_entry)
+
+    greataxe = WeaponItem(name="Greataxe", damage_dice="1d12", damage_type="slashing", mastery_name="Cleave")
+    await ItemCompendium.save_item(vault_path, greataxe)
+    await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Greataxe", "item_slot": "main_hand"}, config=config)
+
+    hp_before_cleave = cleave_target.hp.base_value
+    # Rolls: hit primary (15), damage primary (8), cleave attack (15), cleave damage (6)
+    with mock_dice(15, 8, 15, 6):
+        res = await execute_melee_attack.ainvoke({"attacker_name": "Fighter", "target_name": "Orc"}, config=config)
+
+    assert "HIT!" in res
+    assert "Cleave Mastery Triggered" in res
+    # Cleave target took damage (weapon die only, no +4 ability mod)
+    assert cleave_target.hp.base_value < hp_before_cleave
+    # Cleave Used resource set
+    assert fighter.resources.get("Cleave Used") == "1/1"
+
+
+@pytest.mark.asyncio
+async def test_req_mst_001_cleave_once_per_turn(setup_system, mock_dice):
+    """REQ-MST-001: Cleave only fires once per turn — second hit doesn't trigger another cleave."""
+    vault_path = setup_system
+    config = {"configurable": {"thread_id": vault_path}}
+
+    fighter = Creature(
+        name="Fighter",
+        vault_path=vault_path,
+        tags=["pc", "weapon_mastery"],
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=4),
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=0.0, y=0.0, size=5.0,
+    )
+    fighter.resources["Cleave Used"] = "1/1"  # already used this turn
+
+    target = Creature(
+        name="Orc",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=30),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=5.0, y=0.0, size=5.0,
+    )
+    adjacent = Creature(
+        name="Goblin",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=5.0, y=5.0, size=5.0,
+    )
+    register_entity(fighter)
+    register_entity(target)
+    register_entity(adjacent)
+    spatial_service.sync_entity(fighter)
+    spatial_service.sync_entity(target)
+    spatial_service.sync_entity(adjacent)
+
+    os.makedirs(get_journals_dir(vault_path), exist_ok=True)
+    with open(os.path.join(get_journals_dir(vault_path), "Fighter.md"), "w") as f:
+        f.write("---\nequipment:\n  main_hand: None\n---")
+
+    cleave_entry = CompendiumEntry(
+        name="Cleave",
+        category="mastery",
+        action_type="Passive",
+        description="Cleave into adjacent foe.",
+        mechanics=MechanicEffect(trigger_event="on_hit", mastery_type="cleave"),
+    )
+    await CompendiumManager.save_entry(vault_path, cleave_entry)
+    greataxe = WeaponItem(name="Greataxe", damage_dice="1d12", damage_type="slashing", mastery_name="Cleave")
+    await ItemCompendium.save_item(vault_path, greataxe)
+    await equip_item.ainvoke({"character_name": "Fighter", "item_name": "Greataxe", "item_slot": "main_hand"}, config=config)
+
+    hp_before = adjacent.hp.base_value
+    with mock_dice(15, 8):
+        await execute_melee_attack.ainvoke({"attacker_name": "Fighter", "target_name": "Orc"}, config=config)
+
+    assert adjacent.hp.base_value == hp_before  # no cleave damage
+
+
+@pytest.mark.asyncio
+async def test_req_mst_003_nick_mastery_alert(setup_system, mock_dice):
+    """
+    REQ-MST-003: Nick. On hit with a Light weapon, engine alerts that the extra attack
+    doesn't cost a Bonus Action. Once per turn.
+    """
+    vault_path = setup_system
+    config = {"configurable": {"thread_id": vault_path}}
+
+    rogue = Creature(
+        name="Rogue",
+        vault_path=vault_path,
+        tags=["pc", "weapon_mastery"],
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=3),
+        x=0.0, y=0.0,
+    )
+    target = Creature(
+        name="Goblin",
+        vault_path=vault_path,
+        hp=ModifiableValue(base_value=10),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=5.0, y=0.0,
+    )
+    register_entity(rogue)
+    register_entity(target)
+    spatial_service.sync_entity(rogue)
+    spatial_service.sync_entity(target)
+
+    os.makedirs(get_journals_dir(vault_path), exist_ok=True)
+    with open(os.path.join(get_journals_dir(vault_path), "Rogue.md"), "w") as f:
+        f.write("---\nequipment:\n  main_hand: None\n---")
+
+    nick_entry = CompendiumEntry(
+        name="Nick",
+        category="mastery",
+        action_type="Passive",
+        description="Nick mastery for Light weapons.",
+        mechanics=MechanicEffect(trigger_event="on_hit", mastery_type="nick"),
+    )
+    await CompendiumManager.save_entry(vault_path, nick_entry)
+
+    dagger = WeaponItem(name="Dagger", damage_dice="1d4", damage_type="piercing", mastery_name="Nick")
+    await ItemCompendium.save_item(vault_path, dagger)
+    await equip_item.ainvoke({"character_name": "Rogue", "item_name": "Dagger", "item_slot": "main_hand"}, config=config)
+
+    with mock_dice(15, 3):
+        res = await execute_melee_attack.ainvoke({"attacker_name": "Rogue", "target_name": "Goblin"}, config=config)
+
+    assert "HIT!" in res
+    assert "Nick Mastery Triggered" in res
+    assert "no Bonus Action cost" in res
+    assert rogue.resources.get("Nick Used") == "1/1"

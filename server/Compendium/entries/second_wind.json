@@ -1,0 +1,23 @@
+{
+    "name": "Second Wind",
+    "category": "feature",
+    "action_type": "Bonus Action",
+    "description": "You have a limited well of stamina you can draw on to protect yourself. On your turn, you can use a Bonus Action to regain HP equal to 1d10 + your Fighter level. You must finish a Short or Long Rest before using this feature again.",
+    "mitigation_notes": "Usable once per Short or Long Rest. Fighter level bonus is handled by the DM layer (add as bonus to the healing roll).",
+    "references": ["PHB 2024 Ch. 3"],
+    "mechanics": {
+        "requires_attack_roll": false,
+        "damage_dice": "",
+        "damage_type": "",
+        "healing_dice": "1d10",
+        "save_required": "",
+        "half_damage_on_save": false,
+        "conditions_applied": [],
+        "modifiers": [],
+        "granted_tags": [],
+        "requires_concentration": false,
+        "terrain_effect": null,
+        "trigger_event": "",
+        "resource_cost": "Second Wind Uses [SR]:1"
+    }
+}

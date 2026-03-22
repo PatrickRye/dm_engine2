@@ -2075,11 +2075,12 @@ async def advance_time(
 
 
 @tool
-async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
-    """Creates ACTIVE_COMBAT.md."""
+async def start_combat(pc_names: list[str], enemies: list[dict], surprised_names: list[str] = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """Creates ACTIVE_COMBAT.md. surprised_names: list of combatant names that are surprised (roll initiative twice, take lower)."""
     vault_path = config["configurable"].get("thread_id")
     j_dir = get_journals_dir(vault_path)
     combatants = []
+    surprised_set = set(surprised_names or [])
 
     for pc in pc_names:
         file_path = os.path.join(j_dir, f"{pc}.md")
@@ -2098,10 +2099,16 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
         except Exception:
             pass  # Ignores missing PCs or syntax errors, defaulting to 10
 
+        # REQ-SRP-001: Surprised combatants roll initiative twice and take the lower result
+        if pc in surprised_set:
+            pc_init = min(random.randint(1, 20), random.randint(1, 20)) + pc_dex_mod
+        else:
+            pc_init = random.randint(1, 20) + pc_dex_mod
+
         combatants.append(
             {
                 "name": pc,
-                "init": random.randint(1, 20) + pc_dex_mod,
+                "init": pc_init,
                 "hp": pc_hp,
                 "max_hp": pc_hp,
                 "ac": pc_ac,
@@ -2114,10 +2121,17 @@ async def start_combat(pc_names: list[str], enemies: list[dict], *, config: Anno
         )
 
     for enemy in enemies:
+        enemy_name = enemy.get("name", "Unknown")
+        enemy_dex_mod = int(enemy.get("dex_mod", 0))
+        # REQ-SRP-001: Surprised combatants roll initiative twice and take the lower result
+        if enemy_name in surprised_set:
+            enemy_init = min(random.randint(1, 20), random.randint(1, 20)) + enemy_dex_mod
+        else:
+            enemy_init = random.randint(1, 20) + enemy_dex_mod
         combatants.append(
             {
-                "name": enemy.get("name", "Unknown"),
-                "init": random.randint(1, 20) + int(enemy.get("dex_mod", 0)),
+                "name": enemy_name,
+                "init": enemy_init,
                 "hp": int(enemy.get("hp", 10)),
                 "max_hp": int(enemy.get("hp", 10)),
                 "ac": int(enemy.get("ac", 10)),
@@ -3035,6 +3049,30 @@ async def use_ability_or_spell(  # noqa: C901
                 f"Then call this tool again with `manual_saves={{'PlayerName': 15, ...}}` or `force_auto_roll=True`."
             )
 
+    # Resource gate: validate and reserve resource_cost before dispatch
+    resource_cost_str = mechanics_dump.get("resource_cost", "") if isinstance(mechanics_dump, dict) else ""
+    resource_name_to_deduct = None
+    resource_amount_to_deduct = 0
+    if resource_cost_str:
+        import re as _re
+        rc_match = _re.match(r"^(.+):(\d+)$", resource_cost_str.strip())
+        if rc_match:
+            resource_name_to_deduct = rc_match.group(1).strip()
+            resource_amount_to_deduct = int(rc_match.group(2))
+            current_res = caster.resources.get(resource_name_to_deduct, "")
+            rm = _re.match(r"(\d+)\s*/\s*(\d+)", str(current_res))
+            if not rm:
+                return (
+                    f"SYSTEM ERROR: {caster.name} does not have the resource '{resource_name_to_deduct}' "
+                    f"required for {ability_name}. Add it via update_entity_stats first."
+                )
+            available = int(rm.group(1))
+            if available < resource_amount_to_deduct:
+                return (
+                    f"SYSTEM ERROR: {caster.name} has insufficient '{resource_name_to_deduct}' "
+                    f"({available}/{rm.group(2)}) to use {ability_name} (costs {resource_amount_to_deduct})."
+                )
+
     current_init = await _get_current_combat_initiative(vault_path)
     event = GameEvent(
         event_type="SpellCast",
@@ -3067,6 +3105,15 @@ async def use_ability_or_spell(  # noqa: C901
 
     if is_spell and requires_slot and not is_reaction and not is_legendary_action and result.status != EventStatus.CANCELLED:
         caster.spell_slots_expended_this_turn += 1
+
+    # Deduct resource_cost after successful dispatch
+    if resource_name_to_deduct and result.status != EventStatus.CANCELLED:
+        import re as _re
+        current_res = caster.resources.get(resource_name_to_deduct, "")
+        rm = _re.match(r"(\d+)\s*/\s*(\d+)", str(current_res))
+        if rm:
+            new_val = max(0, int(rm.group(1)) - resource_amount_to_deduct)
+            caster.resources[resource_name_to_deduct] = f"{new_val}/{rm.group(2)}"
 
     if proxy and result.status != EventStatus.CANCELLED:
         proxy.reaction_used = True

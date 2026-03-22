@@ -1,0 +1,23 @@
+{
+    "name": "Action Surge",
+    "category": "feature",
+    "action_type": "Action",
+    "description": "Starting at 2nd level, you can push yourself beyond your normal limits for a moment. On your turn, you can take one additional action. Once you use this feature, you must finish a Short or Long Rest before you can use it again.",
+    "mitigation_notes": "Grants one extra Action this turn. Does NOT grant an extra Bonus Action or Reaction. Resource reset on Short or Long Rest.",
+    "references": ["PHB 2024 Ch. 3"],
+    "mechanics": {
+        "requires_attack_roll": false,
+        "damage_dice": "",
+        "damage_type": "",
+        "healing_dice": "",
+        "save_required": "",
+        "half_damage_on_save": false,
+        "conditions_applied": [],
+        "modifiers": [],
+        "granted_tags": ["extra_action"],
+        "requires_concentration": false,
+        "terrain_effect": null,
+        "trigger_event": "",
+        "resource_cost": "Action Surge [SR]:1"
+    }
+}

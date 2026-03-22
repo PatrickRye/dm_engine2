@@ -233,6 +233,7 @@ class ActiveCondition(BaseModel):
     start_of_turn_thp: int = 0
     end_of_turn_damage_dice: str = ""
     end_of_turn_damage_type: str = ""
+    speed_reduction: int = 0  # REQ-MST-006: Slow mastery reduces target speed by this amount
 
 
 class Creature(BaseGameEntity):

@@ -1,0 +1,23 @@
+{
+    "name": "Divine Smite",
+    "category": "feature",
+    "action_type": "Bonus Action",
+    "description": "Immediately after you hit a target with a Melee weapon or an Unarmed Strike, you can expend one spell slot to smite the target. The smite deals 2d8 Radiant damage per spell slot level (base 2d8 at 1st, +1d8 per level). Undead and Fiends take an extra 1d8 Radiant damage.",
+    "mitigation_notes": "Declared AFTER a melee hit, costs a spell slot. The engine alerts after a melee hit when divine_smite tag is present. DM sets the damage dice to match the slot level expended.",
+    "references": ["PHB 2024 Ch. 3"],
+    "mechanics": {
+        "requires_attack_roll": false,
+        "damage_dice": "2d8",
+        "damage_type": "radiant",
+        "healing_dice": "",
+        "save_required": "",
+        "half_damage_on_save": false,
+        "conditions_applied": [],
+        "modifiers": [],
+        "granted_tags": [],
+        "requires_concentration": false,
+        "terrain_effect": null,
+        "trigger_event": "on_hit",
+        "resource_cost": ""
+    }
+}

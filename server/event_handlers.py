@@ -52,6 +52,17 @@ def check_death_and_dying(target: Creature, current_hp: int, damage: int, is_cri
             results_list.append(f"[Engine] {target.name} drops to 0 HP and is Dying/Unconscious.")
 
 
+def wild_shape_spellblock_handler(event: GameEvent):
+    """REQ-CLS-015: Blocks spell casting while Wild Shaped — fires during PRE_EVENT so cancellation propagates."""
+    if event.status != EventStatus.PRE_EVENT:
+        return
+    caster: Creature = get_entity(event.source_uuid)
+    if caster and caster.wild_shape_hp > 0:
+        print(f"[Engine] {caster.name} is Wild Shaped and cannot cast new spells. (REQ-CLS-015)")
+        event.status = EventStatus.CANCELLED
+        event.payload["results"] = [f"SYSTEM ERROR: {caster.name} is Wild Shaped and cannot cast spells. (REQ-CLS-015)"]
+
+
 def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
     """Calculates spell hits, saving throws, and damage across multiple targets."""
     if event.status != EventStatus.EXECUTION:
@@ -178,7 +189,7 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
 
         target_damage = base_damage
         hit_or_save_str = "Auto-hit"
-        dc = caster.spell_save_dc.total if hasattr(caster, "spell_save_dc") else 10
+        dc = event.payload.get("save_dc_override") or (caster.spell_save_dc.total if hasattr(caster, "spell_save_dc") else 10)
 
         # 1. Spell Attack Roll
         if requires_attack_roll:
@@ -339,7 +350,26 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                             target.active_mechanics.append(event.payload.get("ability_name", "Unknown"))
                         results.append(f"[{target.name}] gained modifier to {target_stat}.")
 
-    # 5. Process Collateral Damage to Geography (Walls/Doors)
+        # 5. Process Healing (e.g. Second Wind, Cure Wounds)
+        if mechanics.healing_dice:
+            heal_amount = roll_dice(mechanics.healing_dice)
+            old_hp = target.hp.base_value
+            target.hp.base_value = min(target.max_hp, target.hp.base_value + heal_amount)
+            actual_heal = target.hp.base_value - old_hp
+            results.append(
+                f"[{target.name}] healed for {actual_heal} HP (now {target.hp.base_value}/{target.max_hp})."
+            )
+            print(f"[Engine] {target.name} healed for {actual_heal} HP.")
+            # REQ-DTH-006: Healing at 0 HP removes Dying/Stable/Unconscious(0HP) conditions
+            if actual_heal > 0:
+                target.active_conditions = [
+                    c for c in target.active_conditions
+                    if c.name not in ["Dying", "Stable"] and not (c.name == "Unconscious" and c.source_name == "0 HP")
+                ]
+                target.death_saves_successes = 0
+                target.death_saves_failures = 0
+
+    # 6. Process Collateral Damage to Geography (Walls/Doors)
     if base_damage > 0 and target_wall_ids and damage_type not in ["poison", "psychic"]:
         for wall_id in target_wall_ids:
             wall = spatial_service.get_wall_by_id(wall_id)
@@ -580,6 +610,14 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         print(f"[Engine] {attacker.name} is hampered by a condition. Applying DISADVANTAGE to attack.")
         event.payload["disadvantage"] = True
 
+    # REQ-CND-007: Grappled 2024 — disadvantage on attacks against non-grappler
+    grappled_conds = [c for c in attacker.active_conditions if c.name.lower() == "grappled"]
+    if grappled_conds:
+        grappler_uuids = {c.source_uuid for c in grappled_conds}
+        if target.entity_uuid not in grappler_uuids:
+            print(f"[Engine] {attacker.name} is Grappled and attacking a non-grappler. Applying DISADVANTAGE.")
+            event.payload["disadvantage"] = True
+
     if "reckless" in attacker_conds:
         print(f"[Engine] {attacker.name} is attacking Recklessly. Applying ADVANTAGE to attack.")
         event.payload["advantage"] = True
@@ -594,6 +632,10 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         print(f"[Engine] {target.name} has a debilitating condition. Applying ADVANTAGE to attackers.")
         event.payload["advantage"] = True
 
+    # REQ-CND-010/011/016: Paralyzed/Petrified/Unconscious target auto-crits on hit within 5ft
+    if any(c in target_conds for c in ["paralyzed", "petrified", "unconscious"]) and dist <= 5.0:
+        event.payload["_auto_crit_on_hit"] = True
+
     if "prone" in target_conds:
         if dist <= 5.0:
             event.payload["advantage"] = True
@@ -606,6 +648,16 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         event.payload["advantage"] = True
         for v in vex_conds:
             target.active_conditions.remove(v)
+
+    # REQ-CND-005: Charmed attacker cannot attack their charmer
+    charmed_by_target = [
+        c for c in attacker.active_conditions
+        if c.name.lower() == "charmed" and c.source_uuid == target.entity_uuid
+    ]
+    if charmed_by_target:
+        print(f"[Engine] {attacker.name} is Charmed by {target.name} and cannot attack them.")
+        event.payload["hit"] = False
+        return
 
     cover_ac_bonus = 2 if cover == "Half" else (5 if cover == "Three-Quarters" else 0)
     target_ac = target.ac.total + cover_ac_bonus
@@ -643,6 +695,11 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
             f"+ {attack_bonus}{exh_str} = {total_attack} vs AC {target_ac}{cover_msg}"
         )
 
+    # REQ-CND-010/011: Apply auto-crit for Paralyzed/Petrified target within 5ft
+    if event.payload.get("_auto_crit_on_hit") and is_hit:
+        is_critical_hit = True
+        print(f"[Engine] AUTOMATIC CRITICAL HIT — {target.name} is paralyzed/petrified and within 5ft.")
+
     # Attacking reveals the attacker
     hidden_conds = [c for c in attacker.active_conditions if c.name.lower() == "hidden"]
     if hidden_conds:
@@ -656,8 +713,11 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         print("[Engine] HIT!")
 
         damage_mod = weapon.get_damage_modifier(attacker)
-        # Roll base damage dice
-        base_damage = roll_dice(weapon.damage_dice) + damage_mod.total + weapon.magic_bonus
+        # Roll base damage dice; Cleave suppresses ability mod unless negative
+        mod_total = damage_mod.total
+        if event.payload.get("suppress_ability_mod_damage"):
+            mod_total = min(0, mod_total)
+        base_damage = roll_dice(weapon.damage_dice) + mod_total + weapon.magic_bonus
 
         # Add conditional damage dice
         extra_damage = 0
@@ -674,6 +734,68 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
                 for dice in event.payload["extra_damage_dice"]:
                     crit_damage += roll_dice(dice)
             total_damage += crit_damage
+
+        # REQ-CLS-003/004: Sneak Attack — auto-detect eligibility
+        sneak_tag = next((t for t in attacker.tags if t.startswith("sneak_attack_")), None)
+        if sneak_tag:
+            is_finesse = WeaponProperty.FINESSE in weapon.properties
+            is_ranged = hasattr(weapon, "normal_range")
+            if is_finesse or is_ranged:
+                has_adv = event.payload.get("advantage", False)
+                has_disadv = event.payload.get("disadvantage", False)
+                # Advantage and disadvantage cancel each other (5e rule).
+                # Sneak Attack is only blocked when there is NET disadvantage (disadv without any adv).
+                net_disadv = has_disadv and not has_adv
+                net_adv = has_adv and not has_disadv
+                if not net_disadv:
+                    # Eligible if: net advantage OR a conscious ally is within 5ft of the target
+                    sa_eligible = net_adv
+                    if not sa_eligible:
+                        is_attacker_pc = any(t in attacker.tags for t in ["pc", "player", "party_npc"])
+                        for uid, ent in get_all_entities(event.vault_path).items():
+                            if uid in (attacker.entity_uuid, target.entity_uuid):
+                                continue
+                            if not isinstance(ent, Creature) or ent.hp.base_value <= 0:
+                                continue
+                            is_ent_pc = any(t in ent.tags for t in ["pc", "player", "party_npc"])
+                            if is_attacker_pc != is_ent_pc:
+                                continue  # skip hostiles
+                            ent_conds = [c.name.lower() for c in ent.active_conditions]
+                            if any(c in ent_conds for c in ["incapacitated", "unconscious", "dead", "dying"]):
+                                continue
+                            ally_dist = spatial_service.calculate_distance(
+                                ent.x, ent.y, ent.z, target.x, target.y, target.z, event.vault_path
+                            )
+                            if ally_dist <= 7.5:  # 5ft + diagonal allowance
+                                sa_eligible = True
+                                break
+
+                    sneak_resource = attacker.resources.get("Sneak Attack", "0/1")
+                    m = re.match(r"(\d+)/(\d+)", str(sneak_resource))
+                    sneak_unused = not m or int(m.group(1)) == 0
+                    if sa_eligible and sneak_unused:
+                        dice_str = sneak_tag.replace("sneak_attack_", "")
+                        sneak_dmg = roll_dice(dice_str)
+                        if is_critical_hit:
+                            sneak_dmg += roll_dice(dice_str)
+                        total_damage += sneak_dmg
+                        attacker.resources["Sneak Attack"] = "1/1"
+                        print(f"[Engine] SNEAK ATTACK! +{sneak_dmg} ({dice_str}) extra damage.")
+                        event.payload.setdefault("results", []).append(
+                            f"[Engine] SNEAK ATTACK! {attacker.name} deals {sneak_dmg} extra sneak attack damage."
+                        )
+
+        # REQ-CLS-001: Rage maintenance — mark that the raging entity attacked this cycle
+        if any(c.name.lower() == "raging" for c in attacker.active_conditions):
+            attacker.resources["Raged This Cycle"] = "1/1"
+
+        # REQ-CLS-005: Divine Smite prompt — alert after a melee hit
+        is_melee = not hasattr(weapon, "normal_range")
+        if is_melee and "divine_smite" in attacker.tags and attacker.spell_slots_expended_this_turn == 0:
+            event.payload.setdefault("results", []).append(
+                "[Engine] SYSTEM ALERT: Melee hit — Divine Smite (Bonus Action) is available. "
+                "Call use_ability_or_spell with 'Divine Smite' to apply smite damage."
+            )
 
         event.payload["hit"] = True
         event.payload["damage"] = total_damage
@@ -720,10 +842,127 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         attacker_ent: Creature, target_ent: Creature, wpn: Weapon, mech: dict, parent_event: GameEvent
     ):
         mod_val = wpn.get_attack_modifier(attacker_ent).total
+        mastery_type = mech.get("mastery_type", "")
+        results_out = parent_event.payload.setdefault("results", [])
+
+        # REQ-MST-001: Cleave — extra attack against adjacent creature, no ability mod on damage
+        if mastery_type == "cleave":
+            # Once per turn guard
+            if attacker_ent.resources.get("Cleave Used") == "1/1":
+                return
+            # Find a hostile creature within 5ft of the primary target and within attacker reach
+            reach = wpn.reach if hasattr(wpn, "reach") else 5.0
+            all_ents = get_all_entities(parent_event.vault_path)
+            cleave_target = None
+            for ent in all_ents.values():
+                if not isinstance(ent, Creature):
+                    continue
+                if ent.entity_uuid in (attacker_ent.entity_uuid, target_ent.entity_uuid):
+                    continue
+                if ent.hp.base_value <= 0:
+                    continue
+                # Must be hostile (different faction tag)
+                attacker_is_pc = any(t in attacker_ent.tags for t in ["pc", "player", "party_npc"])
+                ent_is_pc = any(t in ent.tags for t in ["pc", "player", "party_npc"])
+                if attacker_is_pc == ent_is_pc:
+                    continue
+                # Within 5ft of primary target AND within attacker's reach
+                dist_from_target = spatial_service.calculate_distance(
+                    target_ent.x, target_ent.y, target_ent.z, ent.x, ent.y, ent.z, parent_event.vault_path
+                )
+                dist_from_attacker = spatial_service.calculate_distance(
+                    attacker_ent.x, attacker_ent.y, attacker_ent.z, ent.x, ent.y, ent.z, parent_event.vault_path
+                )
+                if dist_from_target <= 7.5 and dist_from_attacker <= reach + 2.5:
+                    cleave_target = ent
+                    break
+
+            if cleave_target is None:
+                results_out.append(f"[Cleave Mastery] No adjacent target available for Cleave.")
+                return
+
+            # Roll the extra attack (no ability mod on damage unless negative)
+            cleave_event = GameEvent(
+                event_type="MeleeAttack",
+                source_uuid=attacker_ent.entity_uuid,
+                target_uuid=cleave_target.entity_uuid,
+                vault_path=parent_event.vault_path,
+                payload={"cleave_attack": True, "suppress_ability_mod_damage": True},
+            )
+            EventBus.dispatch(cleave_event)
+            attacker_ent.resources["Cleave Used"] = "1/1"
+            hit_str = "HIT" if cleave_event.payload.get("hit") else "MISS"
+            results_out.append(
+                f"[Cleave Mastery Triggered] Extra attack vs {cleave_target.name}: {hit_str}."
+            )
+            return
+
+        # REQ-MST-003: Nick — alert that the extra Light weapon attack doesn't cost a Bonus Action
+        if mastery_type == "nick":
+            if attacker_ent.resources.get("Nick Used") == "1/1":
+                return
+            attacker_ent.resources["Nick Used"] = "1/1"
+            results_out.append(
+                f"[Nick Mastery Triggered] {attacker_ent.name}'s extra Light weapon attack can be made as part of "
+                f"the Attack action (no Bonus Action cost). Once per turn."
+            )
+            return
+
+        # REQ-MST-004: Push — forced movement straight away from attacker
+        if mastery_type == "push":
+            # Size check: target must be ≤ one size larger than attacker
+            if target_ent.size > attacker_ent.size + 5.0:
+                results_out.append(
+                    f"[Push Mastery] {target_ent.name} is too large to be pushed by {attacker_ent.name}."
+                )
+                return
+            dx = target_ent.x - attacker_ent.x
+            dy = target_ent.y - attacker_ent.y
+            dist_2d = math.sqrt(dx * dx + dy * dy)
+            if dist_2d > 0:
+                nx, ny = dx / dist_2d, dy / dist_2d
+            else:
+                nx, ny = 1.0, 0.0  # default direction if co-located
+            push_dist = mech.get("push_distance", 10.0)
+            target_ent.x += nx * push_dist
+            target_ent.y += ny * push_dist
+            spatial_service.sync_entity(target_ent)
+            results_out.append(
+                f"[Push Mastery Triggered] {target_ent.name} is pushed {push_dist}ft away from {attacker_ent.name}."
+            )
+            return
+
+        # REQ-MST-006: Slow — apply Slowed condition reducing speed by 10ft
+        if mastery_type == "slow":
+            already_slowed = any(
+                c.name.lower() == "slowed" and c.source_uuid == attacker_ent.entity_uuid
+                for c in target_ent.active_conditions
+            )
+            if already_slowed:
+                results_out.append(f"[Slow Mastery] {target_ent.name} is already Slowed by {attacker_ent.name}.")
+                return
+            speed_reduction = mech.get("speed_reduction", 10)
+            slow_cond = ActiveCondition(
+                name="Slowed",
+                source_name=f"{attacker_ent.name} (Slow Mastery)",
+                source_uuid=attacker_ent.entity_uuid,
+                speed_reduction=speed_reduction,
+            )
+            target_ent.active_conditions.append(slow_cond)
+            target_ent.movement_remaining = max(0, target_ent.movement_remaining - speed_reduction)
+            results_out.append(
+                f"[Slow Mastery Triggered] {target_ent.name}'s speed is reduced by {speed_reduction}ft "
+                f"until the start of {attacker_ent.name}'s next turn."
+            )
+            return
+
+        # Generic mastery: route through SpellCast
         if mech.get("damage_dice") == "ability_mod":
             mech["damage_dice"] = str(mod_val)
         if mech.get("damage_type") == "weapon":
             mech["damage_type"] = wpn.damage_type
+        # Mastery save DC = 8 + weapon attack bonus (= 8 + prof_bonus + ability_mod)
+        mastery_save_dc = 8 + mod_val
 
         mastery_event = GameEvent(
             event_type="SpellCast",
@@ -733,20 +972,21 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
                 "ability_name": f"{wpn.mastery_name} Mastery",
                 "mechanics": mech,
                 "target_uuids": [target_ent.entity_uuid],
+                "save_dc_override": mastery_save_dc,
             },
         )
         res = EventBus.dispatch(mastery_event)
         if "results" in res.payload and res.payload["results"]:
-            if "results" not in parent_event.payload:
-                parent_event.payload["results"] = []
-            parent_event.payload["results"].append(
+            results_out.append(
                 f"[{wpn.mastery_name} Mastery Triggered] " + " ".join(res.payload["results"])
             )
 
-    if is_hit and weapon.on_hit_mechanics:
-        _trigger_weapon_mastery(attacker, target, weapon, weapon.on_hit_mechanics, event)
-    elif not is_hit and weapon.on_miss_mechanics:
-        _trigger_weapon_mastery(attacker, target, weapon, weapon.on_miss_mechanics, event)
+    # Don't trigger masteries on secondary mastery attacks (e.g., Cleave's extra attack)
+    if not event.payload.get("cleave_attack"):
+        if is_hit and weapon.on_hit_mechanics:
+            _trigger_weapon_mastery(attacker, target, weapon, weapon.on_hit_mechanics, event)
+        elif not is_hit and weapon.on_miss_mechanics:
+            _trigger_weapon_mastery(attacker, target, weapon, weapon.on_miss_mechanics, event)
 
 
 def apply_damage_handler(event: GameEvent):
@@ -766,19 +1006,42 @@ def apply_damage_handler(event: GameEvent):
     results = []
 
     if damage > 0:
+        is_magical_damage = event.payload.get("magical", False)
+
+        # REQ-DMG-005: Compound immunity/resistance entries like "nonmagical slashing" match the base
+        # damage type, but magical attacks bypass those entries.
+        def _entry_matches(entry: str, dtype: str) -> bool:
+            el = entry.lower()
+            return el == dtype or el.endswith(" " + dtype)
+
+        def _entry_is_nonmagical_qualified(entry: str) -> bool:
+            el = entry.lower()
+            return "nonmagical" in el or "non-magical" in el
+
+        def _dtype_in_list(lst, dtype, bypass_nonmagical=False):
+            for e in lst:
+                if _entry_matches(e, dtype):
+                    if bypass_nonmagical and _entry_is_nonmagical_qualified(e):
+                        continue  # magical attack bypasses this entry
+                    return True
+            return False
+
         # Check for immunities first
         is_magically_silenced = any(
             c.name.lower() == "silenced" and "silence" in c.source_name.lower() for c in target.active_conditions
         )
-        if damage_type in target.immunities or (damage_type == "thunder" and is_magically_silenced):
+
+        if _dtype_in_list(target.immunities, damage_type, bypass_nonmagical=is_magical_damage) or (
+            damage_type == "thunder" and is_magically_silenced
+        ):
             damage = 0
             results.append(f"[Engine] {target.name} is IMMUNE to {damage_type}!")
         else:
             # Then check for vulnerabilities and resistances
-            if damage_type in target.vulnerabilities:
+            if _dtype_in_list(target.vulnerabilities, damage_type):
                 damage *= 2
                 results.append(f"[Engine] {target.name} is VULNERABLE to {damage_type}! Damage is doubled.")
-            elif damage_type in target.resistances:
+            elif _dtype_in_list(target.resistances, damage_type, bypass_nonmagical=is_magical_damage):
                 damage = damage // 2  # Halve the damage, rounding down
                 results.append(f"[Engine] {target.name} is RESISTANT to {damage_type}! Damage is halved.")
 
@@ -802,6 +1065,10 @@ def apply_damage_handler(event: GameEvent):
                 results.append(f"[Engine] {target.name}'s Wild Shape absorbed the damage!")
                 target.wild_shape_hp -= damage
                 damage = 0
+
+        # REQ-CLS-001: Rage maintenance — taking damage counts as a valid rage-sustaining action
+        if damage > 0 and any(c.name.lower() == "raging" for c in target.active_conditions):
+            target.resources["Raged This Cycle"] = "1/1"
 
         current_hp = target.hp.base_value
         target.hp.base_value -= damage
@@ -881,6 +1148,16 @@ def handle_rest_event(event: GameEvent):
                         target.resources[res_name] = f"{maximum}/{maximum}"
             print(f"[Engine] {target.name} finished a Long Rest. HP and resources fully restored.")
 
+        elif rest_type == "short":
+            # REQ-CLS-008/011: Reset resources tagged [SR] (Short Rest reset)
+            for res_name in list(target.resources.keys()):
+                if "[SR]" in res_name:
+                    match = re.match(r"(\d+)\s*/\s*(\d+)", str(target.resources[res_name]))
+                    if match:
+                        maximum = int(match.group(2))
+                        target.resources[res_name] = f"{maximum}/{maximum}"
+            print(f"[Engine] {target.name} finished a Short Rest. [SR] resources restored.")
+
 
 def handle_advance_time_event(event: GameEvent):  # noqa: C901
     """Deterministically expires temporary modifiers when time advances."""
@@ -937,6 +1214,46 @@ def handle_advance_time_event(event: GameEvent):  # noqa: C901
     for tz in expired_terrains:
         spatial_service.remove_terrain(tz.zone_id, event.vault_path)
         print(f"[Engine] Temporary terrain '{tz.label}' has expired and faded away.")
+
+
+def deflect_attacks_reaction_handler(event: GameEvent):
+    """REQ-CLS-012: Monk Deflect Attacks — reduces weapon hit damage as a Reaction, POST_EVENT."""
+    if event.status != EventStatus.POST_EVENT:
+        return
+    if not event.payload.get("hit"):
+        return
+
+    target: Creature = get_entity(event.target_uuid)
+    if not target or "deflect_attacks" not in target.tags:
+        return
+    if target.reaction_used:
+        return
+
+    # Compute reduction: 1d10 + dex_mod + monk_level
+    monk_level = next((c.level for c in target.classes if c.class_name.lower() == "monk"), 0)
+    reduction = roll_dice("1d10") + target.dexterity_mod.total + monk_level
+
+    current_damage = event.payload.get("damage", 0)
+    reduced_damage = max(0, current_damage - reduction)
+    target.reaction_used = True
+    event.payload["damage"] = reduced_damage
+
+    msg = (
+        f"[Engine] {target.name} uses Deflect Attacks! Reduced incoming damage by {reduction} "
+        f"({current_damage} → {reduced_damage}). (REQ-CLS-012)"
+    )
+    print(msg)
+    event.payload.setdefault("results", []).append(msg)
+
+    if reduced_damage == 0:
+        # Damage fully negated; can redirect by spending 1 Focus Point
+        focus_val = target.resources.get("Focus Points [SR]", "")
+        m = re.match(r"(\d+)/(\d+)", str(focus_val))
+        if m and int(m.group(1)) >= 1:
+            event.payload.setdefault("results", []).append(
+                f"[Engine] SYSTEM ALERT: {target.name} fully deflected the attack — may spend 1 Focus Point "
+                f"to redirect the projectile. Call use_ability_or_spell('Deflect Attacks Redirect') to apply."
+            )
 
 
 def shield_spell_reaction_handler(event: GameEvent):
@@ -1070,7 +1387,12 @@ def validate_movement_handler(event: GameEvent):
     cost_multiplier = 1
     if "squeezing" in active_conds:
         cost_multiplier += 1
-    if movement_type in ["crawl", "climb", "swim"]:
+    # REQ-MOV-005: Climbing/swimming costs 1 extra foot UNLESS the entity has a native speed for it
+    if movement_type == "climb" and "climb_speed" not in entity.tags:
+        cost_multiplier += 1
+    elif movement_type == "swim" and "swim_speed" not in entity.tags:
+        cost_multiplier += 1
+    elif movement_type == "crawl":
         cost_multiplier += 1
 
     if event.payload.get("dragged_uuids"):
@@ -1647,6 +1969,58 @@ def start_of_turn_handler(event: GameEvent):
         return
 
     results = []
+
+    # REQ-CLS-001: Rage Maintenance — if still raging but did NOT attack or take damage since last turn, end rage
+    if any(c.name.lower() == "raging" for c in entity.active_conditions):
+        raged_val = entity.resources.get("Raged This Cycle", "0/1")
+        m = re.match(r"(\d+)/(\d+)", str(raged_val))
+        if m and int(m.group(1)) == 0:
+            entity.active_conditions = [c for c in entity.active_conditions if c.name.lower() != "raging"]
+            results.append(
+                f"[Engine] {entity.name}'s Rage has ended — no attack or damage taken since last turn. (REQ-CLS-001)"
+            )
+            print(f"[Engine] {entity.name}'s Rage ended due to inactivity.")
+        # Reset the flag for the new turn
+        entity.resources["Raged This Cycle"] = "0/1"
+
+    # REQ-EXH-002: Exhaustion level 6 = death
+    if entity.exhaustion_level >= 6:
+        entity.active_conditions = [c for c in entity.active_conditions if c.name not in ["Dying", "Stable", "Unconscious"]]
+        if not any(c.name == "Dead" for c in entity.active_conditions):
+            entity.active_conditions.append(ActiveCondition(name="Dead"))
+        results.append(f"[Engine] {entity.name} has reached Exhaustion level 6 and is DEAD.")
+        print(f"[Engine] {entity.name} died from Exhaustion level 6.")
+
+    # REQ-MST-001/003: Reset Cleave/Nick once-per-turn resources
+    for once_key in ("Cleave Used", "Nick Used"):
+        if once_key in entity.resources:
+            entity.resources[once_key] = "0/1"
+
+    # REQ-MST-006: Slow mastery — expire Slowed conditions THIS entity imposed on others,
+    # and apply existing Slowed penalties to this entity's refreshed movement.
+    # (a) Clear Slowed conditions on all entities that this entity's weapon imposed
+    all_ents = get_all_entities(event.vault_path)
+    for other in all_ents.values():
+        if not isinstance(other, Creature):
+            continue
+        other.active_conditions = [
+            c for c in other.active_conditions
+            if not (c.name.lower() == "slowed" and c.source_uuid == entity.entity_uuid)
+        ]
+    # (b) Apply any Slowed conditions still on THIS entity to its just-reset movement_remaining
+    for cond in entity.active_conditions:
+        if cond.name.lower() == "slowed" and cond.speed_reduction > 0:
+            entity.movement_remaining = max(0, entity.movement_remaining - cond.speed_reduction)
+            results.append(
+                f"[Engine] {entity.name} is Slowed — speed reduced by {cond.speed_reduction}ft this turn."
+            )
+
+    # REQ-CLS-003: Reset Sneak Attack once-per-turn resource
+    if "Sneak Attack" in entity.resources:
+        m = re.match(r"(\d+)/(\d+)", str(entity.resources["Sneak Attack"]))
+        if m:
+            entity.resources["Sneak Attack"] = f"0/{m.group(2)}"
+
     for cond in entity.active_conditions:
         if cond.start_of_turn_thp > 0:
             if cond.start_of_turn_thp > entity.temp_hp:
@@ -1775,8 +2149,10 @@ def register_core_handlers():
     EventBus.subscribe("AbilityCheck", resolve_ability_check_handler, priority=10)
     EventBus.subscribe("MeleeAttack", shield_spell_reaction_handler, priority=1)
     EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
+    EventBus.subscribe("MeleeAttack", deflect_attacks_reaction_handler, priority=50)
     EventBus.subscribe("MeleeAttack", melee_attack_damage_dispatcher, priority=100)
     EventBus.subscribe("ApplyDamage", apply_damage_handler, priority=10)
+    EventBus.subscribe("SpellCast", wild_shape_spellblock_handler, priority=1)
     EventBus.subscribe("SpellCast", shield_spell_reaction_handler, priority=1)
     EventBus.subscribe("SpellCast", counterspell_reaction_handler, priority=1)
     EventBus.subscribe("SpellCast", resolve_spell_cast_handler, priority=10)

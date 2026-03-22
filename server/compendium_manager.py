@@ -27,6 +27,10 @@ class MechanicEffect(BaseModel):
     requires_concentration: bool = False
     terrain_effect: Optional[Dict[str, Any]] = None
     trigger_event: str = ""  # e.g., "on_hit", "on_miss"
+    resource_cost: str = ""  # e.g., "Second Wind Uses [SR]:1" — consumed after successful use
+    mastery_type: str = ""  # e.g., "cleave", "push", "slow", "nick" — routes to custom mastery logic
+    speed_reduction: int = 0  # REQ-MST-006: Slow mastery speed reduction amount
+    push_distance: float = 10.0  # REQ-MST-004: Push mastery distance in feet
 
 
 class CompendiumEntry(BaseModel):
