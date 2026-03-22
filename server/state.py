@@ -27,6 +27,10 @@ class DMState(TypedDict):
     active_storylet_id: Optional[str] = None  # UUID string of active storylet
     pending_mutations: List[Dict[str, Any]] = Field(default_factory=list)
     tension_arc: Dict[str, Any] = Field(default_factory=dict)  # Serialized TensionArc
+    # KG snapshot for rollback on rejected narratives
+    kg_snapshot: Optional[Dict[str, Any]] = Field(default_factory=None)
+    # Errors encountered during mutation execution (surfaced to QA)
+    mutation_errors: List[str] = Field(default_factory=list)
 
 
 class QAResult(BaseModel):

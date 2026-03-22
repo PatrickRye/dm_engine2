@@ -11,6 +11,8 @@ Storylet Orchestration integration:
 """
 from __future__ import annotations
 
+import time
+from typing import Dict, List, Optional, Tuple
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
@@ -23,6 +25,13 @@ from system_logger import qa_logger
 from tools import _get_config_tone
 
 MAX_QA_REVISIONS = 3
+
+# ---------------------------------------------------------------------
+# TTL Cache: GraphRAG context (invalidated on KG writes)
+# ---------------------------------------------------------------------
+_GRAG_CACHE_TTL_SECONDS = 60.0
+# { (vault_path, active_character): (timestamp, result_str) }
+_grag_cache: Dict[Tuple[str, str], Tuple[float, str]] = {}
 
 
 def extract_npc_dials(biography_text: str) -> Dict[str, float]:
@@ -84,7 +93,7 @@ def extract_npc_dials(biography_text: str) -> Dict[str, float]:
     return {k: v for k, v in dials.items() if abs(v - 0.5) > 0.05}
 
 
-def _get_grag_context(kg, active_character: str = None, max_hops: int = 2) -> str:
+def _get_grag_context(kg, vault_path: str = None, active_character: str = None, max_hops: int = 2) -> str:
     """
     GraphRAG context injection (Gap 8).
 
@@ -93,8 +102,34 @@ def _get_grag_context(kg, active_character: str = None, max_hops: int = 2) -> st
     - NPCs and their relationship edges to active character
     - Active quests and their connected nodes
 
+    Results are cached for 60 seconds per (vault_path, active_character) key.
+    Cache is invalidated by _invalidate_grag_cache() after KG writes.
+
     This is prepended to the narrator's system prompt to give the LLM
     dynamic world-state grounding rather than static rules.
+    """
+    from knowledge_graph import GraphNodeType
+
+    # Task 4: TTL-based memoization cache
+    if vault_path and active_character:
+        cache_key = (vault_path, active_character)
+        now = time.monotonic()
+        if cache_key in _grag_cache:
+            ts, cached = _grag_cache[cache_key]
+            if now - ts < _GRAG_CACHE_TTL_SECONDS:
+                return cached
+        # Compute and cache
+        result = _compute_grag_context(kg, vault_path, active_character, max_hops)
+        _grag_cache[cache_key] = (now, result)
+        return result
+
+    return _compute_grag_context(kg, vault_path, active_character, max_hops)
+
+
+def _compute_grag_context(kg, vault_path: str, active_character: str, max_hops: int) -> str:
+    """
+    Internal: computes GraphRAG context without caching.
+    Extracted so the cache logic and TTL are centralized here.
     """
     from knowledge_graph import GraphNodeType
 
@@ -149,6 +184,23 @@ def _get_grag_context(kg, active_character: str = None, max_hops: int = 2) -> st
 
     lines.append("\n(Only describe entities and relationships that are established in the KG above.)\n")
     return "\n".join(lines)
+
+
+def _invalidate_grag_cache(vault_path: str = None) -> None:
+    """
+    Invalidate the GraphRAG context cache.
+
+    Called after KG writes (mutations committed) so that the next
+    narrator_node invocation re-fetches fresh KG context instead of
+    returning stale cached data.
+    """
+    if vault_path:
+        # Invalidate only entries for this vault
+        keys_to_delete = [k for k in _grag_cache if k[0] == vault_path]
+        for k in keys_to_delete:
+            del _grag_cache[k]
+    else:
+        _grag_cache.clear()
 
 
 def _build_kg_constraints_prompt(kg) -> str:
@@ -305,7 +357,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
 
         # Gap 8 fix: Pre-inject GraphRAG context (NPCs, locations, relationships)
         # before LLM invocation so narrator has dynamic world-state grounding.
-        grag_context = _get_grag_context(kg, active_character=state.get("active_character"))
+        grag_context = _get_grag_context(kg, vault_path=vault_path, active_character=state.get("active_character"))
 
         feedback_context = ""
         if state.get("qa_feedback") and state["qa_feedback"] != "APPROVED":
@@ -371,6 +423,11 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         # Mutations were captured in action_logic_node (commit=False) and validated
         # above. Now commit them to the KG.
         pending = list(state.get("pending_mutations", []))
+        mutation_errors: List[str] = []
+
+        # Always snapshot before mutating (for rollback on rejection)
+        kg_snapshot = kg.model_dump()
+
         if pending:
             from storylet import GraphMutation
             committed = 0
@@ -380,11 +437,16 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     mutation.execute(kg)
                     committed += 1
                 except Exception as e:
+                    err_msg = (
+                        f"Mutation execution failed: {mdict.get('mutation_type')} "
+                        f"on {mdict.get('node_name')}: {e}"
+                    )
+                    mutation_errors.append(err_msg)
                     await write_audit_log(
                         vault_path,
                         "HardGuardrails",
                         "Mutation Execution Error",
-                        f"Failed to execute mutation {mdict}: {e}",
+                        err_msg,
                     )
             await write_audit_log(
                 vault_path,
@@ -393,12 +455,23 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                 f"{committed}/{len(pending)} deferred mutations executed after QA approval.",
             )
 
-        return {"draft_response": draft, "pending_mutations": []}
+        # Task 4: Invalidate GraphRAG cache after KG writes so next call fetches fresh context
+        if pending:
+            _invalidate_grag_cache(vault_path)
+
+        return {
+            "draft_response": draft,
+            "pending_mutations": [],
+            "kg_snapshot": kg_snapshot,
+            "mutation_errors": mutation_errors,
+        }
 
     # ------------------------------------------------------------------
-    # NODE: QA — validates the draft against the 12-point checklist
+    # NODE: QA — validates the draft against the 13-point checklist + mutation cross-check
     # ------------------------------------------------------------------
     async def qa_node(state: DMState, config: RunnableConfig):
+        from registry import get_knowledge_graph
+
         vault, draft, revisions = state["vault_path"], state["draft_response"], state.get("revision_count", 0)
 
         # ESCAPE CLAUSE 1: OOC messages bypass audit
@@ -411,7 +484,73 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             await write_audit_log(vault, "QA Agent", "Force Approve", "Max revisions reached. Passing to prevent loop.")
             return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
 
+        # ------------------------------------------------------------------
+        # Gap 6 (table) fix: Deterministic cross-check #1 — SVO claim validation
+        # This is an independent backstop to the SVO check already done in narrator_node.
+        # Run it again here so QA rejects prose that implies world-state changes
+        # without mutations (in case narrator's guard check was bypassed or missed).
+        # ------------------------------------------------------------------
+        kg = get_knowledge_graph(vault)
+        mutation_errors = list(state.get("mutation_errors", []))
+
+        # Cross-check 1: If there are pending_mutations (shouldn't happen but guard),
+        # or if the draft implies world changes without mutations
+        pending_mutations = list(state.get("pending_mutations", []))
+        if pending_mutations:
+            # Mutations still pending means narrator_node didn't execute them.
+            # This is anomalous — reject and force narrator to reprocess.
+            await write_audit_log(
+                vault, "QA Agent", "Mutation Leak Detected",
+                f"{len(pending_mutations)} mutations leaked into QA without execution. Rejecting."
+            )
+            return {
+                "qa_feedback": (
+                    f"[MUTATION LEAK DETECTED]: {len(pending_mutations)} deferred mutations "
+                    "were not executed before reaching QA. This is an engine error. "
+                    "The narrator must execute pending mutations before QA review."
+                ),
+                "revision_count": revisions + 1,
+            }
+
+        # Cross-check 2: mutation_errors — if mutations failed during narrator execution,
+        # QA must reject because the KG may be in an inconsistent state
+        if mutation_errors:
+            await write_audit_log(
+                vault, "QA Agent", "Mutation Errors Detected",
+                f"Errors during mutation execution: {'; '.join(mutation_errors)}. Rejecting."
+            )
+            return {
+                "qa_feedback": (
+                    f"[MUTATION EXECUTION ERROR]: The following errors occurred while "
+                    "committing world-state changes. The narrative cannot be approved until "
+                    "the engine state is consistent:\n"
+                    + "\n".join(f"  - {e}" for e in mutation_errors)
+                ),
+                "revision_count": revisions + 1,
+            }
+
+        # Cross-check 3: Re-validate SVO claims in QA (independent backstop)
+        if draft and pending_mutations:
+            from hard_guardrails import HardGuardrails
+            from storylet import GraphMutation
+
+            guardrails = HardGuardrails(kg)
+            mutations = [GraphMutation(**m) for m in pending_mutations]
+            ctx = {"vault_path": vault, "active_character": state.get("active_character", "Unknown")}
+            svo_result = guardrails.validate_svo_claims(draft, mutations, ctx)
+            if not svo_result.allowed:
+                await write_audit_log(vault, "QA Agent", "SVO Claim Rejected (QA backstop)", svo_result.reason)
+                return {
+                    "qa_feedback": (
+                        f"[QA SVO BACKSTOP REJECTED]: {svo_result.reason}\n\n"
+                        f"Your draft: {draft}"
+                    ),
+                    "revision_count": revisions + 1,
+                }
+
+        # ------------------------------------------------------------------
         # Gather tools used and mechanical truths from this turn
+        # ------------------------------------------------------------------
         recent_tools = []
         mechanical_truths = []
         for msg in reversed(state["messages"]):
@@ -509,6 +648,39 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
 
         else:
+            # ------------------------------------------------------------------
+            # Task #3: KG Rollback on Rejected Narrative
+            # If QA rejects, restore the KG from the snapshot to undo any
+            # mutations that were speculatively committed after narrator_node.
+            # ------------------------------------------------------------------
+            kg_snapshot = state.get("kg_snapshot")
+            rollback_performed = False
+            if kg_snapshot:
+                try:
+                    from registry import set_knowledge_graph
+                    from knowledge_graph import KnowledgeGraph
+                    restored_kg = KnowledgeGraph.model_validate(kg_snapshot)
+                    set_knowledge_graph(vault, restored_kg)
+                    rollback_performed = True
+                    # Invalidate cache since KG was restored to pre-mutation state
+                    _invalidate_grag_cache(vault)
+                    await write_audit_log(
+                        vault, "QA Agent", "KG Rollback",
+                        f"Restored KG from snapshot. {len(pending_mutations)} pending mutations discarded."
+                    )
+                except Exception as rb_err:
+                    await write_audit_log(
+                        vault, "QA Agent", "KG Rollback FAILED",
+                        f"Snapshot restore failed: {rb_err}. KG may be inconsistent."
+                    )
+
+            rejection_msg = result.feedback
+            if rollback_performed:
+                rejection_msg = (
+                    f"[KG ROLLED BACK — {len(pending_mutations)} speculative mutations discarded]\n\n"
+                    + rejection_msg
+                )
+
             await write_audit_log(vault, "QA Agent", "Result", f"REJECTED. Feedback: {result.feedback}")
             qa_logger.warning(
                 "Rule inconsistency detected. Draft rejected.",
@@ -519,10 +691,20 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                         "vault_path": vault,
                         "feedback": result.feedback,
                         "revision_count": revisions + 1,
+                        "kg_rollback": rollback_performed,
                     },
                 },
             )
-            return {"qa_feedback": result.feedback, "revision_count": revisions + 1}
+            return {
+                "qa_feedback": rejection_msg,
+                "revision_count": revisions + 1,
+                # Clear pending_mutations after rollback since they were never valid
+                "pending_mutations": [],
+                # Clear mutation_errors after surfacing them
+                "mutation_errors": [],
+                # Clear snapshot since it's now the current state
+                "kg_snapshot": kg_snapshot if not rollback_performed else None,
+            }
 
     # ------------------------------------------------------------------
     # NODE: DramaManager — updates tension arc and selects the next active storylet

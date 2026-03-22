@@ -117,7 +117,11 @@ if query_type == "engine_state_check":
 - Phase 3 (Campaign Builder): Sequence-to-storylet conversion with Three Clue Rule redundancy.
 - Inverse Three Clue Redundancy: *"for any essential conclusion, the architecture must provide at least three distinct vectors of discovery."*
 
-**Current state**: All storylets are created manually via `create_storylet` tool. No algorithmic generation, no chokepoint detection, no auto-generated backup paths.
+**Current state**: Three Clue Rule analyzer (`storylet_analyzer.py`) and NLP Ingestion Pipeline (`ingestion_pipeline.py`) are implemented:
+- `IngestionPipeline` with Phase 2 (a): NPC lore → KG entities/edges/dials via LLM
+- Phase 2 (b): Campaign narrative → Storylets with prereq annotations
+- Phase 2 (c): Storylet resolution prose → GraphMutation effects (Effect Annotation, Task 3.3)
+- `ThreeClueAnalyzer` for chokepoint detection and backup storylet generation
 
 **Fix** (incremental):
 1. Build `IngestionPipeline` class with Phase 1 entity extraction using LLM
@@ -183,7 +187,7 @@ Inject this as contextual grounding in the system prompt.
 | 3 | HIGH | Engine state queries in storylet prereqs | **DONE** ✅ | `storylet.py` | `test_storylet_engine_prereqs.py` |
 | 4 | HIGH | SVO claim validation | **DONE** ✅ | `hard_guardrails.py` | `test_svo_validation.py` |
 | 5 | HIGH | Three Clue redundancy analyzer | **DONE** ✅ | `storylet_analyzer.py` (new) | `test_three_clue_analyzer.py` |
-| 6 | HIGH | QA cross-check: narrative claims vs mutations | Pending | `graph.py`, `qa_node` | `test_qa_mutation_crosscheck.py` |
+| 6 | HIGH | QA cross-check: narrative claims vs mutations | **DONE** ✅ | `graph.py` | Integration test in `test_qa_mutation_crosscheck.py` |
 | 7 | MEDIUM | Relationship-weighted storylet selection | **DONE** ✅ | `drama_manager.py` | `test_drama_manager_relationships.py` |
 | 8 | MEDIUM | GraphRAG context injection | **DONE** ✅ | `graph.py` | `test_grag_context_injection.py` |
 | 9 | MEDIUM | NPC dial extraction and injection | **DONE** ✅ | `knowledge_graph.py`, `graph.py` | `test_npc_dials.py` |
