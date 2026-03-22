@@ -43,7 +43,8 @@ async def test_req_cor_005_opposed_tests_ties_go_to_defender(mock_obsidian_vault
             {"attacker_name": "Attacker", "target_name": "Defender", "action_type": "grapple"}, config=config
         )
 
-    assert "Defender wins! Nothing happens." in res
+    assert "Defender succeeds" in res
+    assert "Nothing happens." in res
 
 
 @pytest.mark.asyncio
@@ -154,7 +155,7 @@ async def test_req_spc_002_grappling_initiation(mock_obsidian_vault):
     )
     defender.movement_remaining = 30
 
-    with patch("random.randint", side_effect=[20, 1]):  # Attacker rolls high, defender rolls low
+    with patch("random.randint", side_effect=[1, 1]):  # Defender rolls low
         res = await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Grappler", "target_name": "Victim", "action_type": "grapple"}, config=config
         )

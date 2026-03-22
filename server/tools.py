@@ -533,6 +533,8 @@ async def modify_health(
     hp_change: int,
     reason: str,
     damage_type: str = "untyped",
+    instant_death_threshold: int = None,
+    disintegrate_if_zero: bool = False,
     *,
     config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
@@ -540,11 +542,27 @@ async def modify_health(
     Use this tool to apply guaranteed damage (traps, falling, auto-hit spells) or healing (potions, healing spells).
     Provide a negative hp_change for damage, positive for healing.
     Specify damage_type (e.g., 'fire', 'bludgeoning', 'falling') so the engine can check resistances.
+    Use `instant_death_threshold` for spells like Power Word Kill.
+    Use `disintegrate_if_zero` for spells like Disintegrate.
     """
     vault_path = config["configurable"].get("thread_id")
     target = await _get_entity_by_name(target_name, vault_path)
     if not target:
         return f"SYSTEM ERROR: Target '{target_name}' not found."
+
+    current_hp = target.hp.base_value
+
+    if instant_death_threshold is not None:
+        if current_hp <= instant_death_threshold:
+            target.hp.base_value = 0
+            target.active_conditions = [
+                c for c in target.active_conditions if c.name not in ["Dying", "Stable", "Unconscious"]
+            ]
+            if not any(c.name == "Dead" for c in target.active_conditions):
+                target.active_conditions.append(ActiveCondition(name="Dead"))
+            return f"MECHANICAL TRUTH: {target.name} had {current_hp} HP (<= {instant_death_threshold}) and was instantly killed by {reason}!"
+        else:
+            return f"MECHANICAL TRUTH: {target.name} has {current_hp} HP (> {instant_death_threshold}) and was unaffected by {reason}."
 
     if hp_change < 0:
         # Route damage through engine resistance checks natively
@@ -576,7 +594,6 @@ async def modify_health(
 
         hp_change = -dmg
 
-    current_hp = target.hp.base_value
     target.hp.base_value += hp_change
     action = "healed for" if hp_change > 0 else "took"
     result_msg = (
@@ -597,7 +614,15 @@ async def modify_health(
                     target.active_conditions.append(ActiveCondition(name="Dead"))
                 result_msg += f"\nSYSTEM ALERT: {target.name} is DEAD."
         elif target.hp.base_value <= 0:
-            if (current_hp - damage) <= -target.max_hp:
+            if disintegrate_if_zero:
+                target.hp.base_value = 0
+                target.active_conditions = [c for c in target.active_conditions if c.name not in ["Dying", "Stable"]]
+                if not any(c.name == "Dead" for c in target.active_conditions):
+                    target.active_conditions.append(ActiveCondition(name="Dead"))
+                if not any(c.name == "Dust" for c in target.active_conditions):
+                    target.active_conditions.append(ActiveCondition(name="Dust"))
+                result_msg += f"\nSYSTEM ALERT: {target.name} drops to 0 HP and is turned to DUST (Instantly Killed)!"
+            elif (current_hp - damage) <= -target.max_hp:
                 target.hp.base_value = 0
                 target.active_conditions = [c for c in target.active_conditions if c.name not in ["Dying", "Stable"]]
                 if not any(c.name == "Dead" for c in target.active_conditions):
@@ -625,7 +650,8 @@ async def modify_health(
 
     if target.hp.base_value > 0:
         target.active_conditions = [
-            c for c in target.active_conditions
+            c
+            for c in target.active_conditions
             if c.name not in ["Dying", "Stable"] and not (c.name == "Unconscious" and c.source_name in ["0 HP", "Unknown"])
         ]
         target.death_saves_successes = 0
@@ -1297,29 +1323,40 @@ async def use_font_of_magic(
     cost_map = {1: 2, 2: 3, 3: 5, 4: 6, 5: 7}
     if slot_level not in cost_map and action == "create_slot":
         return "SYSTEM ERROR: Can only create spell slots of 1st through 5th level."
-        
+
     try:
         async with edit_markdown_entity(file_path) as state:
             yaml_data = state["yaml_data"]
             resources = yaml_data.get("resources", {})
-            
+
             sp_key = next((k for k in resources.keys() if "sorcery point" in k.lower()), None)
-            slot_key = next((k for k in resources.keys() if f"level {slot_level}" in k.lower() or f"{slot_level}st level" in k.lower() or f"{slot_level}nd level" in k.lower() or f"{slot_level}rd level" in k.lower() or f"{slot_level}th level" in k.lower()), None)
+            slot_key = next(
+                (
+                    k
+                    for k in resources.keys()
+                    if f"level {slot_level}" in k.lower()
+                    or f"{slot_level}st level" in k.lower()
+                    or f"{slot_level}nd level" in k.lower()
+                    or f"{slot_level}rd level" in k.lower()
+                    or f"{slot_level}th level" in k.lower()
+                ),
+                None,
+            )
 
             if not sp_key:
                 state["save"] = False
                 return f"SYSTEM ERROR: No Sorcery Points found on {character_name}."
-                
+
             sp_match = re.match(r"(\d+)\s*/\s*(\d+)", str(resources[sp_key]))
             sp_cur, sp_max = int(sp_match.group(1)), int(sp_match.group(2))
-            
+
             if not slot_key:
                 slot_key = f"Level {slot_level} Spell Slots"
                 resources[slot_key] = "0/0"
-                
+
             slot_match = re.match(r"(\d+)\s*/\s*(\d+)", str(resources[slot_key]))
             slot_cur, slot_max = int(slot_match.group(1)), int(slot_match.group(2))
-            
+
             if action == "create_slot":
                 cost = cost_map[slot_level]
                 if sp_cur < cost:
@@ -1330,7 +1367,7 @@ async def use_font_of_magic(
                 resources[sp_key] = f"{sp_cur}/{sp_max}"
                 resources[slot_key] = f"{slot_cur}/{max(slot_cur, slot_max)}"
                 log = f"Spent {cost} Sorcery Points to create a Level {slot_level} Spell Slot."
-            
+
             elif action == "convert_slot":
                 if slot_cur < 1:
                     state["save"] = False
@@ -2111,7 +2148,13 @@ async def advance_time(
 
 
 @tool
-async def start_combat(pc_names: list[str], enemies: list[dict], surprised_names: list[str] = None, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def start_combat(
+    pc_names: list[str],
+    enemies: list[dict],
+    surprised_names: list[str] = None,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """Creates ACTIVE_COMBAT.md. surprised_names: list of combatant names that are surprised (roll initiative twice, take lower)."""
     vault_path = config["configurable"].get("thread_id")
     j_dir = get_journals_dir(vault_path)
@@ -2405,14 +2448,12 @@ async def place_entity(
     # Persist to vault so the placement survives a reload
     if hasattr(entity, "_filepath"):
         from vault_io import sync_engine_to_vault
+
         await sync_engine_to_vault(vault_path)
 
     map_info = f" on map '{entity.current_map}'" if entity.current_map else ""
     old_map_info = f" (moved from '{old_map}')" if old_map and old_map != entity.current_map else ""
-    return (
-        f"Placed {entity.name} at ({x}, {y}, {z}){map_info}{old_map_info}. "
-        f"No movement cost or opportunity attacks."
-    )
+    return f"Placed {entity.name} at ({x}, {y}, {z}){map_info}{old_map_info}. " f"No movement cost or opportunity attacks."
 
 
 @tool
@@ -2565,8 +2606,7 @@ async def move_entity(  # noqa: C901
             if tag.startswith("aura:"):
                 cond_name = tag[5:]
                 already = any(
-                    c.name.lower() == cond_name.lower() and c.source_name == zone.label
-                    for c in entity.active_conditions
+                    c.name.lower() == cond_name.lower() and c.source_name == zone.label for c in entity.active_conditions
                 )
                 if not already:
                     entity.active_conditions.append(
@@ -2582,7 +2622,8 @@ async def move_entity(  # noqa: C901
                 cond_name = tag[5:]
                 before = len(entity.active_conditions)
                 entity.active_conditions = [
-                    c for c in entity.active_conditions
+                    c
+                    for c in entity.active_conditions
                     if not (c.name.lower() == cond_name.lower() and c.source_name == zone.label)
                 ]
                 if len(entity.active_conditions) < before:
@@ -2595,12 +2636,17 @@ async def move_entity(  # noqa: C901
     illusion_reveal_msgs = []
     if movement_type.lower() not in ["teleport", "fall"] and HAS_GIS:
         from shapely.geometry import LineString as _LineString
+
         path_line = _LineString([(old_x, old_y), (target_x, target_y)])
         entity_uuid_str = str(entity.entity_uuid)
         for illusion_wall in spatial_service.get_illusion_walls(vault_path):
             if illusion_wall.is_phantasm:
                 continue  # Phantasm: physical pass-through doesn't auto-reveal (REQ-ILL-004)
-            if entity_uuid_str not in illusion_wall.revealed_for and illusion_wall.line and path_line.intersects(illusion_wall.line):
+            if (
+                entity_uuid_str not in illusion_wall.revealed_for
+                and illusion_wall.line
+                and path_line.intersects(illusion_wall.line)
+            ):
                 illusion_wall.revealed_for.append(entity_uuid_str)
                 spatial_service.invalidate_cache(vault_path)
                 illusion_reveal_msgs.append(
@@ -2733,26 +2779,27 @@ async def refresh_vault_data(
     """
     Forces the engine to reload entities from the Obsidian Vault into memory, updating their stats to match the Markdown files.
     - If `entity_names` is provided, those specific entities are forcefully re-hydrated.
-    - If `refresh_all` is True, it efficiently scans all files for changes using modified timestamps. 
+    - If `refresh_all` is True, it efficiently scans all files for changes using modified timestamps.
       You MUST ask the DM for confirmation ("Are you sure?") before calling with `refresh_all=True`.
     """
     vault_path = config["configurable"].get("thread_id")
-    
+
     if not entity_names and not refresh_all:
         return "SYSTEM ERROR: You must specify either a list of `entity_names` to refresh or set `refresh_all=True`."
 
     if refresh_all:
         from vault_io import sync_engine_from_vault_updates
+
         res = await sync_engine_from_vault_updates(vault_path)
         return res
 
     from vault_io import load_entity_into_engine, get_journals_dir
     import os
-    
+
     j_dir = get_journals_dir(vault_path)
     reloaded = []
     not_found = []
-    
+
     for name in entity_names:
         filepath = os.path.join(j_dir, f"{name}.md")
         if os.path.exists(filepath):
@@ -2769,7 +2816,7 @@ async def refresh_vault_data(
         res_str += f"MECHANICAL TRUTH: Successfully force-reloaded {', '.join(reloaded)} from vault. "
     if not_found:
         res_str += f"SYSTEM ERROR: Failed to reload (files not found or invalid): {', '.join(not_found)}"
-        
+
     return res_str.strip()
 
 
@@ -2783,16 +2830,20 @@ async def report_rule_challenge(
 ) -> str:
     """Use this tool IMMEDIATELY if a player complains, challenges, or disputes a game rule, dice roll, or mechanical outcome."""
     from system_logger import qa_logger
+
     vault_path = config["configurable"].get("thread_id", "default")
-    qa_logger.warning("Player Rule Dispute", extra={
-        "agent_id": "PLAYER_CHALLENGE",
-        "context": {
-            "character": character_name,
-            "vault_path": vault_path,
-            "dispute_details": dispute_details,
-            "expected_rule": expected_rule
-        }
-    })
+    qa_logger.warning(
+        "Player Rule Dispute",
+        extra={
+            "agent_id": "PLAYER_CHALLENGE",
+            "context": {
+                "character": character_name,
+                "vault_path": vault_path,
+                "dispute_details": dispute_details,
+                "expected_rule": expected_rule,
+            },
+        },
+    )
     return f"MECHANICAL TRUTH: Rule dispute from {character_name} successfully logged to the QA system."
 
 
@@ -3048,13 +3099,19 @@ async def use_ability_or_spell(  # noqa: C901
         caster_conds = [c.name.lower() for c in getattr(caster, "active_conditions", [])]
         caster_tags = getattr(caster, "tags", [])
         is_underwater_no_breath = (
-            any(t in caster_tags for t in ["underwater", "submerged"]) or any(t in caster_conds for t in ["underwater", "submerged"])
-        ) and "water_breathing" not in caster_tags and not any(c == "water breathing" for c in caster_conds)
-        if v_req and (
-            any(c in caster_conds for c in ["silenced", "gagged"])
-            or is_underwater_no_breath
-        ):
-            reason = "Silenced/Gagged" if any(c in caster_conds for c in ["silenced", "gagged"]) else "submerged underwater without Water Breathing"
+            (
+                any(t in caster_tags for t in ["underwater", "submerged"])
+                or any(t in caster_conds for t in ["underwater", "submerged"])
+            )
+            and "water_breathing" not in caster_tags
+            and not any(c == "water breathing" for c in caster_conds)
+        )
+        if v_req and (any(c in caster_conds for c in ["silenced", "gagged"]) or is_underwater_no_breath):
+            reason = (
+                "Silenced/Gagged"
+                if any(c in caster_conds for c in ["silenced", "gagged"])
+                else "submerged underwater without Water Breathing"
+            )
             vsm_error = f"SYSTEM ERROR: {caster.name} cannot cast '{ability_display_name}' because it requires Verbal (V) components and they are {reason}. (REQ-SND-001)"
 
         # REQ-SPL-014: Bound check
@@ -3241,6 +3298,7 @@ async def use_ability_or_spell(  # noqa: C901
     resource_amount_to_deduct = 0
     if resource_cost_str:
         import re as _re
+
         rc_match = _re.match(r"^(.+):(\d+)$", resource_cost_str.strip())
         if rc_match:
             resource_name_to_deduct = rc_match.group(1).strip()
@@ -3295,6 +3353,7 @@ async def use_ability_or_spell(  # noqa: C901
     # Deduct resource_cost after successful dispatch
     if resource_name_to_deduct and result.status != EventStatus.CANCELLED:
         import re as _re
+
         current_res = caster.resources.get(resource_name_to_deduct, "")
         rm = _re.match(r"(\d+)\s*/\s*(\d+)", str(current_res))
         if rm:
@@ -4379,12 +4438,15 @@ async def execute_grapple_or_shove(
     throw_distance: float = 10.0,
     advantage: bool = False,
     disadvantage: bool = False,
+    manual_roll_total: int = None,
+    force_auto_roll: bool = False,
     *,
     config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
     """
-    Resolves a contested Athletics check for a Grapple, Shove, or Throw. action_type must be 'grapple', 'shove', or 'throw'.
-    The engine automatically calculates the correct Modifiers based on the entities' stats.
+    Resolves a Grapple, Shove, Throw, or Escape. action_type must be 'grapple', 'shove', 'throw', or 'escape'.
+    - For grapple/shove/throw: Target makes a Save vs Attacker's DC.
+    - For escape: Attacker (escaping entity) makes a Check vs Target's (grappler's) DC.
     """
     vault_path = config["configurable"].get("thread_id")
     attacker = await _get_entity_by_name(attacker_name, vault_path)
@@ -4393,24 +4455,81 @@ async def execute_grapple_or_shove(
     if not attacker or not target:
         return "SYSTEM ERROR: Attacker or Target not found in active memory."
 
+    if action_type.lower() == "escape":
+        # REQ-SKL-009: Escaping a grapple is an Acrobatics or Athletics check against the grappler's static Escape DC
+        grappler = target
+        escaper = attacker
+
+        char_level = grappler.character_level if hasattr(grappler, "character_level") and grappler.character_level > 0 else 1
+        prof_bonus = max(2, (char_level - 1) // 4 + 2)
+        escape_dc = 8 + grappler.strength_mod.total + prof_bonus
+
+        is_pc = any(t in escaper.tags for t in ["pc", "player"])
+        if is_pc and not force_auto_roll and manual_roll_total is None:
+            auto_settings = get_roll_automations(escaper.name)
+            if not auto_settings.get("skill_checks", True):
+                return (
+                    f"SYSTEM ALERT: {escaper.name} has manual skill checks enabled. Ask the player to roll "
+                    f"Acrobatics or Athletics against DC {escape_dc} and provide the total."
+                )
+
+        if manual_roll_total is not None:
+            escaper_total = manual_roll_total
+            log = f"Grapple Escape DC {escape_dc}: {escaper.name} manually rolled {escaper_total}. "
+        else:
+            tgt_roll1, tgt_roll2 = random.randint(1, 20), random.randint(1, 20)
+            if advantage and not disadvantage:
+                tgt_roll = max(tgt_roll1, tgt_roll2)
+            elif disadvantage and not advantage:
+                tgt_roll = min(tgt_roll1, tgt_roll2)
+            else:
+                tgt_roll = tgt_roll1
+
+            escaper_mod = max(escaper.strength_mod.total, escaper.dexterity_mod.total)
+            escaper_total = tgt_roll + escaper_mod
+            log = f"Grapple Escape DC {escape_dc}: {escaper.name} rolls {tgt_roll} + {escaper_mod} = {escaper_total}. "
+
+        if escaper_total >= escape_dc:
+            log += f"Success! {escaper.name} escapes the grapple."
+            await toggle_condition.ainvoke(
+                {"character_name": escaper.name, "condition_name": "Grappled", "is_active": False}, config=config
+            )
+        else:
+            log += f"Failure. {escaper.name} remains grappled."
+
+        return f"MECHANICAL TRUTH: {log}"
+
     # REQ-ACT-007: 2024 update — target makes Str or Dex SAVE vs attacker's DC
     # DC = 8 + attacker STR mod + proficiency bonus (derived from character level)
     char_level = attacker.character_level if hasattr(attacker, "character_level") and attacker.character_level > 0 else 1
     prof_bonus = max(2, (char_level - 1) // 4 + 2)
     save_dc = 8 + attacker.strength_mod.total + prof_bonus
 
-    tgt_roll1, tgt_roll2 = random.randint(1, 20), random.randint(1, 20)
-    if advantage and not disadvantage:
-        tgt_roll = max(tgt_roll1, tgt_roll2)
-    elif disadvantage and not advantage:
-        tgt_roll = min(tgt_roll1, tgt_roll2)
+    is_pc = any(t in target.tags for t in ["pc", "player"])
+    if is_pc and not force_auto_roll and manual_roll_total is None:
+        auto_settings = get_roll_automations(target.name)
+        if not auto_settings.get("saving_throws", True):
+            return (
+                f"SYSTEM ALERT: {target.name} has manual saving throws enabled. Ask the player to roll "
+                f"a Strength or Dexterity Save against DC {save_dc} and provide the total."
+            )
+
+    if manual_roll_total is not None:
+        tgt_total = manual_roll_total
+        log = f"Grapple/Shove DC {save_dc}: {target.name} manually rolled {tgt_total}. "
     else:
-        tgt_roll = tgt_roll1
+        tgt_roll1, tgt_roll2 = random.randint(1, 20), random.randint(1, 20)
+        if advantage and not disadvantage:
+            tgt_roll = max(tgt_roll1, tgt_roll2)
+        elif disadvantage and not advantage:
+            tgt_roll = min(tgt_roll1, tgt_roll2)
+        else:
+            tgt_roll = tgt_roll1
 
-    target_mod = max(target.strength_mod.total, target.dexterity_mod.total)
-    tgt_total = tgt_roll + target_mod
+        target_mod = max(target.strength_mod.total, target.dexterity_mod.total)
+        tgt_total = tgt_roll + target_mod
 
-    log = f"Grapple/Shove DC {save_dc}: {target.name} rolls {tgt_roll} + {target_mod} = {tgt_total}. "
+        log = f"Grapple/Shove DC {save_dc}: {target.name} rolls {tgt_roll} + {target_mod} = {tgt_total}. "
 
     # Target fails the save (total < DC) → attacker succeeds
     if tgt_total < save_dc:
@@ -4650,9 +4769,7 @@ async def investigate_illusion(
         return f"SYSTEM ERROR: Entity '{entity_name}' not found."
 
     # REQ-ILL-006: Truesight auto-succeeds
-    has_truesight = any(
-        t == "truesight" or t.startswith("truesight_") for t in getattr(entity, "tags", [])
-    )
+    has_truesight = any(t == "truesight" or t.startswith("truesight_") for t in getattr(entity, "tags", []))
 
     illusion_walls = spatial_service.get_illusion_walls(vault_path)
     target_wall = None
