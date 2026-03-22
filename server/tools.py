@@ -2371,6 +2371,51 @@ async def end_combat(*, config: Annotated[RunnableConfig, InjectedToolArg]) -> s
 
 
 @tool
+async def place_entity(
+    entity_name: str,
+    x: float,
+    y: float,
+    map_name: str = "",
+    z: float = 0.0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """Teleports an entity to an exact position and map without spending movement or triggering
+    opportunity attacks.  Use this to:
+      • Place a freshly created or JIT-loaded NPC at their correct starting location.
+      • Move an entity between maps (e.g. from 'dungeon_floor1.jpg' to 'tavern.jpg').
+      • Correct an entity that spawned at (0, 0) due to missing map/coordinate data.
+
+    map_name — the map file name as stored in the vault (e.g. 'dungeon_floor1.jpg').
+    Leave map_name blank to keep the entity on their current map (or the active map if unassigned)."""
+    vault_path = config["configurable"].get("thread_id")
+    entity = await _get_entity_by_name(entity_name, vault_path)
+    if not entity:
+        return f"SYSTEM ERROR: Entity '{entity_name}' not found."
+
+    old_map = getattr(entity, "current_map", "")
+    entity.x = x
+    entity.y = y
+    entity.z = z
+    if map_name:
+        entity.current_map = map_name
+
+    spatial_service.sync_entity(entity)
+
+    # Persist to vault so the placement survives a reload
+    if hasattr(entity, "_filepath"):
+        from vault_io import sync_engine_to_vault
+        await sync_engine_to_vault(vault_path)
+
+    map_info = f" on map '{entity.current_map}'" if entity.current_map else ""
+    old_map_info = f" (moved from '{old_map}')" if old_map and old_map != entity.current_map else ""
+    return (
+        f"Placed {entity.name} at ({x}, {y}, {z}){map_info}{old_map_info}. "
+        f"No movement cost or opportunity attacks."
+    )
+
+
+@tool
 async def move_entity(  # noqa: C901
     entity_name: str,
     target_x: float,
@@ -2378,13 +2423,15 @@ async def move_entity(  # noqa: C901
     target_z: float = None,
     movement_type: str = "walk",
     standing_jump: bool = False,
+    target_map: str = None,
     *,
     config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
     """Moves an entity to a new (X, Y, Z) coordinate on the spatial grid and visually updates the combat whiteboard.
     Valid movement_type values: 'walk', 'jump', 'climb', 'fly', 'teleport', 'crawl', 'disengage', 'forced', 'fall', 'travel'.
     'walk' and 'crawl' will be blocked by solid walls in a straight line.
-    Set standing_jump=True for a jump without a 10ft running start (REQ-MOV-010: halves both long and high jump limits)."""
+    Set standing_jump=True for a jump without a 10ft running start (REQ-MOV-010: halves both long and high jump limits).
+    Set target_map to move the entity to a different map (implies movement_type='teleport' for the map transition)."""
     vault_path = config["configurable"].get("thread_id")
     entity = await _get_entity_by_name(entity_name, vault_path)
     if not entity:
@@ -2501,6 +2548,8 @@ async def move_entity(  # noqa: C901
     entity.x = target_x
     entity.y = target_y
     entity.z = target_z
+    if target_map is not None:
+        entity.current_map = target_map
 
     spatial_service.sync_entity(entity)
 

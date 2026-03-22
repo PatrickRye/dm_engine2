@@ -399,6 +399,21 @@ class SpatialQueryService:
         md.temporary_walls.clear()
         self.invalidate_cache(vault_path)
 
+    def _entity_on_active_map(self, entity: SpatialObject, vault_path: str) -> bool:
+        """Returns True if the entity belongs on the vault's currently active map.
+
+        Entities with current_map=="" are treated as being on whatever map is active
+        (backward-compat for entities created before multi-map support).  Entities with
+        a specific current_map are only present on that named map.
+        """
+        current_map = getattr(entity, "current_map", "")
+        if not current_map:
+            return True  # unassigned — appears on any/default active map
+        active_map = self.get_map_data(vault_path).map_name or ""
+        if not active_map:
+            return True  # no named map loaded yet; don't filter anyone out
+        return current_map == active_map
+
     def load_map(self, map_data: MapData, vault_path: str = "default"):
         if not map_data.original_walls and map_data.walls:
             map_data.original_walls = [wall.model_copy(deep=True) for wall in map_data.walls]
@@ -411,8 +426,18 @@ class SpatialQueryService:
         self._map_data[vault_path] = map_data
         self.invalidate_cache(vault_path)
 
+        # Re-sync every registered entity so map-specific entities appear/disappear correctly.
+        if vault_path in self._entities:
+            for entity in list(self._entities[vault_path].values()):
+                self.sync_entity(entity)
+
     def sync_entity(self, entity: SpatialObject):
-        """Adds or updates an entity's bounding box in the Rtree spatial index."""
+        """Adds or updates an entity's bounding box in the Rtree spatial index.
+
+        Entities whose current_map doesn't match the vault's active map are kept in
+        _entities (so registry/name lookups still work) but removed from the spatial
+        index so they don't affect movement, LOS, or collision queries.
+        """
         if not HAS_GIS:
             return
 
@@ -421,7 +446,24 @@ class SpatialQueryService:
             vp = "default"
         self.get_map_data(vp)
 
+        # Always store in _entities so the registry can find the entity by name/UUID.
         self._entities[vp][entity.entity_uuid] = entity
+
+        # If this entity is assigned to a different map, remove it from the spatial
+        # index (if present) and return early — it won't affect spatial queries.
+        if not self._entity_on_active_map(entity, vp):
+            if entity.entity_uuid in self._uuid_to_id[vp]:
+                curr_id = self._uuid_to_id[vp][entity.entity_uuid]
+                old_bbox = self._uuid_to_bbox[vp].get(entity.entity_uuid)
+                if old_bbox:
+                    self.entity_idx[vp].delete(curr_id, old_bbox)
+                del self._id_to_uuid[vp][curr_id]
+                del self._uuid_to_id[vp][entity.entity_uuid]
+                self._uuid_to_bbox[vp].pop(entity.entity_uuid, None)
+                self._uuid_to_shape[vp].pop(entity.entity_uuid, None)
+                self._entity_terrain_occupancy.get(vp, {}).pop(entity.entity_uuid, None)
+            return
+
         new_bbox = self._get_bbox(entity)
         new_shape = box(*new_bbox)
 

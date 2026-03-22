@@ -29,6 +29,7 @@ class BaseGameEntity(BaseModel):
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
+    current_map: str = ""  # Map name (e.g. "dungeon_floor1.jpg") entity is on; "" = default/active map
     size: float = 5.0  # represents a standard 5x5 foot D&D grid space
     height: float = 5.0  # Defaults to size unless specifically set (e.g. Medium creature = 5x5x5)
 

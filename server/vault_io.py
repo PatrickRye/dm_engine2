@@ -146,6 +146,7 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
             x=float(yaml_data.get("x", 0.0)),
             y=float(yaml_data.get("y", 0.0)),
             z=float(yaml_data.get("z", 0.0)),
+            current_map=str(yaml_data.get("current_map", "")),
             icon_url=yaml_data.get("icon_url", ""),
             height=float(yaml_data.get("height", yaml_data.get("size", 5.0))),
             max_hp=int(yaml_data.get("max_hp", yaml_data.get("hp", 10))),
@@ -262,6 +263,15 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
             pass
         print(f"Loaded to Engine: {entity.name} (HP: {entity.hp.base_value})")
 
+        # Warn when a newly JIT-loaded entity has no map assignment and sits at the origin.
+        # These entities will be placed on the default/active map, but the DM may want to
+        # use `place_entity` to put them somewhere intentional.
+        if not entity.current_map and entity.x == 0.0 and entity.y == 0.0:
+            print(
+                f"[DM ALERT] {entity.name} has no map assignment and spawned at (0, 0). "
+                f"Use `place_entity` to position them on a specific map and location."
+            )
+
         spatial_service.sync_entity(entity)
         return entity
     except Exception as e:
@@ -347,6 +357,7 @@ async def sync_engine_to_vault(vault_path: str):
                 yaml_data["x"] = entity.x
                 yaml_data["y"] = entity.y
                 yaml_data["z"] = entity.z
+                yaml_data["current_map"] = entity.current_map
                 yaml_data["height"] = entity.height
                 if entity.icon_url:
                     yaml_data["icon_url"] = entity.icon_url
