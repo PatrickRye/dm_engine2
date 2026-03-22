@@ -467,6 +467,12 @@ async def execute_melee_attack(
             return f"SYSTEM ERROR: {attacker.name} has no Legendary Actions remaining."
         attacker.legendary_actions_current -= 1
 
+    if "controlled_mount" in attacker.tags:
+        return (
+            f"SYSTEM ERROR: {attacker.name} is a controlled mount. "
+            f"It can ONLY take the Dash, Disengage, or Dodge actions (REQ-MNT-003)."
+        )
+
     # REQ-WPN-003: Off-hand attack requires a Light weapon
     if is_offhand and isinstance(attacker, Creature) and attacker.equipped_weapon_uuid:
         offhand_weapon = get_entity(attacker.equipped_weapon_uuid, vault_path)
@@ -1687,6 +1693,7 @@ async def manage_inventory(  # noqa: C901
 async def perform_ability_check_or_save(  # noqa: C901
     character_name: str,
     skill_or_stat_name: str,
+    target_names: list[str] = None,
     is_hidden: bool = False,
     is_passive: bool = False,
     advantage: bool = False,
@@ -1757,6 +1764,23 @@ async def perform_ability_check_or_save(  # noqa: C901
         active_conds = [c.name.lower() for c in engine_creature.active_conditions]
         if "poisoned" in active_conds:
             disadvantage = True
+
+    # REQ-ENC-004: Charmed Social Advantage
+    social_alert = ""
+    if (
+        engine_creature
+        and isinstance(engine_creature, Creature)
+        and target_names
+        and clean_skill in ["persuasion", "deception", "intimidation", "performance", "insight"]
+    ):
+        for t_name in target_names:
+            t_ent = await _get_entity_by_name(t_name, vault_path)
+            if t_ent and any(
+                c.name.lower() == "charmed" and c.source_uuid == engine_creature.entity_uuid
+                for c in getattr(t_ent, "active_conditions", [])
+            ):
+                advantage = True
+                social_alert += f"\nSYSTEM ALERT (REQ-ENC-004): {character_name} has Advantage on social checks against {t_ent.name} because they are Charmed!"
 
     is_pc = any(t in engine_creature.tags for t in ["pc", "player"]) if engine_creature else False
     if is_pc and not is_passive and not force_auto_roll and manual_roll_total is None:
@@ -1889,15 +1913,9 @@ async def perform_ability_check_or_save(  # noqa: C901
                     "\nSYSTEM ALERT: Character is in BRIGHT LIGHT. They cannot hide without physical cover or invisibility."
                 )
             elif illum == "darkness":
-                illum_alert = (
-                    "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. They are heavily obscured and can hide freely. "
-                    "If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
-                )
+                illum_alert = "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. They are heavily obscured and can hide freely."
             elif illum == "dim":
-                illum_alert = (
-                    "\nSYSTEM ALERT: Character is in DIM LIGHT. They are lightly obscured and can hide. "
-                    "If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
-                )
+                illum_alert = "\nSYSTEM ALERT: Character is in DIM LIGHT. They are lightly obscured and can hide."
             # REQ-ARM-002: Heavy armor stealth disadvantage
             try:
                 async with read_markdown_entity(file_path) as (yd, _):
@@ -1913,6 +1931,35 @@ async def perform_ability_check_or_save(  # noqa: C901
             except Exception:
                 pass
 
+        # REQ-VIS-002: Evaluate stealth natively
+        if illum != "bright":
+            max_pp = 0
+            is_pc_stealth = any(t in engine_creature.tags for t in ["pc", "player", "party_npc"])
+            for uid, ent in get_all_entities(vault_path).items():
+                if isinstance(ent, Creature) and ent.hp.base_value > 0 and ent.entity_uuid != engine_creature.entity_uuid:
+                    is_ent_pc = any(t in ent.tags for t in ["pc", "player", "party_npc"])
+                    if is_pc_stealth != is_ent_pc:
+                        dist = 0
+                        if HAS_GIS:
+                            dist = spatial_service.calculate_distance(
+                                ent.x, ent.y, ent.z, engine_creature.x, engine_creature.y, engine_creature.z, vault_path
+                            )
+                        distance_penalty = int(dist // 10)
+                        pp = 10 + ent.wisdom_mod.total - distance_penalty
+                        if pp > max_pp:
+                            max_pp = pp
+            hide_dc = max(15, max_pp)
+            if total >= hide_dc:
+                if not any(c.name.lower() == "invisible" for c in engine_creature.active_conditions):
+                    engine_creature.active_conditions.append(ActiveCondition(name="Invisible", source_name="Hide Action"))
+                illum_alert += f"\nSYSTEM ALERT (REQ-VIS-002): {character_name} rolled {total} (>= DC {hide_dc}). They succeeded and gained the 'Invisible' condition!"
+            else:
+                illum_alert += f"\nSYSTEM ALERT (REQ-VIS-002): {character_name} rolled {total} (failed to beat DC {hide_dc}). They remain visible."
+        else:
+            illum_alert += (
+                f"\nSYSTEM ALERT (REQ-VIS-002): {character_name} failed to hide (cannot hide in bright light without cover)."
+            )
+
     exh_penalty = engine_creature.exhaustion_level * 2 if (engine_creature and isinstance(engine_creature, Creature)) else 0
     total -= exh_penalty
     exh_str = f" - {exh_penalty} (Exhaustion)" if exh_penalty > 0 else ""
@@ -1924,7 +1971,7 @@ async def perform_ability_check_or_save(  # noqa: C901
     result_str += (
         "\nHIDDEN ROLL: Narrate sensory experience only." if is_hidden else "\nYou may reveal the total to the player."
     )
-    result_str += illum_alert
+    result_str += illum_alert + social_alert
 
     await write_audit_log(vault_path, "Rules Engine", "perform_ability_check_or_save Executed", result_str)
     return result_str
@@ -2485,24 +2532,27 @@ async def move_entity(  # noqa: C901
     dz = target_z - old_z
     dist_3d = spatial_service.calculate_distance(old_x, old_y, old_z, target_x, target_y, target_z, vault_path)
 
-    # --- Identify Dragged Entities ---
+    # --- Identify Dragged Entities & Riders ---
     dragged_entities = []
-    if movement_type.lower() not in ["teleport", "fall", "forced"]:
-        for uid, ent in get_all_entities(vault_path).items():
-            if isinstance(ent, Creature):
+    riders = []
+    for uid, ent in get_all_entities(vault_path).items():
+        if isinstance(ent, Creature):
+            if movement_type.lower() not in ["teleport", "fall", "forced"]:
                 for cond in ent.active_conditions:
                     if cond.name.lower() == "grappled" and cond.source_uuid == entity.entity_uuid:
                         dragged_entities.append(ent)
+            if getattr(ent, "mounted_on_uuid", None) == entity.entity_uuid:
+                riders.append(ent)
 
     # --- REQ-GEO-006: Cannot end movement in an occupied space ---
     if movement_type.lower() not in ["teleport", "forced", "fall"]:
-        # dragged_entities are grappled by this mover — they travel with us, not a blocker
         dragged_uuids = {d.entity_uuid for d in dragged_entities}
+        rider_uuids = {r.entity_uuid for r in riders}
         occupants = spatial_service.get_entities_at_position(
             target_x, target_y, entity.size, vault_path, exclude_uuid=entity.entity_uuid
         )
         for occ in occupants:
-            if occ.entity_uuid in dragged_uuids:
+            if occ.entity_uuid in dragged_uuids or occ.entity_uuid in rider_uuids:
                 continue
             if hasattr(occ, "hp") and getattr(occ.hp, "base_value", 0) > 0:
                 return (
@@ -2654,6 +2704,23 @@ async def move_entity(  # noqa: C901
                     f"'{illusion_wall.label}' — it is now revealed to them as an illusion."
                 )
 
+    # REQ-MNT-005: Forced movement triggers Dex Save for all riders to stay mounted
+    forced_dismount_msgs = []
+    if movement_type.lower() == "forced" and riders:
+        for r in riders:
+            roll = random.randint(1, 20)
+            total = roll + r.dexterity_mod.total
+            if total < 10:
+                r.mounted_on_uuid = None
+                r.active_conditions.append(ActiveCondition(name="Prone", source_name="Forced Dismount"))
+                forced_dismount_msgs.append(
+                    f"\nSYSTEM ALERT (REQ-MNT-005): {r.name} failed DC 10 Dex save ({total}) and was thrown from their mount, landing Prone!"
+                )
+            else:
+                forced_dismount_msgs.append(
+                    f"\nSYSTEM ALERT (REQ-MNT-005): {r.name} succeeded DC 10 Dex save ({total}) and held onto their mount."
+                )
+
     # Apply movement to dragged entities
     dx, dy = target_x - old_x, target_y - old_y
     drag_msg_parts = []
@@ -2666,6 +2733,18 @@ async def move_entity(  # noqa: C901
                 {"entity_name": dragged.name, "updates": {"x": new_dx, "y": new_dy, "z": new_dz}}, config
             )
         drag_msg_parts.append(dragged.name)
+
+    rider_msg_parts = []
+    for r in riders:
+        if getattr(r, "mounted_on_uuid", None) == entity.entity_uuid:
+            new_dx, new_dy, new_dz = r.x + dx, r.y + dy, r.z + dz
+            r.x, r.y, r.z = new_dx, new_dy, new_dz
+            spatial_service.sync_entity(r)
+            if hasattr(r, "_filepath"):
+                await update_yaml_frontmatter.ainvoke(
+                    {"entity_name": r.name, "updates": {"x": new_dx, "y": new_dy, "z": new_dz}}, config
+                )
+            rider_msg_parts.append(r.name)
 
     # Persist the change to the entity's file
     if hasattr(entity, "_filepath"):
@@ -2684,6 +2763,8 @@ async def move_entity(  # noqa: C901
                         c["x"], c["y"] = target_x, target_y
                     elif c.get("name", "") in drag_msg_parts:
                         c["x"], c["y"] = c.get("x", 0) + dx, c.get("y", 0) + dy
+                    elif c.get("name", "") in rider_msg_parts:
+                        c["x"], c["y"] = c.get("x", 0) + dx, c.get("y", 0) + dy
         except Exception:
             pass
 
@@ -2695,6 +2776,10 @@ async def move_entity(  # noqa: C901
 
     if drag_msg_parts:
         base_msg += f" They automatically dragged {', '.join(drag_msg_parts)} with them."
+    if rider_msg_parts:
+        base_msg += f" Their riders {', '.join(rider_msg_parts)} moved with them."
+    for msg in forced_dismount_msgs:
+        base_msg += msg
 
     for aura_msg in terrain_aura_msgs:
         base_msg += aura_msg
@@ -3033,6 +3118,7 @@ async def use_ability_or_spell(  # noqa: C901
     manual_saves: dict = None,
     force_auto_roll: bool = False,
     proxy_caster_name: str = None,
+    command_invokes_self_harm: bool = False,
     *,
     config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
@@ -3074,6 +3160,12 @@ async def use_ability_or_spell(  # noqa: C901
             if reason:
                 return f"SYSTEM ERROR: {origin_ent.name} cannot execute this action because {reason}. Per 5.5e rules, without verbal commands it must take the Dodge action and use its move to avoid danger."
 
+    if "controlled_mount" in origin_ent.tags:
+        return (
+            f"SYSTEM ERROR: {origin_ent.name} is a controlled mount. "
+            f"It can ONLY take the Dash, Disengage, or Dodge actions (REQ-MNT-003)."
+        )
+
     mitigation_notes = ""
     spell_def = await SpellCompendium.load_spell(vault_path, ability_name)
     if spell_def:
@@ -3113,6 +3205,22 @@ async def use_ability_or_spell(  # noqa: C901
                 else "submerged underwater without Water Breathing"
             )
             vsm_error = f"SYSTEM ERROR: {caster.name} cannot cast '{ability_display_name}' because it requires Verbal (V) components and they are {reason}. (REQ-SND-001)"
+
+        if not vsm_error and v_req:
+            # REQ-SND-002: Verbal components break stealth
+            hidden_conds = [
+                c
+                for c in getattr(origin_ent, "active_conditions", [])
+                if c.name.lower() in ["hidden", "invisible"] and c.source_name in ["Hide Action", "Manual", "Unknown"]
+            ]
+            if hidden_conds:
+                for c in hidden_conds:
+                    origin_ent.active_conditions.remove(c)
+                mitigation_notes += f"\nSYSTEM ALERT: {origin_ent.name} spoke a Verbal component and lost their Invisible/Hidden status (REQ-SND-002)!"
+
+        # REQ-ENC-002: Harmful Commands
+        if command_invokes_self_harm and spell_def and spell_def.school.lower() == "enchantment":
+            vsm_error = f"SYSTEM ERROR: {caster.name} commanded the target to harm themselves. Spells like Command or Suggestion automatically fail and terminate if the command invokes direct self-harm! (REQ-ENC-002)"
 
         # REQ-SPL-014: Bound check
         if (
@@ -4306,6 +4414,34 @@ async def toggle_condition(  # noqa: C901
                 "\nSYSTEM ALERT: 'Frightened' means they have Disadvantage on attacks/checks "
                 "while the source is visible, and CANNOT willingly move closer to it."
             )
+
+        # REQ-MNT-006: Mount knocks rider Prone unless they have a reaction
+        if cond_lower == "prone" and engine_creature:
+            riders = [
+                e
+                for e in get_all_entities(vault_path).values()
+                if isinstance(e, Creature) and getattr(e, "mounted_on_uuid", None) == engine_creature.entity_uuid
+            ]
+            for rider in riders:
+                rider.mounted_on_uuid = None
+                if not rider.reaction_used:
+                    rider.reaction_used = True
+                    result_msg += f"\nSYSTEM ALERT (REQ-MNT-006): {engine_creature.name} fell Prone! {rider.name} used their Reaction to safely dismount and land on their feet."
+                else:
+                    if not any(c.name.lower() == "prone" for c in rider.active_conditions):
+                        rider.active_conditions.append(ActiveCondition(name="Prone", source_name="Mount Fell"))
+                    result_msg += f"\nSYSTEM ALERT (REQ-MNT-006): {engine_creature.name} fell Prone! {rider.name} had no Reaction available and fell Prone!"
+
+        # REQ-MNT-005: Rider knocked Prone triggers DC 10 save to stay mounted
+        if cond_lower == "prone" and getattr(engine_creature, "mounted_on_uuid", None):
+            roll = random.randint(1, 20)
+            total = roll + engine_creature.dexterity_mod.total
+            if total < 10:
+                engine_creature.mounted_on_uuid = None
+                result_msg += f"\nSYSTEM ALERT (REQ-MNT-005): {character_name} was knocked Prone while mounted. Failed DC 10 Dex save ({total}) and fell off!"
+            else:
+                result_msg += f"\nSYSTEM ALERT (REQ-MNT-005): {character_name} was knocked Prone while mounted, but succeeded the DC 10 Dex save ({total}) to stay on!"
+
         elif cond_lower in ["dazed", "confused"]:
             result_msg += (
                 f"\nSYSTEM ALERT: '{condition_name.capitalize()}' restricts actions and movement. "
@@ -4580,6 +4716,93 @@ async def execute_grapple_or_shove(
         log += f"Defender succeeds (rolled {tgt_total} vs DC {save_dc})! Nothing happens."
 
     return f"MECHANICAL TRUTH: {log}"
+
+
+@tool
+async def manage_mount(
+    rider_name: str,
+    mount_name: str = "",
+    action: str = "mount",
+    is_controlled: bool = True,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Handles mounting and dismounting a creature (REQ-MNT-001 to REQ-MNT-004).
+    Costs half of the rider's speed.
+    If is_controlled=True, the mount's initiative changes to match the rider and it can only Dash/Disengage/Dodge.
+    """
+    vault_path = config["configurable"].get("thread_id")
+    rider = await _get_entity_by_name(rider_name, vault_path)
+    if not rider:
+        return f"SYSTEM ERROR: Rider '{rider_name}' not found."
+
+    move_cost = max(1, rider.speed // 2)
+
+    if action.lower() == "mount":
+        if not mount_name:
+            return "SYSTEM ERROR: Must provide mount_name."
+        mount = await _get_entity_by_name(mount_name, vault_path)
+        if not mount:
+            return f"SYSTEM ERROR: Mount '{mount_name}' not found."
+
+        dist = spatial_service.calculate_distance(rider.x, rider.y, rider.z, mount.x, mount.y, mount.z, vault_path)
+        if dist > (mount.size / 2 + 5.0):
+            return "SYSTEM ERROR: Mount is too far away to mount."
+
+        if rider.movement_remaining < move_cost:
+            return f"SYSTEM ERROR: Not enough movement to mount (requires {move_cost}ft)."
+
+        rider.movement_remaining -= move_cost
+        rider.mounted_on_uuid = mount.entity_uuid
+
+        if is_controlled:
+            if "controlled_mount" not in mount.tags:
+                mount.tags.append("controlled_mount")
+            if "independent_mount" in mount.tags:
+                mount.tags.remove("independent_mount")
+        else:
+            if "independent_mount" not in mount.tags:
+                mount.tags.append("independent_mount")
+            if "controlled_mount" in mount.tags:
+                mount.tags.remove("controlled_mount")
+
+        rider.x, rider.y, rider.z = mount.x, mount.y, mount.z
+        spatial_service.sync_entity(rider)
+
+        combat_file = os.path.join(get_journals_dir(vault_path), "ACTIVE_COMBAT.md")
+        if is_controlled and os.path.exists(combat_file):
+            try:
+                async with edit_markdown_entity(combat_file) as state:
+                    yaml_data = state["yaml_data"]
+                    combatants = yaml_data.get("combatants", [])
+                    rider_init = None
+                    mount_idx = -1
+                    for i, c in enumerate(combatants):
+                        if c["name"].lower() == rider.name.lower():
+                            rider_init = c["init"]
+                        if c["name"].lower() == mount.name.lower():
+                            mount_idx = i
+
+                    if rider_init is not None and mount_idx != -1:
+                        combatants[mount_idx]["init"] = float(rider_init)
+                        yaml_data["combatants"] = sorted(combatants, key=lambda x: float(x["init"]), reverse=True)
+            except Exception:
+                pass
+
+        return f"MECHANICAL TRUTH: {rider.name} mounted {mount.name}. Movement cost: {move_cost}ft."
+
+    elif action.lower() == "dismount":
+        if not getattr(rider, "mounted_on_uuid", None):
+            return "SYSTEM ERROR: Rider is not mounted."
+        if rider.movement_remaining < move_cost:
+            return f"SYSTEM ERROR: Not enough movement to dismount (requires {move_cost}ft)."
+
+        rider.movement_remaining -= move_cost
+        rider.mounted_on_uuid = None
+        return f"MECHANICAL TRUTH: {rider.name} dismounted. Movement cost: {move_cost}ft."
+
+    return "SYSTEM ERROR: Invalid action. Use 'mount' or 'dismount'."
 
 
 @tool

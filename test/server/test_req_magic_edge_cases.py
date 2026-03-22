@@ -1,9 +1,10 @@
 import os
 import pytest
-from dnd_rules_engine import Creature, ModifiableValue
-from spatial_engine import spatial_service
+from dnd_rules_engine import Creature, ModifiableValue, ActiveCondition
+from spatial_engine import spatial_service, Wall
 from registry import clear_registry, register_entity
-from tools import modify_health
+from tools import modify_health, use_ability_or_spell, move_entity
+from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
 
 
 @pytest.fixture(autouse=True)
@@ -74,11 +75,84 @@ async def test_req_edg_004_instant_death_disintegrate(setup):
     assert not any(c.name == "Dying" for c in target.active_conditions)
 
 
-@pytest.mark.skip(reason="Pending implementation of Target Invalidation logic in the rules engine")
-def test_req_spl_006_target_invalidation():
+@pytest.mark.asyncio
+async def test_req_spl_006_target_invalidation(setup):
     """
     Trace: REQ-SPL-006
     Validates that if a target becomes invalid (e.g., dies or moves out of range) between
     casting and resolution, the spell fails on that target but the spell slot is still expended.
     """
-    pass
+    vp = setup
+    caster = Creature(
+        name="Wizard",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    target = Creature(
+        name="Dead Goblin",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=0),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        active_conditions=[ActiveCondition(name="Dead")],
+    )
+    register_entity(caster)
+    register_entity(target)
+
+    spell = SpellDefinition(name="Magic Missile", level=1, mechanics=SpellMechanics(damage_dice="3d4", damage_type="force"))
+    await SpellCompendium.save_spell(vp, spell)
+
+    config = {"configurable": {"thread_id": vp}}
+    res = await use_ability_or_spell.ainvoke(
+        {"caster_name": "Wizard", "ability_name": "Magic Missile", "target_names": ["Dead Goblin"]}, config=config
+    )
+
+    assert "is dead and an invalid target" in res
+    assert "REQ-SPL-006" in res
+    assert caster.spell_slots_expended_this_turn == 1
+
+
+@pytest.mark.asyncio
+async def test_req_edg_007_illusion_bypass(setup):
+    """
+    Trace: REQ-EDG-007
+    Validates that physical intersection with an illusion instantly reveals it, bypassing investigation checks.
+    """
+    vp = setup
+    hero = Creature(
+        name="Hero",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=20),
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        x=0.0,
+        y=0.0,
+        size=5.0,
+    )
+    register_entity(hero)
+    spatial_service.sync_entity(hero)
+
+    wall = Wall(
+        label="Fake Wall",
+        start=(5.0, -5.0),
+        end=(5.0, 5.0),
+        is_solid=False,
+        is_visible=True,
+        is_illusion=True,
+        illusion_spell_dc=15,
+    )
+    spatial_service.add_wall(wall, vault_path=vp)
+
+    config = {"configurable": {"thread_id": vp}}
+    res = await move_entity.ainvoke(
+        {"entity_name": "Hero", "target_x": 10.0, "target_y": 0.0, "movement_type": "walk"}, config=config
+    )
+
+    assert "REQ-ILL-001" in res
+    assert "revealed to them as an illusion" in res
+    assert str(hero.entity_uuid) in wall.revealed_for

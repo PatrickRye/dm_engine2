@@ -206,6 +206,7 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
             tags=yaml_data.get("tags", []),
             summoned_by_uuid=summoned_by_uuid,
             summon_spell=summon_spell,
+            mounted_on_uuid=uuid.UUID(yaml_data["mounted_on_uuid"]) if yaml_data.get("mounted_on_uuid") else None,
         )
 
         # Bridge: Initialize and Equip the Object-Oriented Weapon
@@ -381,6 +382,10 @@ async def sync_engine_to_vault(vault_path: str):
             if entity.summoned_by_uuid:
                 yaml_data["summoned_by_uuid"] = str(entity.summoned_by_uuid)
                 yaml_data["summon_spell"] = entity.summon_spell
+            if getattr(entity, "mounted_on_uuid", None):
+                yaml_data["mounted_on_uuid"] = str(entity.mounted_on_uuid)
+            elif "mounted_on_uuid" in yaml_data:
+                yaml_data["mounted_on_uuid"] = None
 
             # Reconstruct the file
             new_yaml_str = await asyncio.to_thread(yaml.dump, yaml_data, sort_keys=False)

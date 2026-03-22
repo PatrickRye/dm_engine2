@@ -187,6 +187,11 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
         if not target:
             continue
 
+        # REQ-SPL-006: Target Invalidation (e.g. Target died between cast and resolution)
+        if any(c.name.lower() == "dead" for c in target.active_conditions) and mechanics.damage_dice:
+            results.append(f"[Engine] {target.name} is dead and an invalid target. The spell fails on them. (REQ-SPL-006)")
+            continue
+
         target_damage = base_damage
         hit_or_save_str = "Auto-hit"
         dc = event.payload.get("save_dc_override") or (caster.spell_save_dc.total if hasattr(caster, "spell_save_dc") else 10)
@@ -285,8 +290,8 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                     "damage": target_damage,
                     "damage_type": damage_type,
                     "critical": is_crit,
-                    "source_name": event.payload.get("ability_name", "Unknown Spell")
-                }
+                    "source_name": event.payload.get("ability_name", "Unknown Spell"),
+                },
             )
             EventBus.dispatch(damage_event)
             results.extend(damage_event.payload.get("results", []))
@@ -326,6 +331,7 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                         start_of_turn_thp=sot_thp,
                         end_of_turn_damage_dice=eot_dmg_dice,
                         end_of_turn_damage_type=eot_dmg_type.lower(),
+                        post_spell_hostility=("realizes_charm" in mechanics.granted_tags),
                     )
                 )
                 results.append(f"[{target.name}] is now {cond_name}!")
@@ -356,14 +362,13 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
             old_hp = target.hp.base_value
             target.hp.base_value = min(target.max_hp, target.hp.base_value + heal_amount)
             actual_heal = target.hp.base_value - old_hp
-            results.append(
-                f"[{target.name}] healed for {actual_heal} HP (now {target.hp.base_value}/{target.max_hp})."
-            )
+            results.append(f"[{target.name}] healed for {actual_heal} HP (now {target.hp.base_value}/{target.max_hp}).")
             print(f"[Engine] {target.name} healed for {actual_heal} HP.")
             # REQ-DTH-006: Healing at 0 HP removes Dying/Stable/Unconscious(0HP) conditions
             if actual_heal > 0:
                 target.active_conditions = [
-                    c for c in target.active_conditions
+                    c
+                    for c in target.active_conditions
                     if c.name not in ["Dying", "Stable"] and not (c.name == "Unconscious" and c.source_name == "0 HP")
                 ]
                 target.death_saves_successes = 0
@@ -669,8 +674,7 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
 
     # REQ-CND-005: Charmed attacker cannot attack their charmer
     charmed_by_target = [
-        c for c in attacker.active_conditions
-        if c.name.lower() == "charmed" and c.source_uuid == target.entity_uuid
+        c for c in attacker.active_conditions if c.name.lower() == "charmed" and c.source_uuid == target.entity_uuid
     ]
     if charmed_by_target:
         print(f"[Engine] {attacker.name} is Charmed by {target.name} and cannot attack them.")
@@ -719,11 +723,15 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         print(f"[Engine] AUTOMATIC CRITICAL HIT — {target.name} is paralyzed/petrified and within 5ft.")
 
     # Attacking reveals the attacker
-    hidden_conds = [c for c in attacker.active_conditions if c.name.lower() == "hidden"]
+    hidden_conds = [
+        c
+        for c in attacker.active_conditions
+        if c.name.lower() in ["hidden", "invisible"] and c.source_name in ["Hide Action", "Manual", "Unknown"]
+    ]
     if hidden_conds:
         for c in hidden_conds:
             attacker.active_conditions.remove(c)
-        print(f"[Engine] {attacker.name} reveals themselves by attacking. 'Hidden' condition removed.")
+        print(f"[Engine] {attacker.name} reveals themselves by attacking. 'Hidden/Invisible' condition removed.")
 
     if is_hit:
         if is_critical_hit:
@@ -910,9 +918,7 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
             EventBus.dispatch(cleave_event)
             attacker_ent.resources["Cleave Used"] = "1/1"
             hit_str = "HIT" if cleave_event.payload.get("hit") else "MISS"
-            results_out.append(
-                f"[Cleave Mastery Triggered] Extra attack vs {cleave_target.name}: {hit_str}."
-            )
+            results_out.append(f"[Cleave Mastery Triggered] Extra attack vs {cleave_target.name}: {hit_str}.")
             return
 
         # REQ-MST-003: Nick — alert that the extra Light weapon attack doesn't cost a Bonus Action
@@ -930,9 +936,7 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         if mastery_type == "push":
             # Size check: target must be ≤ one size larger than attacker
             if target_ent.size > attacker_ent.size + 5.0:
-                results_out.append(
-                    f"[Push Mastery] {target_ent.name} is too large to be pushed by {attacker_ent.name}."
-                )
+                results_out.append(f"[Push Mastery] {target_ent.name} is too large to be pushed by {attacker_ent.name}.")
                 return
             dx = target_ent.x - attacker_ent.x
             dy = target_ent.y - attacker_ent.y
@@ -953,8 +957,7 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         # REQ-MST-006: Slow — apply Slowed condition reducing speed by 10ft
         if mastery_type == "slow":
             already_slowed = any(
-                c.name.lower() == "slowed" and c.source_uuid == attacker_ent.entity_uuid
-                for c in target_ent.active_conditions
+                c.name.lower() == "slowed" and c.source_uuid == attacker_ent.entity_uuid for c in target_ent.active_conditions
             )
             if already_slowed:
                 results_out.append(f"[Slow Mastery] {target_ent.name} is already Slowed by {attacker_ent.name}.")
@@ -995,9 +998,7 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         )
         res = EventBus.dispatch(mastery_event)
         if "results" in res.payload and res.payload["results"]:
-            results_out.append(
-                f"[{wpn.mastery_name} Mastery Triggered] " + " ".join(res.payload["results"])
-            )
+            results_out.append(f"[{wpn.mastery_name} Mastery Triggered] " + " ".join(res.payload["results"]))
 
     # Don't trigger masteries on secondary mastery attacks (e.g., Cleave's extra attack)
     if not event.payload.get("cleave_attack"):
@@ -1096,6 +1097,29 @@ def apply_damage_handler(event: GameEvent):
         if damage > 0 and any(c.name.lower() == "raging" for c in target.active_conditions):
             target.resources["Raged This Cycle"] = "1/1"
 
+        # REQ-ENC-001: Damage Breaks Charm
+        if damage > 0:
+            charmed_conds = [c for c in target.active_conditions if c.name.lower() == "charmed"]
+            for c in charmed_conds:
+                attacker = get_entity(event.source_uuid)
+                charmer = get_entity(c.source_uuid) if c.source_uuid else None
+                if attacker and charmer:
+                    attacker_is_pc = any(t in getattr(attacker, "tags", []) for t in ["pc", "player", "party_npc"])
+                    charmer_is_pc = any(t in getattr(charmer, "tags", []) for t in ["pc", "player", "party_npc"])
+                    if attacker.entity_uuid == charmer.entity_uuid or (attacker_is_pc == charmer_is_pc):
+                        target.active_conditions.remove(c)
+                        results.append(
+                            f"[Engine] SYSTEM ALERT (REQ-ENC-001): {target.name} took damage from {attacker.name} (ally of their charmer). The Charmed condition is broken!"
+                        )
+                        if charmer.concentrating_on == c.source_name:
+                            EventBus.dispatch(
+                                GameEvent(
+                                    event_type="DropConcentration",
+                                    source_uuid=charmer.entity_uuid,
+                                    vault_path=event.vault_path,
+                                )
+                            )
+
         current_hp = target.hp.base_value
         target.hp.base_value -= damage
 
@@ -1139,8 +1163,8 @@ def melee_attack_damage_dispatcher(event: GameEvent):
         payload={
             "damage": event.payload.get("damage", 0),
             "damage_type": event.payload.get("damage_type", "unknown"),
-            "critical": event.payload.get("critical", False)
-        }
+            "critical": event.payload.get("critical", False),
+        },
     )
     EventBus.dispatch(damage_event)
     event.payload.setdefault("results", []).extend(damage_event.payload.get("results", []))
@@ -1380,7 +1404,11 @@ def handle_drop_concentration_event(event: GameEvent):
             ]
             for cond in expired_conditions:
                 entity.active_conditions.remove(cond)
-                print(f"[Engine] {entity.name} is no longer {cond.name} from {spell_name}.")
+                msg = f"[Engine] {entity.name} is no longer {cond.name} from {spell_name}."
+                if cond.post_spell_hostility:
+                    msg += f"\n[Engine] SYSTEM ALERT (REQ-ENC-003): {entity.name} realizes they were charmed by {caster.name}! Their attitude immediately drops to Hostile."
+                print(msg)
+                event.payload.setdefault("results", []).append(msg)
 
     # Remove terrain tied to this caster's concentration spell
     expired_terrains = [
@@ -1465,7 +1493,10 @@ def validate_movement_handler(event: GameEvent):
         target_x = event.payload.get("target_x", start_x)
         target_y = event.payload.get("target_y", start_y)
         for cross_ent, cross_len in spatial_service.get_entities_on_path(
-            start_x, start_y, target_x, target_y,
+            start_x,
+            start_y,
+            target_x,
+            target_y,
             event.vault_path,
             exclude_uuid=event.source_uuid,
         ):
@@ -1477,8 +1508,7 @@ def validate_movement_handler(event: GameEvent):
                 continue
             # Skip entities whose bbox already contains the mover's start position (stacked)
             half = getattr(cross_ent, "size", 5.0) / 2
-            if (cross_ent.x - half <= start_x <= cross_ent.x + half and
-                    cross_ent.y - half <= start_y <= cross_ent.y + half):
+            if cross_ent.x - half <= start_x <= cross_ent.x + half and cross_ent.y - half <= start_y <= cross_ent.y + half:
                 continue
             entity_cross_dist += cross_len
     diff_dist += entity_cross_dist
@@ -1829,10 +1859,12 @@ def counterspell_reaction_handler(event: GameEvent):  # noqa: C901
         if total_save < dc:
             event.status = EventStatus.CANCELLED
             msg = f"[Engine] {caster.name} failed CON save ({total_save} vs DC {dc}). The spell fails, but the spell slot is preserved."
-            
+
             # In 5e, beginning to cast a new concentration spell instantly breaks the old one, even if countered.
             if event.payload.get("mechanics", {}).get("requires_concentration", False) and caster.concentrating_on:
-                EventBus.dispatch(GameEvent(event_type="DropConcentration", source_uuid=caster.entity_uuid, vault_path=event.vault_path))
+                EventBus.dispatch(
+                    GameEvent(event_type="DropConcentration", source_uuid=caster.entity_uuid, vault_path=event.vault_path)
+                )
 
             print(msg)
             if "results" not in event.payload:
@@ -1990,9 +2022,12 @@ def _evaluate_repeating_saves(entity: Creature, timing: str) -> list:
 
             if total_save >= cond.save_dc:
                 conditions_to_remove.append(cond)
-                results.append(
-                    f"[Engine] {entity.name} succeeded on their {timing}-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) and is no longer {cond.name}."
-                )
+                msg = f"[Engine] {entity.name} succeeded on their {timing}-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) and is no longer {cond.name}."
+                if cond.post_spell_hostility:
+                    charmer = get_entity(cond.source_uuid) if cond.source_uuid else None
+                    charmer_name = charmer.name if charmer else "the caster"
+                    msg += f"\n[Engine] SYSTEM ALERT (REQ-ENC-003): {entity.name} realizes they were charmed by {charmer_name}! Their attitude immediately drops to Hostile."
+                results.append(msg)
             else:
                 results.append(
                     f"[Engine] {entity.name} failed their {timing}-of-turn {cond.save_required} save ({total_save} vs DC {cond.save_dc}) against {cond.name}."
@@ -2029,8 +2064,8 @@ def end_of_turn_save_handler(event: GameEvent):
                         "damage": dmg,
                         "damage_type": cond.end_of_turn_damage_type.lower(),
                         "critical": False,
-                        "source_name": cond.name
-                    }
+                        "source_name": cond.name,
+                    },
                 )
                 EventBus.dispatch(damage_event)
                 results.extend(damage_event.payload.get("results", []))
@@ -2090,16 +2125,13 @@ def start_of_turn_handler(event: GameEvent):
         if not isinstance(other, Creature):
             continue
         other.active_conditions = [
-            c for c in other.active_conditions
-            if not (c.name.lower() == "slowed" and c.source_uuid == entity.entity_uuid)
+            c for c in other.active_conditions if not (c.name.lower() == "slowed" and c.source_uuid == entity.entity_uuid)
         ]
     # (b) Apply any Slowed conditions still on THIS entity to its just-reset movement_remaining
     for cond in entity.active_conditions:
         if cond.name.lower() == "slowed" and cond.speed_reduction > 0:
             entity.movement_remaining = max(0, entity.movement_remaining - cond.speed_reduction)
-            results.append(
-                f"[Engine] {entity.name} is Slowed — speed reduced by {cond.speed_reduction}ft this turn."
-            )
+            results.append(f"[Engine] {entity.name} is Slowed — speed reduced by {cond.speed_reduction}ft this turn.")
 
     # REQ-CLS-003: Reset Sneak Attack once-per-turn resource
     if "Sneak Attack" in entity.resources:
@@ -2136,13 +2168,17 @@ def start_of_turn_handler(event: GameEvent):
             if hb_current > 0:
                 # Still holding breath — decrement
                 entity.resources["Breath Hold"] = f"{hb_current - 1}/{hb_max}"
-                results.append(f"[Engine] {entity.name} is holding breath. Breath Hold: {hb_current - 1}/{hb_max} rounds remaining.")
+                results.append(
+                    f"[Engine] {entity.name} is holding breath. Breath Hold: {hb_current - 1}/{hb_max} rounds remaining."
+                )
             else:
                 # Breath exhausted — transition to choking or continue choking
                 max_choke = max(1, 1 + con_mod)
                 if "Choking Rounds" not in entity.resources:
                     entity.resources["Choking Rounds"] = f"{max_choke}/{max_choke}"
-                    results.append(f"[Engine] {entity.name} has run out of breath! Choking for {max_choke} rounds. (REQ-ENV-007)")
+                    results.append(
+                        f"[Engine] {entity.name} has run out of breath! Choking for {max_choke} rounds. (REQ-ENV-007)"
+                    )
                 else:
                     choke_match = re.match(r"(\d+)/(\d+)", str(entity.resources["Choking Rounds"]))
                     if choke_match:
@@ -2150,7 +2186,9 @@ def start_of_turn_handler(event: GameEvent):
                         choke_max = int(choke_match.group(2))
                         if choke_current > 0:
                             entity.resources["Choking Rounds"] = f"{choke_current - 1}/{choke_max}"
-                            results.append(f"[Engine] {entity.name} is choking! {choke_current - 1} rounds until death. (REQ-ENV-008)")
+                            results.append(
+                                f"[Engine] {entity.name} is choking! {choke_current - 1} rounds until death. (REQ-ENV-008)"
+                            )
                         else:
                             # Choking rounds exhausted — entity drops to 0 HP and starts dying
                             entity.hp.base_value = 0

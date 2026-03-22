@@ -38,6 +38,7 @@ from langgraph.checkpoint.memory import MemorySaver
 try:
     import sqlite3 as _sqlite3
     from langgraph.checkpoint.sqlite import SqliteSaver as _SqliteSaver
+
     _SQLITE_AVAILABLE = True
 except ImportError:
     _SQLITE_AVAILABLE = False
@@ -91,6 +92,7 @@ from tools import (
     manage_map_trap,
     manage_skill_challenge,
     generate_random_loot,
+    manage_mount,
     ingest_battlemap_json,
     evaluate_extreme_weather,
     manage_map_terrain,
@@ -148,6 +150,7 @@ MASTER_TOOLS_LIST = [
     manage_map_trap,
     manage_skill_challenge,
     generate_random_loot,
+    manage_mount,
     use_font_of_magic,
     ingest_battlemap_json,
     evaluate_extreme_weather,
@@ -236,8 +239,10 @@ async def lifespan(app: FastAPI):
             print(f"Using SqliteSaver checkpoint store at {db_path}")
         else:
             checkpointer = MemorySaver()
-            print("WARNING: langgraph-checkpoint-sqlite not installed; using in-memory MemorySaver. "
-                  "Install with: pip install langgraph-checkpoint-sqlite")
+            print(
+                "WARNING: langgraph-checkpoint-sqlite not installed; using in-memory MemorySaver. "
+                "Install with: pip install langgraph-checkpoint-sqlite"
+            )
 
         # Build and compile the multi-agent graph ONCE when the server boots
         dm_engine_app = build_graph(draft_llm, qa_llm, MASTER_TOOLS_LIST, checkpointer=checkpointer)
@@ -1055,7 +1060,9 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
         if request.character in CHARACTER_LOCKS and CHARACTER_LOCKS[request.character] != request.client_id:
             raise HTTPException(
                 status_code=403,
-                detail=(f"Agency Error: '{request.character}' is currently " "being controlled by another player's connection."),
+                detail=(
+                    f"Agency Error: '{request.character}' is currently " "being controlled by another player's connection."
+                ),
             )
         CHARACTER_LOCKS[request.character] = request.client_id
 

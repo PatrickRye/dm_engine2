@@ -236,6 +236,7 @@ class ActiveCondition(BaseModel):
     end_of_turn_damage_dice: str = ""
     end_of_turn_damage_type: str = ""
     speed_reduction: int = 0  # REQ-MST-006: Slow mastery reduces target speed by this amount
+    post_spell_hostility: bool = False
 
 
 class Creature(BaseGameEntity):
@@ -276,24 +277,28 @@ class Creature(BaseGameEntity):
     spell_slots_expended_this_turn: int = 0
     summoned_by_uuid: Optional[uuid.UUID] = None
     summon_spell: str = ""
+    mounted_on_uuid: Optional[uuid.UUID] = None
     _load_snapshot: int = PrivateAttr(default=0)
 
     def _compute_snapshot(self) -> int:
-        return hash((
-            self.hp.base_value,
-            self.temp_hp,
-            self.x,
-            self.y,
-            self.z,
-            self.concentrating_on,
-            self.reaction_used,
-            self.movement_remaining,
-            self.death_saves_successes,
-            self.death_saves_failures,
-            self.exhaustion_level,
-            tuple(sorted(c.name for c in self.active_conditions)),
-            tuple(sorted(self.resources.items())),
-        ))
+        return hash(
+            (
+                self.hp.base_value,
+                self.temp_hp,
+                self.x,
+                self.y,
+                self.z,
+                self.concentrating_on,
+                self.reaction_used,
+                self.movement_remaining,
+                self.death_saves_successes,
+                self.death_saves_failures,
+                self.exhaustion_level,
+                self.mounted_on_uuid,
+                tuple(sorted(c.name for c in self.active_conditions)),
+                tuple(sorted(self.resources.items())),
+            )
+        )
 
     def store_snapshot(self):
         """Record current state as the clean baseline. Call after loading from disk."""
