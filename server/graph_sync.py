@@ -110,6 +110,14 @@ def sync_registry_to_graph(vault_path: str, kg: Any) -> str:
                     )
                     edges_added += 1
 
+    # Gap 2 fix: Invalidate GraphRAG cache since KG was modified
+    if nodes_added > 0 or edges_added > 0:
+        try:
+            from graph import _invalidate_grag_cache
+            _invalidate_grag_cache(vault_path)
+        except Exception:
+            pass  # Best-effort: cache invalidation failure shouldn't break sync
+
     return f"MECHANICAL TRUTH: Synced registry to Knowledge Graph. Added {nodes_added} nodes, {edges_added} edges."
 
 

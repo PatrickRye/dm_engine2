@@ -31,6 +31,8 @@ class DMState(TypedDict):
     kg_snapshot: Optional[Dict[str, Any]] = Field(default_factory=None)
     # Errors encountered during mutation execution (surfaced to QA)
     mutation_errors: List[str] = Field(default_factory=list)
+    # Ingestion pipeline payload (cleared after ingestion_node processes it)
+    pending_ingest: Dict[str, Any] = Field(default_factory=dict)
 
 
 class QAResult(BaseModel):

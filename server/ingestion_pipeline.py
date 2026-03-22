@@ -478,6 +478,14 @@ async def run_ingestion_pipeline(
                             pass
                     effects_annotated += 1
 
+    # Gap 2 fix: Invalidate GraphRAG cache since KG was modified
+    if nodes_added > 0 or edges_added > 0:
+        try:
+            from graph import _invalidate_grag_cache
+            _invalidate_grag_cache(vault_path)
+        except Exception:
+            pass  # Best-effort
+
     return {
         "nodes_added": nodes_added,
         "edges_added": edges_added,

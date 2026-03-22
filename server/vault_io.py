@@ -814,6 +814,14 @@ async def sync_knowledge_graph_from_vault(vault_path: str, kg: Any) -> str:
             kg.add_edge(edge)
 
     kg._rebuild_adjacency()
+
+    # Gap 2 fix: Invalidate GraphRAG cache since KG was rebuilt from vault
+    try:
+        from graph import _invalidate_grag_cache
+        _invalidate_grag_cache(vault_path)
+    except Exception:
+        pass  # Best-effort
+
     return f"Loaded Knowledge Graph: {len(nodes_data)} nodes, {len(edges_data)} edges from vault."
 
 

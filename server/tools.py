@@ -5519,3 +5519,81 @@ async def sync_knowledge_graph(
         return result
 
     return "SYSTEM ERROR: direction must be 'to_vault' or 'from_vault'."
+
+
+@tool
+async def run_ingestion_pipeline_tool(
+    npc_lore_text: str = "",
+    campaign_narrative_text: str = "",
+    storylet_resolutions_json: str = "{}",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Phase 2 NLP Ingestion Pipeline: parse raw DM content into structured engine artifacts.
+
+    This tool requires an active LLM session and may take several seconds to complete.
+    Results are written directly to the Knowledge Graph and Storylet Registry.
+
+    Args:
+        npc_lore_text: Raw NPC biography or lore text to parse into KG entities.
+        campaign_narrative_text: Campaign narrative text to parse into Storylets.
+        storylet_resolutions_json: JSON string of {{"storylet_name": "resolution_text"}} pairs
+            for effect annotation (Task 3.3).
+    """
+    import asyncio
+    import json as _json
+
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    # Get LLM from config context (set by the graph builder)
+    llm = config["configurable"].get("_llm")
+    if llm is None:
+        return (
+            "SYSTEM ERROR: No LLM available in session context. "
+            "The ingestion pipeline requires an active LLM session. "
+            "Ensure the session was initialized with an LLM instance."
+        )
+
+    try:
+        storylet_resolutions = _json.loads(storylet_resolutions_json) if storylet_resolutions_json else {}
+    except Exception:
+        storylet_resolutions = {}
+
+    try:
+        from ingestion_pipeline import run_ingestion_pipeline
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If already in async context, create a task
+            async def _run():
+                return await run_ingestion_pipeline(
+                    vault_path=vault_path,
+                    npc_lore_text=npc_lore_text or None,
+                    campaign_narrative_text=campaign_narrative_text or None,
+                    storylet_resolutions=storylet_resolutions or None,
+                    llm=llm,
+                )
+            task = loop.create_task(_run())
+            # Wait for it in a blocking way (this tool is called from sync context)
+            result = loop.run_until_complete(task)
+        else:
+            result = loop.run_until_complete(run_ingestion_pipeline(
+                vault_path=vault_path,
+                npc_lore_text=npc_lore_text or None,
+                campaign_narrative_text=campaign_narrative_text or None,
+                storylet_resolutions=storylet_resolutions or None,
+                llm=llm,
+            ))
+    except Exception as e:
+        return f"SYSTEM ERROR: Ingestion pipeline failed: {e}"
+
+    return (
+        f"MECHANICAL TRUTH: Ingestion pipeline complete.\n"
+        f"  KG nodes added: {result['nodes_added']}\n"
+        f"  KG edges added: {result['edges_added']}\n"
+        f"  Storylets created: {result['storylets_created']}\n"
+        f"  Effects annotated: {result['effects_annotated']}"
+    )
+

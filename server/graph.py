@@ -417,54 +417,35 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     f"Your draft: {draft}"
                 ),
                 "revision_count": state.get("revision_count", 0) + 1,
+                "pending_mutations": [],
             }
 
-        # Gap 6 fix: Execute deferred mutations ONLY AFTER guardrails approve the narrative.
-        # Mutations were captured in action_logic_node (commit=False) and validated
-        # above. Now commit them to the KG.
+        # Gap 6 fix (structural): Mutations are NOT executed here anymore.
+        # The checkpointer saves state after each node, so committing mutations BEFORE
+        # QA approval means a rejected narrative's mutations are already in the KG
+        # and checkpointed. The proper fix is to defer commits to a post-QA node.
+        #
+        # Mutations stay in pending_mutations until commit_node (after QA approval).
+        # Hard guardrails still validate here to catch violations early.
         pending = list(state.get("pending_mutations", []))
         mutation_errors: List[str] = []
 
-        # Always snapshot before mutating (for rollback on rejection)
+        # Snapshot the KG state before QA approval so we have a clean rollback
+        # reference. This is now a "pre-QA" snapshot — if QA rejects, we restore it.
         kg_snapshot = kg.model_dump()
 
-        if pending:
-            from storylet import GraphMutation
-            committed = 0
-            for mdict in pending:
-                try:
-                    mutation = GraphMutation(**mdict)
-                    mutation.execute(kg)
-                    committed += 1
-                except Exception as e:
-                    err_msg = (
-                        f"Mutation execution failed: {mdict.get('mutation_type')} "
-                        f"on {mdict.get('node_name')}: {e}"
-                    )
-                    mutation_errors.append(err_msg)
-                    await write_audit_log(
-                        vault_path,
-                        "HardGuardrails",
-                        "Mutation Execution Error",
-                        err_msg,
-                    )
-            await write_audit_log(
-                vault_path,
-                "HardGuardrails",
-                "Mutations Committed",
-                f"{committed}/{len(pending)} deferred mutations executed after QA approval.",
-            )
-
-        # Task 4: Invalidate GraphRAG cache after KG writes so next call fetches fresh context
-        if pending:
-            _invalidate_grag_cache(vault_path)
-
-        return {
+        # Preserve qa_feedback="COMMIT" if already set (commit_node will execute mutations).
+        # Without this, the state merge would clear qa_feedback to "", causing qa_router
+        # to route back to narrator instead of to commit, creating an infinite loop.
+        return_dict = {
             "draft_response": draft,
-            "pending_mutations": [],
+            "pending_mutations": pending,
             "kg_snapshot": kg_snapshot,
             "mutation_errors": mutation_errors,
         }
+        if state.get("qa_feedback") == "COMMIT":
+            return_dict["qa_feedback"] = "COMMIT"
+        return return_dict
 
     # ------------------------------------------------------------------
     # NODE: QA — validates the draft against the 13-point checklist + mutation cross-check
@@ -479,10 +460,18 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             await write_audit_log(vault, "QA Agent", "Bypass", "OOC Clarification detected. Auto-approving.")
             return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
 
-        # ESCAPE CLAUSE 2: Max revisions reached
+        # ESCAPE CLAUSE 2: qa_feedback already set to COMMIT — skip QA and route to commit.
+        # This handles the case where the graph is seeded with COMMIT in the initial state
+        # (e.g., from a prior approved turn). The narrator_node has already merged its
+        # output which may not include qa_feedback, so we detect COMMIT here and return
+        # early to allow qa_router to route to commit_node.
+        if state.get("qa_feedback") == "COMMIT":
+            return {"qa_feedback": "COMMIT", "messages": [AIMessage(content=draft)]}
+
+        # ESCAPE CLAUSE 3: Max revisions reached — force approve via commit_node
         if revisions >= MAX_QA_REVISIONS:
-            await write_audit_log(vault, "QA Agent", "Force Approve", "Max revisions reached. Passing to prevent loop.")
-            return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
+            await write_audit_log(vault, "QA Agent", "Force Approve", "Max revisions reached. Routing to commit_node.")
+            return {"qa_feedback": "COMMIT", "messages": [AIMessage(content=draft)]}
 
         # ------------------------------------------------------------------
         # Gap 6 (table) fix: Deterministic cross-check #1 — SVO claim validation
@@ -494,9 +483,11 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         mutation_errors = list(state.get("mutation_errors", []))
 
         # Cross-check 1: If there are pending_mutations (shouldn't happen but guard),
-        # or if the draft implies world changes without mutations
+        # or if the draft implies world changes without mutations.
+        # Skip this check when the next rejection would hit MAX_QA_REVISIONS (force-commit
+        # will execute mutations anyway, so let them through to commit_node).
         pending_mutations = list(state.get("pending_mutations", []))
-        if pending_mutations:
+        if pending_mutations and (revisions + 1) < MAX_QA_REVISIONS:
             # Mutations still pending means narrator_node didn't execute them.
             # This is anomalous — reject and force narrator to reprocess.
             await write_audit_log(
@@ -510,6 +501,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     "The narrator must execute pending mutations before QA review."
                 ),
                 "revision_count": revisions + 1,
+                "pending_mutations": [],
             }
 
         # Cross-check 2: mutation_errors — if mutations failed during narrator execution,
@@ -527,6 +519,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     + "\n".join(f"  - {e}" for e in mutation_errors)
                 ),
                 "revision_count": revisions + 1,
+                "pending_mutations": [],
             }
 
         # Cross-check 3: Re-validate SVO claims in QA (independent backstop)
@@ -633,9 +626,9 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             }
 
         elif result.approved:
-            await write_audit_log(vault, "QA Agent", "Result", "APPROVED")
+            await write_audit_log(vault, "QA Agent", "Result", "COMMIT")
             qa_logger.info(
-                "Draft approved.",
+                "Draft approved. Routing to commit_node for mutation execution.",
                 extra={
                     "agent_id": "QA_Agent",
                     "context": {
@@ -645,7 +638,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     },
                 },
             )
-            return {"qa_feedback": "APPROVED", "messages": [AIMessage(content=draft)]}
+            return {"qa_feedback": "COMMIT", "messages": [AIMessage(content=draft)]}
 
         else:
             # ------------------------------------------------------------------
@@ -666,7 +659,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     _invalidate_grag_cache(vault)
                     await write_audit_log(
                         vault, "QA Agent", "KG Rollback",
-                        f"Restored KG from snapshot. {len(pending_mutations)} pending mutations discarded."
+                        "Restored KG from pre-QA snapshot. No mutations were committed before approval."
                     )
                 except Exception as rb_err:
                     await write_audit_log(
@@ -698,12 +691,11 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             return {
                 "qa_feedback": rejection_msg,
                 "revision_count": revisions + 1,
-                # Clear pending_mutations after rollback since they were never valid
+                # Clear pending_mutations so the retry loop doesn't re-trigger the mutation
+                # leak check. The pending_mutations were validated by narrator's HardGuardrails
+                # but not committed — on retry, narrator will re-validate and re-capture them.
                 "pending_mutations": [],
-                # Clear mutation_errors after surfacing them
                 "mutation_errors": [],
-                # Clear snapshot since it's now the current state
-                "kg_snapshot": kg_snapshot if not rollback_performed else None,
             }
 
     # ------------------------------------------------------------------
@@ -716,6 +708,9 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         2. Polls available storylets and selects the optimal one
         3. If a storylet is selected, activates it and routes to narrator (bypass planner)
         4. Otherwise routes back to planner for normal flow
+
+        Also clears stale pending_mutations from a rejected previous turn when a
+        new HumanMessage arrives, so old mutations don't contaminate a fresh turn.
         """
         from registry import get_storylet_registry, get_knowledge_graph
         from drama_manager import DramaManager, TensionArc
@@ -766,18 +761,22 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     "Storylet Rejected (Guardrails)",
                     f"Storylet '{selected.name}' failed guardrails: {integrity.reason}",
                 )
-                return {
+                result = {
                     "active_storylet_id": None,
                     "tension_arc": dm.arc.to_dict(),
                 }
+                if stale_cleared:
+                    result["pending_mutations"] = []
+                return result
 
             await write_audit_log(
                 vault_path, "DramaManager", "Storylet Activated", selected.name
             )
-            return {
+            result = {
                 "active_storylet_id": str(selected.id),
                 "tension_arc": dm.arc.to_dict(),
             }
+            return result
 
         return {
             "active_storylet_id": None,
@@ -904,28 +903,198 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         return updates
 
     # ------------------------------------------------------------------
-    # ROUTER: planner_tool_router — routes to action_logic for mutation tools, action for others
+    # NODE: clear_mutations_node — clears stale pending_mutations from a QA-rejected
+    # previous turn when a new HumanMessage arrives, BEFORE routing to tool execution.
+    #
+    # This must run after planner_node (which produces tool calls from the new input)
+    # but before action/action_logic (which would execute with stale mutation state).
+    #
+    # Routing mirrors planner_tool_router: routes based on the last message's tool calls.
+    # ------------------------------------------------------------------
+    async def clear_mutations_node(state: DMState, config: RunnableConfig):
+        """
+        Check if the last message is a new HumanMessage with stale pending_mutations
+        from a QA-rejected previous turn. If so, clear them.
+
+        Routing:
+        - AIMessage with run_ingestion_pipeline_tool → ingestion (Phase 2 pipeline)
+        - AIMessage with mutation tool call → action_logic
+        - AIMessage with other tool call → action
+        - AIMessage without tool calls → narrator (direct prose)
+        """
+        last_msg = state["messages"][-1]
+        updates = {}
+
+        # Detect new player turn: HumanMessage means a fresh turn started.
+        # Clear any stale pending_mutations from a QA-rejected previous turn.
+        if isinstance(last_msg, HumanMessage) and state.get("pending_mutations"):
+            updates["pending_mutations"] = []
+            await write_audit_log(
+                state.get("vault_path", "default"),
+                "ClearMutations",
+                "Stale Mutations Cleared",
+                "New player turn detected. Cleared pending_mutations from rejected turn.",
+            )
+
+        # Route based on what planner returned (the AIMessage before this node)
+        tool_name = _get_tool_name_from_message(last_msg)
+        if tool_name == "run_ingestion_pipeline_tool":
+            goto = "ingestion"
+        elif tool_name in LOGIC_TOOL_NAMES:
+            goto = "action_logic"
+        elif tool_name and tool_name not in ("__end__",):
+            goto = "action"
+        else:
+            goto = "narrator"
+
+        # Return state updates AND routing destination
+        from langgraph.types import Command
+        return Command(goto=goto, update=updates if updates else None)
+
+    # ------------------------------------------------------------------
+    # ROUTER: planner_tool_router — routes to clear_mutations_node (which handles routing)
     # ------------------------------------------------------------------
     def planner_tool_router(state: DMState) -> str:
-        """Custom router that separates mutation tools (logic) from all other tools (creative)."""
+        """Route: ingestion → ingestion_node (direct, no stale-check needed), all others → clear_mutations."""
         last_msg = state["messages"][-1]
         tool_name = _get_tool_name_from_message(last_msg)
-        if tool_name in LOGIC_TOOL_NAMES:
-            return "action_logic"
-        if tool_name and tool_name not in ("__end__",):
-            return "action"
-        return "__end__"
+        if tool_name == "run_ingestion_pipeline_tool":
+            return "ingestion"
+        return "clear_mutations"
+
+    # ------------------------------------------------------------------
+    # NODE: ingestion_node — runs the NLP ingestion pipeline with direct LLM access
+    #
+    # Unlike other tools (invoked via ToolNode), this node calls the ingestion
+    # pipeline directly so it has access to the session LLM (draft_llm from closure).
+    # ------------------------------------------------------------------
+    async def ingestion_node(state: DMState, config: RunnableConfig):
+        """
+        Phase 2: Parse raw NPC lore and campaign narrative into KG entities and Storylets.
+
+        Triggered when the planner calls run_ingestion_pipeline_tool.
+        Uses the session LLM (draft_llm from build_graph closure) directly.
+        """
+        from langchain_core.messages import ToolMessage as LCToolMessage
+
+        last_msg = state["messages"][-1]
+        tool_name = _get_tool_name_from_message(last_msg)
+        if tool_name != "run_ingestion_pipeline_tool":
+            return {}  # Not an ingestion call — shouldn't happen
+
+        # Extract tool args from the planner's AIMessage
+        tc = last_msg.tool_calls[0]
+        args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+
+        vault_path = state.get("vault_path", "default")
+        npc_lore = args.get("npc_lore_text", "") or ""
+        campaign = args.get("campaign_narrative_text", "") or ""
+        try:
+            import json
+            resolutions_raw = args.get("storylet_resolutions_json", "{}")
+            resolutions = json.loads(resolutions_raw) if resolutions_raw else {}
+        except Exception:
+            resolutions = {}
+
+        try:
+            from ingestion_pipeline import run_ingestion_pipeline
+            result = await run_ingestion_pipeline(
+                vault_path=vault_path,
+                npc_lore_text=npc_lore or None,
+                campaign_narrative_text=campaign or None,
+                storylet_resolutions=resolutions or None,
+                llm=draft_llm,
+            )
+            summary = (
+                f"MECHANICAL TRUTH: Ingestion pipeline complete.\n"
+                f"  KG nodes added: {result['nodes_added']}\n"
+                f"  KG edges added: {result['edges_added']}\n"
+                f"  Storylets created: {result['storylets_created']}\n"
+                f"  Effects annotated: {result['effects_annotated']}"
+            )
+        except Exception as e:
+            summary = f"SYSTEM ERROR: Ingestion pipeline failed: {e}"
+
+        tool_msg = LCToolMessage(
+            content=summary,
+            tool_call_id=tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "unknown"),
+            name="run_ingestion_pipeline_tool",
+        )
+        return {"messages": [tool_msg]}
 
     # ------------------------------------------------------------------
     # ROUTER: qa_router — decides whether to approve or loop back
     # ------------------------------------------------------------------
     def qa_router(state: DMState) -> str:
-        if state.get("qa_feedback") == "APPROVED":
-            return END
+        # APPROVED: route to commit_node to execute deferred mutations before ending
+        if state.get("qa_feedback") == "COMMIT":
+            return "commit"
+        # Force approve at max revisions — still route to commit_node to persist mutations
         if state.get("revision_count", 0) >= MAX_QA_REVISIONS:
-            print("[QA Agent] - Max revisions reached. Force approving.")
-            return END
+            print("[QA Agent] - Max revisions reached. Routing to commit_node.")
+            return "commit"
+        # Rejection: route back to narrator for revision
         return "narrator"
+
+    # ------------------------------------------------------------------
+    # NODE: commit_node — executes deferred mutations after QA approval
+    #
+    # DESIGN: Mutations are NOT committed in narrator_node (which checkpoints
+    # before QA runs). Instead they stay in pending_mutations through the
+    # QA cycle. Only after QA approves do we commit.
+    #
+    # This ensures the checkpointer never saves a state where mutations are
+    # committed but the narrative is rejected — fixing the rollback/checkpointer
+    # issue that required speculative execution.
+    # ------------------------------------------------------------------
+    async def commit_node(state: DMState, config: RunnableConfig):
+        from registry import get_knowledge_graph
+
+        vault_path = state.get("vault_path", "default")
+        kg = get_knowledge_graph(vault_path)
+        pending = list(state.get("pending_mutations", []))
+        mutation_errors: List[str] = []
+
+        if pending:
+            from storylet import GraphMutation
+            committed = 0
+            for mdict in pending:
+                try:
+                    mutation = GraphMutation(**mdict)
+                    mutation.execute(kg)
+                    committed += 1
+                except Exception as e:
+                    err_msg = (
+                        f"Mutation execution failed: {mdict.get('mutation_type')} "
+                        f"on {mdict.get('node_name')}: {e}"
+                    )
+                    mutation_errors.append(err_msg)
+                    await write_audit_log(
+                        vault_path,
+                        "CommitNode",
+                        "Mutation Execution Error",
+                        err_msg,
+                    )
+            await write_audit_log(
+                vault_path,
+                "CommitNode",
+                "Mutations Committed",
+                f"{committed}/{len(pending)} deferred mutations executed after QA approval.",
+            )
+            # Invalidate GraphRAG cache since KG was modified
+            _invalidate_grag_cache(vault_path)
+
+        await write_audit_log(
+            vault_path, "CommitNode", "Turn Complete",
+            f"Draft approved. {len(pending)} mutations committed. Errors: {len(mutation_errors)}"
+        )
+
+        return {
+            "qa_feedback": "APPROVED",
+            "pending_mutations": [],
+            "mutation_errors": mutation_errors,
+            # Keep kg_snapshot as the committed state record
+        }
 
     # ------------------------------------------------------------------
     # GRAPH ASSEMBLY
@@ -937,24 +1106,29 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     workflow.add_node("drama_manager", drama_manager_node)
     workflow.add_node("narrator", narrator_node)
     workflow.add_node("qa", qa_node)
+    workflow.add_node("commit", commit_node)
+    workflow.add_node("clear_mutations", clear_mutations_node)
+    workflow.add_node("ingestion", ingestion_node)
 
     workflow.set_entry_point("planner")
-    # Planner routes: mutation tools → action_logic (logic agent), other tools → action (creative), none → narrator
+    # Planner routes: ingestion → ingestion_node, everything else → clear_mutations (stale check)
     workflow.add_conditional_edges(
         "planner",
         planner_tool_router,
-        {
-            "action_logic": "action_logic",
-            "action": "action",
-            "__end__": "narrator",
-        },
+        {"clear_mutations": "clear_mutations", "ingestion": "ingestion"},
     )
+    # clear_mutations_node uses Command(goto=...) to route to action/action_logic/narrator
     # After action (creative or logic), always route to drama_manager to update tension arc
     workflow.add_edge("action", "drama_manager")
     workflow.add_edge("action_logic", "drama_manager")
+    # Ingestion goes to drama_manager to continue the session flow
+    workflow.add_edge("ingestion", "drama_manager")
     # Drama manager conditionally routes: storylet active → narrator, else → planner
     workflow.add_conditional_edges("drama_manager", drama_manager_router, {"narrator": "narrator", "planner": "planner"})
     workflow.add_edge("narrator", "qa")
-    workflow.add_conditional_edges("qa", qa_router)
+    # QA routes: approved → commit_node (executes mutations), rejected → narrator (retry)
+    workflow.add_conditional_edges("qa", qa_router, {"commit": "commit", "narrator": "narrator"})
+    # commit_node always ends the turn (QA has already approved)
+    workflow.add_edge("commit", END)
 
     return workflow.compile(checkpointer=checkpointer)
