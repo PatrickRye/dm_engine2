@@ -533,6 +533,12 @@ class HardGuardrails:
                 all_reasons.append(cons_result.reason)
                 all_revisions.extend(cons_result.required_revisions)
 
+        # 4. NPC disposition and faction standing consistency
+        disp_result = self.validate_disposition_consistency(narrative_text, ctx)
+        if not disp_result.allowed:
+            all_reasons.append(disp_result.reason)
+            all_revisions.extend(disp_result.required_revisions)
+
         if all_reasons:
             return GuardrailResult(
                 allowed=False,
@@ -540,6 +546,112 @@ class HardGuardrails:
                 required_revisions=all_revisions,
             )
 
+        return GuardrailResult(allowed=True)
+
+    # ------------------------------------------------------------------
+    # Disposition / Faction Reputation consistency checks
+    # ------------------------------------------------------------------
+    # Descriptors that imply hostile disposition (NPC with disp > 30 shouldn't have these)
+    _HOSTILE_DESCRIPTORS = {
+        "snarls", "attacks", "draws weapon", "reaches for weapon",
+        "refuses to speak", "spits at", "glares with hatred", "denounces",
+        "curses", "draws a blade", "moves to strike", "raises arms to strike",
+        "refuses your request", "turns you away", "denies you entry",
+    }
+    # Descriptors that imply friendly disposition (NPC with disp < 70 shouldn't have these)
+    _FRIENDLY_DESCRIPTORS = {
+        "smiles warmly", "greets you", "eagerly helps", "gladly offers",
+        "waves you in", "embraces", "offers a drink", "extends hand",
+        "welcomes you", "invites you", "thanks you profusely",
+    }
+
+    def validate_disposition_consistency(
+        self, narrative_text: str, ctx: Dict[str, Any]
+    ) -> GuardrailResult:
+        """
+        Check that narrative tone is consistent with NPC disposition and faction standing.
+
+        An NPC with disposition_toward_party < 30 should not be described warmly.
+        An NPC with disposition_toward_party > 70 should not be described hostilely.
+        A faction with faction_standing["party"] < 30 should not be described as friendly.
+        """
+        if not narrative_text:
+            return GuardrailResult(allowed=True)
+
+        text_lower = narrative_text.lower()
+        violations: List[str] = []
+
+        # Check each NPC mentioned in prose
+        wikilinks = re.findall(r"\[\[([^\]]+)\]\]", narrative_text)
+        for link in wikilinks:
+            name = link.strip()
+            node = self.kg.get_node_by_name(name)
+            if not node:
+                continue
+
+            # NPC disposition check
+            if node.node_type.value == "npc":
+                disp = node.attributes.get("disposition_toward_party", 50)
+                if disp < 30:
+                    # Hostile NPC: should not be described with hostile actions
+                    # (A villain attacking is consistent; a villain welcoming players is also fine.
+                    # The guardrail catches: hostile NPC described with hostile behavior
+                    # that's inconsistent with their revealed disposition.)
+                    for desc in self._HOSTILE_DESCRIPTORS:
+                        if desc in text_lower:
+                            violations.append(
+                                f"[[{name}]] has disposition {disp} (HOSTILE) but narrative "
+                                f"describes them with hostile action ('{desc}')."
+                            )
+                            break
+                elif disp > 70:
+                    # Friendly NPC: should not be described with friendly actions
+                    # (A friend attacking is jarring. The guardrail catches: friendly NPC
+                    # described with friendly behavior that's inconsistent.)
+                    for desc in self._FRIENDLY_DESCRIPTORS:
+                        if desc in text_lower:
+                            violations.append(
+                                f"[[{name}]] has disposition {disp} (FRIENDLY) but narrative "
+                                f"describes them with friendly action ('{desc}')."
+                            )
+                            break
+
+            # Faction standing check
+            if node.node_type.value == "faction":
+                standing_map = node.attributes.get("faction_standing", {})
+                party_key = ctx.get("active_character", "party")
+                standing = standing_map.get(party_key, standing_map.get("party", 50))
+                if standing < 30:
+                    # Hostile faction: reject hostile action descriptions
+                    for desc in self._HOSTILE_DESCRIPTORS:
+                        if desc in text_lower:
+                            violations.append(
+                                f"Faction [[{name}]] has standing {standing} (HOSTILE) but narrative "
+                                f"describes them with hostile action ('{desc}')."
+                            )
+                            break
+                elif standing > 70:
+                    # Allied faction: reject friendly action descriptions
+                    for desc in self._FRIENDLY_DESCRIPTORS:
+                        if desc in text_lower:
+                            violations.append(
+                                f"Faction [[{name}]] has standing {standing} (ALLIED) but narrative "
+                                f"describes them with friendly action ('{desc}')."
+                            )
+                            break
+
+        if violations:
+            revisions = [
+                f"Rewrite to describe {name} with a tone consistent with their "
+                f"current disposition/standing."
+                for violation in violations
+                for name in [violation.split("[[")[1].split("]]")[0]]
+            ]
+            return GuardrailResult(
+                allowed=False,
+                reason="; ".join(violations),
+                required_revisions=revisions,
+            )
         return GuardrailResult(allowed=True)
 
     def check_storylet_integrity(

@@ -228,6 +228,52 @@ class GraphQuery(BaseModel):
                 # Fallback: try direct attribute access
                 return self._compare(getattr(entity, attr, None), self.op, self.value)
 
+            # --- NPC Disposition: disposition_toward_party attribute check ---
+            if self.query_type == "disposition_check":
+                node_uuid = self._resolve_node_uuid(kg)
+                if node_uuid is None:
+                    return False
+                node = kg.get_node(node_uuid)
+                if node is None:
+                    return False
+                disp = node.attributes.get("disposition_toward_party", 50)
+                return self._compare(disp, self.op, self.value)
+
+            # --- Faction Reputation: faction_standing["party"] attribute check ---
+            if self.query_type == "faction_standing_check":
+                node_uuid = self._resolve_node_uuid(kg)
+                if node_uuid is None:
+                    return False
+                node = kg.get_node(node_uuid)
+                if node is None or node.node_type != GraphNodeType.FACTION:
+                    return False
+                standing_map = node.attributes.get("faction_standing", {})
+                # Support per-character tracking via ctx["active_character"]
+                party_key = ctx.get("active_character", "party")
+                standing = standing_map.get(party_key, standing_map.get("party", 50))
+                return self._compare(standing, self.op, self.value)
+
+            # --- Edge attribute check: for secret revelation prerequisites ---
+            if self.query_type == "edge_attribute_check":
+                subj_uuid = self._resolve_node_uuid(kg)
+                obj_uuid = self._resolve_target_uuid(kg)
+                if subj_uuid is None or obj_uuid is None:
+                    return False
+                pred = GraphPredicate(self.predicate) if self.predicate else None
+                for edge in kg.edges:
+                    if edge.subject_uuid != subj_uuid:
+                        continue
+                    if edge.object_uuid != obj_uuid:
+                        continue
+                    if pred is not None and edge.predicate != pred:
+                        continue
+                    # Found the matching edge — check the requested attribute
+                    edge_attr_val = getattr(edge, self.attribute, None)
+                    if edge_attr_val is None:
+                        return False
+                    return self._compare(edge_attr_val, self.op, self.value)
+                return False
+
             return False
         except Exception:
             return False
@@ -265,7 +311,7 @@ class GraphMutation(BaseModel):
     mutation_type: str = Field(
         description=(
             "One of: 'add_node', 'remove_node', 'add_edge', 'remove_edge', "
-            "'set_attribute', 'add_tag', 'remove_tag', 'set_immutable'"
+            "'set_attribute', 'add_tag', 'remove_tag', 'set_immutable', 'set_edge_attribute'"
         )
     )
     node_uuid: Optional[uuid.UUID] = None
@@ -277,6 +323,7 @@ class GraphMutation(BaseModel):
     attribute: Optional[str] = None
     value: Any = None
     tags: Optional[List[str]] = None
+    secret: bool = False  # For add_edge — sets edge.secret
 
     def _resolve_node_uuid(self, kg: KnowledgeGraph) -> Optional[uuid.UUID]:
         if self.node_uuid:
@@ -321,7 +368,12 @@ class GraphMutation(BaseModel):
                     return
                 pred = GraphPredicate(self.predicate) if self.predicate else GraphPredicate.CONNECTED_TO
                 from knowledge_graph import KnowledgeGraphEdge
-                edge = KnowledgeGraphEdge(subject_uuid=subj_uuid, predicate=pred, object_uuid=obj_uuid)
+                edge = KnowledgeGraphEdge(
+                    subject_uuid=subj_uuid,
+                    predicate=pred,
+                    object_uuid=obj_uuid,
+                    secret=self.secret,
+                )
                 kg.add_edge(edge)
                 return
 
@@ -376,6 +428,26 @@ class GraphMutation(BaseModel):
                 node = kg.get_node(uid)
                 if node:
                     node.is_immutable = bool(self.value)
+                return
+
+            if self.mutation_type == "set_edge_attribute":
+                # Set an attribute on a specific edge (identified by subject + predicate + object).
+                # Used to reveal secrets: set_edge_attribute(subject="Lord Vance", predicate="member_of",
+                # object="The Cult", attribute="secret", value=False)
+                subj_uuid = self._resolve_node_uuid(kg)
+                obj_uuid = self._resolve_target_uuid(kg)
+                if not subj_uuid or not obj_uuid:
+                    return
+                pred = GraphPredicate(self.predicate) if self.predicate else None
+                for edge in kg.edges:
+                    if edge.subject_uuid != subj_uuid:
+                        continue
+                    if edge.object_uuid != obj_uuid:
+                        continue
+                    if pred is not None and edge.predicate != pred:
+                        continue
+                    setattr(edge, self.attribute, self.value)
+                    break
                 return
 
         except Exception as e:

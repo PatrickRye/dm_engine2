@@ -82,6 +82,7 @@ def _dict_to_storylet(data: dict) -> Storylet:
             attribute=mdata.get("attribute"),
             value=mdata.get("value"),
             tags=mdata.get("tags"),
+            secret=mdata.get("secret", False),
         )
 
     def _restore_effect(edata: dict) -> StoryletEffect:
@@ -144,6 +145,7 @@ def _mutation_to_dict(m: GraphMutation) -> dict:
         "attribute": m.attribute,
         "value": m.value,
         "tags": m.tags,
+        "secret": m.secret,
     }
 
 

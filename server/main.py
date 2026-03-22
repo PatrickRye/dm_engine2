@@ -106,6 +106,13 @@ from tools import (
     mark_entity_immutable,
     request_graph_mutations,
     sync_knowledge_graph,
+    run_ingestion_pipeline_tool,
+    hydrate_campaign,
+    hydrate_delta,
+    detect_missing_entities,
+    propose_entity_creation,
+    generate_side_quests_for_entity,
+    reveal_secret,
     _get_config_tone,
     _get_entity_by_name,
     _calculate_reach,
@@ -168,6 +175,13 @@ MASTER_TOOLS_LIST = [
     mark_entity_immutable,
     request_graph_mutations,
     sync_knowledge_graph,
+    run_ingestion_pipeline_tool,
+    hydrate_campaign,
+    hydrate_delta,
+    detect_missing_entities,
+    propose_entity_creation,
+    generate_side_quests_for_entity,
+    reveal_secret,
 ]
 
 # 1. INITIALIZE THE APP FIRST

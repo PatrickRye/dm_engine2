@@ -72,6 +72,9 @@ class KnowledgeGraphEdge(BaseModel):
     predicate: GraphPredicate
     object_uuid: uuid.UUID
     weight: float = 1.0
+    # Secret edges are hidden from the narrator's GraphRAG context
+    # but remain visible to storylets (DM-level knowledge).
+    secret: bool = False
 
 
 class KnowledgeGraph(BaseModel):
@@ -293,16 +296,27 @@ class KnowledgeGraph(BaseModel):
         kg._rebuild_adjacency()
         return kg
 
-    def get_context_for_node(self, node_uuid: uuid.UUID, max_hops: int = 2) -> Dict[str, Any]:
+    def get_context_for_node(
+        self, node_uuid: uuid.UUID, max_hops: int = 2, hide_secrets: bool = True
+    ) -> Dict[str, Any]:
         """
         Returns a dict with the node's own data plus its immediate neighborhood.
         Used for GraphRAG-style context windows.
+
+        Args:
+            node_uuid: The node to get context for.
+            max_hops: Unused but kept for API compatibility.
+            hide_secrets: If True, secret edges are excluded from neighbors.
+                          The narrator's GraphRAG context passes True (secrets hidden).
+                          Storylet evaluation passes False (all edges visible).
         """
         node = self.get_node(node_uuid)
         if not node:
             return {}
         neighbors: Dict[str, List[str]] = defaultdict(list)
         for edge in self.edges:
+            if hide_secrets and edge.secret:
+                continue
             if edge.subject_uuid == node_uuid:
                 target = self.get_node(edge.object_uuid)
                 if target:

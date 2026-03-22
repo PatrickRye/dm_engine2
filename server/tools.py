@@ -5597,3 +5597,452 @@ async def run_ingestion_pipeline_tool(
         f"  Effects annotated: {result['effects_annotated']}"
     )
 
+
+@tool
+async def hydrate_campaign(
+    campaign_materials_json: str = "{}",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    One-shot campaign hydration: fully populate the Knowledge Graph and Storylet
+    Registry from raw campaign materials provided by the DM.
+
+    This is an expensive upfront operation (one-time LLM cost) that enables
+    fast subsequent sessions. Call this when starting a new campaign or doing
+    major session prep.
+
+    Results are written directly to the Knowledge Graph and Storylet Registry.
+
+    Args:
+        campaign_materials_json: JSON string of CampaignMaterials:
+            {{
+              "campaign_name": "Curse of Strahd",
+              "npc_lore": "Lord Vader is an ancient Sith lord...",
+              "campaign_narrative": "The party arrives at Castle Ravenloft...",
+              "session_prep_notes": "The warlock will betray the party...",
+              "storylet_resolutions": {{
+                "The Betrayal": "Lord Vader turns on the party and joins the Cult."
+              }}
+            }}
+            All fields are optional — the pipeline processes whatever is provided.
+    """
+    import asyncio
+    import json as _json
+
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    llm = config["configurable"].get("_llm")
+    if llm is None:
+        return (
+            "SYSTEM ERROR: No LLM available in session context. "
+            "The hydration pipeline requires an active LLM session."
+        )
+
+    try:
+        materials = _json.loads(campaign_materials_json)
+    except Exception:
+        return "SYSTEM ERROR: Invalid campaign_materials_json. Provide a valid JSON string."
+
+    try:
+        from ingestion_pipeline import CampaignHydrationPipeline, CampaignMaterials
+        loop = asyncio.get_event_loop()
+
+        async def _run():
+            cm = CampaignMaterials(
+                campaign_name=materials.get("campaign_name", ""),
+                npc_lore=materials.get("npc_lore", ""),
+                campaign_narrative=materials.get("campaign_narrative", ""),
+                session_prep_notes=materials.get("session_prep_notes", ""),
+                storylet_resolutions=materials.get("storylet_resolutions", {}),
+            )
+            pipeline = CampaignHydrationPipeline(llm, vault_path)
+            return await pipeline.run(cm)
+
+        if loop.is_running():
+            task = loop.create_task(_run())
+            result = loop.run_until_complete(task)
+        else:
+            result = loop.run_until_complete(_run())
+    except Exception as e:
+        return f"SYSTEM ERROR: Campaign hydration failed: {e}"
+
+    lines = [
+        "MECHANICAL TRUTH: Campaign hydration complete.",
+        f"  KG nodes created: {result.nodes_created}",
+        f"  KG edges created: {result.edges_created}",
+        f"  Storylets created: {result.storylets_created}",
+        f"  Storylets annotated: {result.storylets_annotated}",
+        f"  Effects attached: {result.effects_attached}",
+        f"  Backup storylets (Three Clue Rule): {result.backup_storylets_generated}",
+        f"  Three Clue violations fixed: {result.three_clue_violations_fixed}",
+        f"  Vault persisted: {result.vault_persisted}",
+    ]
+    if result.warnings:
+        lines.append("  Warnings:")
+        for w in result.warnings:
+            lines.append(f"    - {w}")
+
+    return "\n".join(lines)
+
+
+@tool
+async def hydrate_delta(
+    new_materials_json: str = "{}",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Incrementally hydrate only NEW content from DM materials — skips entities
+    and storylets that already exist in the Knowledge Graph or Storylet Registry.
+
+    Use this for session prep updates, mid-campaign additions, or when the DM
+    provides new materials. This is much cheaper than a full hydration because
+    it only processes genuinely new content.
+
+    To check what entities are missing before calling this tool, use
+    detect_missing_entities first.
+
+    Args:
+        new_materials_json: JSON string of CampaignMaterials with only the new content:
+            {{
+              "npc_lore": "A new NPC named Zypyr appears...",
+              "session_prep_notes": "The party will encounter the Archmage..."
+            }}
+    """
+    import asyncio
+    import json as _json
+
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    llm = config["configurable"].get("_llm")
+    if llm is None:
+        return (
+            "SYSTEM ERROR: No LLM available in session context. "
+            "The hydration pipeline requires an active LLM session."
+        )
+
+    try:
+        materials = _json.loads(new_materials_json)
+    except Exception:
+        return "SYSTEM ERROR: Invalid new_materials_json. Provide a valid JSON string."
+
+    try:
+        from ingestion_pipeline import IncrementalHydrationPipeline, CampaignMaterials
+        loop = asyncio.get_event_loop()
+
+        async def _run():
+            cm = CampaignMaterials(
+                npc_lore=materials.get("npc_lore", ""),
+                campaign_narrative=materials.get("campaign_narrative", ""),
+                session_prep_notes=materials.get("session_prep_notes", ""),
+                storylet_resolutions=materials.get("storylet_resolutions", {}),
+            )
+            pipeline = IncrementalHydrationPipeline(llm, vault_path)
+            return await pipeline.delta_hydrate(cm)
+
+        if loop.is_running():
+            task = loop.create_task(_run())
+            result = loop.run_until_complete(task)
+        else:
+            result = loop.run_until_complete(_run())
+    except Exception as e:
+        return f"SYSTEM ERROR: Delta hydration failed: {e}"
+
+    lines = [
+        "MECHANICAL TRUTH: Delta hydration complete.",
+        f"  KG nodes created: {result.nodes_created}",
+        f"  KG edges created: {result.edges_created}",
+        f"  Storylets created: {result.storylets_created}",
+        f"  Warnings: {len(result.warnings)}",
+    ]
+    if result.warnings:
+        for w in result.warnings:
+            lines.append(f"    - {w}")
+
+    return "\n".join(lines)
+
+
+@tool
+async def detect_missing_entities(
+    narrative_text: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Scan narrative text for entity references (Wikilinks or capitalized names)
+    that are NOT in the Knowledge Graph.
+
+    Returns a list of missing entity names that can be hydrated by calling
+    hydrate_delta or hydrate_missing_entity.
+
+    This tool is useful:
+      - Before a session: proactively identify gaps in the KG
+      - After a guardrail rejection: the DM can call this to understand what
+        entities the narrator referenced that aren't in the KG
+
+    Args:
+        narrative_text: The narrative prose or DM notes to scan.
+    """
+    import json as _json
+
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    try:
+        from ingestion_pipeline import IncrementalHydrationPipeline
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path=vault_path)
+        missing = pipeline.detect_missing_entities(narrative_text)
+    except Exception as e:
+        return f"SYSTEM ERROR: Entity scan failed: {e}"
+
+    if not missing:
+        return (
+            "MECHANICAL TRUTH: All referenced entities exist in the Knowledge Graph. "
+            "No missing entities detected."
+        )
+
+    suggestion = pipeline.suggest_hydration(missing)
+    return f"MECHANICAL TRUTH: Missing entities detected ({len(missing)}):\n" + "\n".join(f"  - {n}" for n in missing) + "\n\n" + suggestion
+
+
+@tool
+async def reveal_secret(
+    subject_name: str,
+    predicate: str,
+    object_name: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Reveal a secret edge in the Knowledge Graph — sets edge.secret=False.
+
+    When a secret is discovered by the party (e.g., Lord Vance's membership in
+    the Cult is revealed), call this tool to flip the edge from secret to public.
+    After this call, the edge will appear in GraphRAG context for the narrator.
+
+    This emits a 'set_edge_attribute' mutation: sets secret=False on the matching edge.
+    The mutation is validated and committed through the standard deferred-mutation flow
+    (Hard Guardrails validate, then commit_node executes after QA approval).
+
+    Args:
+        subject_name: The subject node name (e.g., "Lord Vance")
+        predicate: The edge predicate (e.g., "member_of", "serves")
+        object_name: The object node name (e.g., "The Cult")
+    """
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    from registry import get_knowledge_graph
+    from knowledge_graph import GraphPredicate
+
+    kg = get_knowledge_graph(vault_path)
+
+    # Find the edge
+    subj_uuid = kg.find_node_uuid(subject_name)
+    obj_uuid = kg.find_node_uuid(object_name)
+    if not subj_uuid or not obj_uuid:
+        return f"SYSTEM ERROR: Could not find node(s): {subject_name} or {object_name}"
+
+    try:
+        pred = GraphPredicate(predicate)
+    except ValueError:
+        return f"SYSTEM ERROR: Unknown predicate '{predicate}'"
+
+    # Find and check the edge
+    target_edge = None
+    for edge in kg.edges:
+        if edge.subject_uuid == subj_uuid and edge.object_uuid == obj_uuid and edge.predicate == pred:
+            target_edge = edge
+            break
+
+    if target_edge is None:
+        return f"SYSTEM ERROR: Edge not found: [[{subject_name}]] --{predicate}--> [[{object_name}]]"
+
+    if not target_edge.secret:
+        return f"MECHANICAL TRUTH: Edge [[{subject_name}]] --{predicate}--> [[{object_name}]] is already public. No secret to reveal."
+
+    # Build the mutation dict — action_logic_node will capture and defer this
+    mutation_dict = {
+        "mutation_type": "set_edge_attribute",
+        "node_name": subject_name,
+        "predicate": predicate,
+        "target_name": object_name,
+        "attribute": "secret",
+        "value": False,
+    }
+    import json
+
+    return (
+        f"MECHANICAL TRUTH: Secret-reveal mutation for [[{subject_name}]] --{predicate}--> [[{object_name}]]. "
+        f"Mutation: {json.dumps(mutation_dict)}"
+    )
+
+
+@tool
+async def propose_entity_creation(
+    entity_name: str,
+    entity_type: str = "npc",
+    player_description: str = "",
+    proposed_by_player: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Propose a new entity for creation in the Knowledge Graph.
+
+    Use this when narrative references an entity that doesn't exist yet.
+    This creates a proposal that the DM can approve, modify, or reject.
+
+    If approved: the entity is added to KG and EmergentWorldBuilder is triggered.
+    If modified: the modified description is used instead.
+
+    Args:
+        entity_name: The proposed entity name (e.g., "Mary", "The Prancing Pony")
+        entity_type: KG node type — one of: npc, location, item, faction
+        player_description: What the player or narrator said about this entity
+        proposed_by_player: True if a player suggested this entity (vs DM invention)
+    """
+    import asyncio
+
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    llm = config["configurable"].get("_llm")
+
+    # Check if entity already exists
+    from registry import get_knowledge_graph
+    kg = get_knowledge_graph(vault_path)
+    if kg.get_node_by_name(entity_name) is not None:
+        return f"SYSTEM ERROR: Entity '{entity_name}' already exists in the Knowledge Graph."
+
+    # Build the entity with minimal info; emergent builder will flesh it out
+    from knowledge_graph import KnowledgeGraphNode, GraphNodeType
+    import uuid
+
+    node = KnowledgeGraphNode(
+        node_uuid=uuid.uuid4(),
+        node_type=GraphNodeType(entity_type),
+        name=entity_name,
+        attributes={
+            "description": player_description or f"Emergent entity {entity_name}.",
+            "proposed_by_player": str(proposed_by_player),
+        },
+        is_immutable=False,  # Player-created entities are mutable by default
+    )
+    kg.add_node(node)
+
+    # Trigger EmergentWorldBuilder to flesh out the entity
+    if llm is not None:
+        try:
+            from ingestion_pipeline import EmergentWorldBuilder
+            loop = asyncio.get_event_loop()
+
+            async def _run():
+                builder = EmergentWorldBuilder(llm=llm, vault_path=vault_path)
+                return await builder.on_entity_created(
+                    entity_name=entity_name,
+                    entity_type=entity_type,
+                    context=player_description,
+                    player_proposed=proposed_by_player,
+                )
+
+            if loop.is_running():
+                task = loop.create_task(_run())
+                report = loop.run_until_complete(task)
+            else:
+                report = loop.run_until_complete(_run())
+
+            return (
+                f"MECHANICAL TRUTH: Entity '{entity_name}' proposed and created.\n"
+                f"  Type: {entity_type}\n"
+                f"  Proposed by player: {proposed_by_player}\n"
+                f"  Side quest storylets generated: {report.storylets_created}\n"
+                f"  World edges inferred: {report.edges_created}\n"
+                f"  Description: {report.description or '(fleshed out by LLM)'}"
+                + (f"\n  Warnings: {report.warnings}" if report.warnings else "")
+            )
+        except Exception as e:
+            return (
+                f"MECHANICAL TRUTH: Entity '{entity_name}' created (side quest generation failed: {e}).\n"
+                f"  Type: {entity_type}. The DM should flesh out this entity manually."
+            )
+
+    return (
+        f"MECHANICAL TRUTH: Entity '{entity_name}' created (no LLM — manual fleshing recommended).\n"
+        f"  Type: {entity_type}. Call generate_side_quests_for_entity when LLM is available."
+    )
+
+
+@tool
+async def generate_side_quests_for_entity(
+    entity_name: str,
+    quest_count: int = 3,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Generate side quest storylets for an existing KG entity.
+
+    Use when the DM wants to flesh out an NPC's potential arcs
+    without waiting for players to naturally engage with them.
+    The entity must already exist in the Knowledge Graph.
+
+    Args:
+        entity_name: Name of the existing KG entity to generate quests for
+        quest_count: Number of side quest stubs to generate (default 3, max 5)
+    """
+    import asyncio
+
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    llm = config["configurable"].get("_llm")
+    if llm is None:
+        return (
+            "SYSTEM ERROR: No LLM available in session context. "
+            "Side quest generation requires an active LLM session."
+        )
+
+    from registry import get_knowledge_graph
+    kg = get_knowledge_graph(vault_path)
+    node = kg.get_node_by_name(entity_name)
+    if node is None:
+        return f"SYSTEM ERROR: Entity '{entity_name}' not found in Knowledge Graph."
+
+    try:
+        from ingestion_pipeline import EmergentWorldBuilder
+        loop = asyncio.get_event_loop()
+
+        async def _run():
+            builder = EmergentWorldBuilder(llm=llm, vault_path=vault_path)
+            return await builder.on_entity_created(
+                entity_name=entity_name,
+                entity_type=node.node_type.value,
+                context=node.attributes.get("description", "") if node.attributes else "",
+                player_proposed=False,
+            )
+
+        if loop.is_running():
+            task = loop.create_task(_run())
+            report = loop.run_until_complete(task)
+        else:
+            report = loop.run_until_complete(_run())
+
+        return (
+            f"MECHANICAL TRUTH: Side quests generated for '{entity_name}'.\n"
+            f"  Storylets created: {report.storylets_created}\n"
+            f"  World edges inferred: {report.edges_created}"
+            + (f"\n  Warnings: {report.warnings}" if report.warnings else "")
+        )
+    except Exception as e:
+        return f"SYSTEM ERROR: Side quest generation failed: {e}"
+

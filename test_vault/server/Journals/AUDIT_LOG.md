@@ -34359,3 +34359,507 @@ tags: [system, audit]
 **[CommitNode]** - *Turn Complete*
 > Draft approved. 0 mutations committed. Errors: 0
 
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Merchant' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[CommitNode]** - *Mutations Committed*
+> 1/1 deferred mutations executed after QA approval.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 1 mutations committed. Errors: 0
+
+**[QA Agent]** - *Mutation Leak Detected*
+> 1 mutations leaked into QA without execution. Rejecting.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Goblin' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Merchant' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[CommitNode]** - *Mutations Committed*
+> 1/1 deferred mutations executed after QA approval.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 1 mutations committed. Errors: 0
+
+**[QA Agent]** - *Mutation Leak Detected*
+> 1 mutations leaked into QA without execution. Rejecting.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Goblin' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Merchant' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[CommitNode]** - *Mutations Committed*
+> 1/1 deferred mutations executed after QA approval.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 1 mutations committed. Errors: 0
+
+**[QA Agent]** - *Mutation Leak Detected*
+> 1 mutations leaked into QA without execution. Rejecting.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Goblin' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Merchant' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[CommitNode]** - *Mutations Committed*
+> 1/1 deferred mutations executed after QA approval.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 1 mutations committed. Errors: 0
+
+**[QA Agent]** - *Mutation Leak Detected*
+> 1 mutations leaked into QA without execution. Rejecting.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Goblin' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Merchant' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[CommitNode]** - *Mutations Committed*
+> 1/1 deferred mutations executed after QA approval.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 1 mutations committed. Errors: 0
+
+**[QA Agent]** - *Mutation Leak Detected*
+> 1 mutations leaked into QA without execution. Rejecting.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Goblin' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Merchant' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[CommitNode]** - *Mutations Committed*
+> 1/1 deferred mutations executed after QA approval.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 1 mutations committed. Errors: 0
+
+**[QA Agent]** - *Mutation Leak Detected*
+> 1 mutations leaked into QA without execution. Rejecting.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Goblin' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Merchant' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[CommitNode]** - *Mutations Committed*
+> 1/1 deferred mutations executed after QA approval.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 1 mutations committed. Errors: 0
+
+**[QA Agent]** - *Mutation Leak Detected*
+> 1 mutations leaked into QA without execution. Rejecting.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Goblin' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Merchant' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[CommitNode]** - *Mutations Committed*
+> 1/1 deferred mutations executed after QA approval.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 1 mutations committed. Errors: 0
+
+**[QA Agent]** - *Mutation Leak Detected*
+> 1 mutations leaked into QA without execution. Rejecting.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: perform_ability_check_or_save({})
+
+**[QA Agent]** - *KG Rollback*
+> Restored KG from pre-QA snapshot. No mutations were committed before approval.
+
+**[QA Agent]** - *Result*
+> REJECTED. Feedback: Player agency violated.
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+
+**[HardGuardrails]** - *Narrative Rejected*
+> Reason: Subject node 'Goblin' does not exist in the Knowledge Graph.
+
+**[QA Agent]** - *Reviewing Draft*
+> Tools audited this turn: None
+
+**[QA Agent]** - *Result*
+> COMMIT
+
+**[CommitNode]** - *Turn Complete*
+> Draft approved. 0 mutations committed. Errors: 0
+

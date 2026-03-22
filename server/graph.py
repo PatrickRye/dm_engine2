@@ -139,7 +139,7 @@ def _compute_grag_context(kg, vault_path: str, active_character: str, max_hops: 
     Internal: computes GraphRAG context without caching.
     Extracted so the cache logic and TTL are centralized here.
     """
-    from knowledge_graph import GraphNodeType
+    from knowledge_graph import GraphNodeType, GraphPredicate
 
     if not kg or not kg.nodes:
         return ""
@@ -153,7 +153,7 @@ def _compute_grag_context(kg, vault_path: str, active_character: str, max_hops: 
     if active_character:
         char_uuid = kg.find_node_uuid(active_character)
         if char_uuid:
-            ctx = kg.get_context_for_node(char_uuid, max_hops=max_hops)
+            ctx = kg.get_context_for_node(char_uuid, max_hops=max_hops, hide_secrets=True)
             if ctx:
                 lines.append(f"\n[Active Character: {ctx.get('name', active_character)}]")
                 neighbors = ctx.get("neighbors", {})
@@ -172,18 +172,27 @@ def _compute_grag_context(kg, vault_path: str, active_character: str, max_hops: 
         # Deduplicate: if active character is an NPC, skip them (already rendered)
         if char_uuid and npc.node_uuid == char_uuid:
             continue
-        ctx = kg.get_context_for_node(npc.node_uuid, max_hops=1)
+        ctx = kg.get_context_for_node(npc.node_uuid, max_hops=1, hide_secrets=True)
         if ctx:
             attrs = ctx.get("attributes", {})
             neighbors = ctx.get("neighbors", {})
             lines.append(f"\n[NPC: {npc.name}]")
+            # NPC disposition toward party
+            disp = attrs.get("disposition_toward_party", 50)
+            if disp < 30:
+                disp_label = "HOSTILE"
+            elif disp > 70:
+                disp_label = "FRIENDLY"
+            else:
+                disp_label = "NEUTRAL"
+            lines.append(f"  disposition: {disp}/100 ({disp_label})")
             # Gap 9: Inject NPC behavioral dials
             if npc.npc_dials:
                 dial_str = ", ".join(f"{k}={v:.1f}" for k, v in npc.npc_dials.items())
                 lines.append(f"  Behavioral Dials: {dial_str}")
             if attrs:
                 notable = {k: v for k, v in attrs.items()
-                           if k not in ("description", "bio", "notes") and v}
+                           if k not in ("description", "bio", "notes", "disposition_toward_party") and v}
                 if notable:
                     for k, v in list(notable.items())[:3]:
                         lines.append(f"  {k}: {v}")
@@ -194,6 +203,34 @@ def _compute_grag_context(kg, vault_path: str, active_character: str, max_hops: 
                         edge_summary.append(f"{pred.replace('_', ' ')}: {', '.join(names[:2])}")
                 if edge_summary:
                     lines.append(f"  Relationships: {'; '.join(edge_summary[:3])}")
+
+    # Faction nodes with their standing toward the party
+    faction_nodes = kg.query_nodes(node_type=GraphNodeType.FACTION)
+    for faction in faction_nodes[:3]:  # Limit to 3 factions
+        standing_map = faction.attributes.get("faction_standing", {})
+        party_key = active_character or "party"
+        standing = standing_map.get(party_key, standing_map.get("party", 50))
+        if standing < 30:
+            standing_label = "HOSTILE"
+        elif standing > 70:
+            standing_label = "ALLIED"
+        else:
+            standing_label = "NEUTRAL"
+        lines.append(f"\n[FACTION: {faction.name}]")
+        lines.append(f"  standing: {standing}/100 ({standing_label} toward party)")
+        # Controls (edges with CONTROLS predicate)
+        controls_edges = kg.query_edges(
+            subject_uuid=faction.node_uuid,
+            predicate=GraphPredicate.CONTROLS,
+        )
+        if controls_edges:
+            ctrl_names = []
+            for edge in controls_edges[:3]:
+                node = kg.get_node(edge.object_uuid)
+                if node:
+                    ctrl_names.append(f"[[{node.name}]]")
+            if ctrl_names:
+                lines.append(f"  Controls: {', '.join(ctrl_names)}")
 
     lines.append("\n(Only describe entities and relationships that are established in the KG above.)\n")
     return "\n".join(lines)
@@ -895,6 +932,57 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                 f"MECHANICAL TRUTH: {len(parsed)} graph mutations validated and captured "
                 f"(deferred execution pending QA approval). Mutations: {json.dumps(mutation_data)}"
             )
+        elif tool_name == "reveal_secret":
+            # reveal_secret: pre-validate edge exists and is secret, then defer mutation
+            from knowledge_graph import GraphPredicate
+
+            args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+            subject_name = args.get("subject_name", "")
+            predicate_str = args.get("predicate", "")
+            object_name = args.get("object_name", "")
+
+            # Resolve edge
+            subj_uuid = kg.find_node_uuid(subject_name)
+            obj_uuid = kg.find_node_uuid(object_name)
+            if not subj_uuid or not obj_uuid:
+                result_content = f"SYSTEM ERROR: Could not find node(s): {subject_name} or {object_name}"
+            else:
+                try:
+                    pred = GraphPredicate(predicate_str)
+                except ValueError:
+                    result_content = f"SYSTEM ERROR: Unknown predicate '{predicate_str}'"
+                    pred = None
+
+                if pred is not None:
+                    target_edge = None
+                    for edge in kg.edges:
+                        if (edge.subject_uuid == subj_uuid and
+                            edge.object_uuid == obj_uuid and
+                            edge.predicate == pred):
+                            target_edge = edge
+                            break
+
+                    if target_edge is None:
+                        result_content = f"SYSTEM ERROR: Edge not found: [[{subject_name}]] --{predicate_str}--> [[{object_name}]]"
+                    elif not target_edge.secret:
+                        result_content = f"MECHANICAL TRUTH: Edge is already public. No secret to reveal."
+                    else:
+                        mutation_dict = {
+                            "mutation_type": "set_edge_attribute",
+                            "node_name": subject_name,
+                            "predicate": predicate_str,
+                            "target_name": object_name,
+                            "attribute": "secret",
+                            "value": False,
+                        }
+                        mutation_data = [mutation_dict]
+                        result_content = (
+                            f"MECHANICAL TRUTH: Secret-reveal mutation validated and captured "
+                            f"(deferred execution pending QA approval). Mutation: {json.dumps(mutation_dict)}"
+                        )
+
+            if not mutation_data:
+                mutation_data = None
         else:
             # For create_storylet and mark_entity_immutable, execute immediately
             # (they don't have the commit=False pattern yet)
@@ -1065,6 +1153,67 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     # committed but the narrative is rejected — fixing the rollback/checkpointer
     # issue that required speculative execution.
     # ------------------------------------------------------------------
+
+    def _update_attitude_edge(
+        kg,
+        node,
+        old_val: int,
+        new_val: int,
+        party_uuid,
+    ) -> None:
+        """
+        When disposition_toward_party or faction_standing crosses a threshold,
+        auto-add/update/remove the HOSTILE_TOWARD or ALLIED_WITH edge to the party.
+        Thresholds: <30 hostile, >70 friendly, 30-70 neutral.
+        """
+        if party_uuid is None:
+            return
+
+        def _current_attitude() -> Optional[str]:
+            """Returns 'hostile', 'friendly', or None based on existing edges."""
+            for edge in kg.edges:
+                if edge.subject_uuid != node.node_uuid:
+                    continue
+                if edge.object_uuid != party_uuid:
+                    continue
+                if edge.predicate == GraphPredicate.HOSTILE_TOWARD:
+                    return "hostile"
+                if edge.predicate == GraphPredicate.ALLIED_WITH:
+                    return "friendly"
+            return None
+
+        def _set_attitude(predicate: GraphPredicate) -> None:
+            # Remove any existing attitude edge first
+            for edge in list(kg.edges):
+                if (
+                    edge.subject_uuid == node.node_uuid
+                    and edge.object_uuid == party_uuid
+                    and edge.predicate in (GraphPredicate.HOSTILE_TOWARD, GraphPredicate.ALLIED_WITH)
+                ):
+                    kg.remove_edge(edge.edge_uuid)
+            # Add new attitude edge
+            kg.add_edge(
+                KnowledgeGraphEdge(
+                    subject_uuid=node.node_uuid,
+                    predicate=predicate,
+                    object_uuid=party_uuid,
+                )
+            )
+
+        old_state = "hostile" if old_val < 30 else ("friendly" if old_val > 70 else None)
+        new_state = "hostile" if new_val < 30 else ("friendly" if new_val > 70 else None)
+
+        if old_state == new_state:
+            return  # No threshold crossed
+
+        if new_state is None:
+            # Back to neutral — remove attitude edge
+            _set_attitude(GraphPredicate.HOSTILE_TOWARD)  # removes both types first
+        elif new_state == "hostile":
+            _set_attitude(GraphPredicate.HOSTILE_TOWARD)
+        elif new_state == "friendly":
+            _set_attitude(GraphPredicate.ALLIED_WITH)
+
     async def commit_node(state: DMState, config: RunnableConfig):
         from registry import get_knowledge_graph
 
@@ -1072,15 +1221,46 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         kg = get_knowledge_graph(vault_path)
         pending = list(state.get("pending_mutations", []))
         mutation_errors: List[str] = []
+        narrative_context = state.get("draft_response", "")
 
         if pending:
             from storylet import GraphMutation
+            from knowledge_graph import GraphPredicate, KnowledgeGraphEdge
+
             committed = 0
+            newly_created_entities: List[str] = []
+            # Snapshot attitude values before mutations so we can detect threshold crossings
+            party_uuid = kg.find_node_uuid("The Party") or kg.find_node_uuid("Party")
+
             for mdict in pending:
                 try:
                     mutation = GraphMutation(**mdict)
                     mutation.execute(kg)
                     committed += 1
+                    if mutation.mutation_type == "add_node" and mutation.node_name:
+                        newly_created_entities.append(mutation.node_name)
+
+                    # Auto-update attitude edges when disposition/standing crosses threshold
+                    if mutation.mutation_type == "set_attribute" and mutation.attribute in (
+                        "disposition_toward_party",
+                        "faction_standing",
+                    ):
+                        node = kg.get_node(mutation._resolve_node_uuid(kg)) if mutation._resolve_node_uuid(kg) else None
+                        if not node:
+                            continue
+
+                        if mutation.attribute == "disposition_toward_party":
+                            new_val = mutation.value
+                            old_val = node.attributes.get("disposition_toward_party", 50)
+                            _update_attitude_edge(kg, node, old_val, new_val, party_uuid)
+                        elif mutation.attribute == "faction_standing":
+                            # value is a dict like {"party": X} or {"character_name": X}
+                            new_standing = mutation.value or {}
+                            old_standing = node.attributes.get("faction_standing", {})
+                            party_key = "party"
+                            old_val = old_standing.get(party_key, 50)
+                            new_val = new_standing.get(party_key, old_val)
+                            _update_attitude_edge(kg, node, old_val, new_val, party_uuid)
                 except Exception as e:
                     err_msg = (
                         f"Mutation execution failed: {mdict.get('mutation_type')} "
@@ -1101,6 +1281,32 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             )
             # Invalidate GraphRAG cache since KG was modified
             _invalidate_grag_cache(vault_path)
+
+            # Emergent Worldbuilding: flesh out newly created entities
+            for entity_name in newly_created_entities:
+                try:
+                    from ingestion_pipeline import EmergentWorldBuilder
+                    # Use the draft_llm from the graph closure for LLM-powered fleshing
+                    builder = EmergentWorldBuilder(llm=draft_llm, vault_path=vault_path)
+                    report = await builder.on_entity_created(
+                        entity_name=entity_name,
+                        context=narrative_context,
+                    )
+                    await write_audit_log(
+                        vault_path,
+                        "EmergentWorldBuilder",
+                        "Entity Hydrated",
+                        f"Entity '{entity_name}' fleshed out: "
+                        f"{report.storylets_created} storylets, {report.edges_created} edges created."
+                        + (f" Warnings: {report.warnings}" if report.warnings else ""),
+                    )
+                except Exception as e:
+                    await write_audit_log(
+                        vault_path,
+                        "EmergentWorldBuilder",
+                        "Hydration Skipped",
+                        f"Could not hydrate '{entity_name}': {e}",
+                    )
 
         await write_audit_log(
             vault_path, "CommitNode", "Turn Complete",

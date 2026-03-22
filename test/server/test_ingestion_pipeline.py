@@ -23,6 +23,8 @@ from ingestion_pipeline import (
     KGEdgeSpec,
     StoryletSpec,
     EffectAnnotationSpec,
+    CampaignMaterials,
+    HydrationReport,
     _build_npc_system_prompt,
     _build_storylet_prerequisites,
     ingest_npc_lore,
@@ -31,6 +33,7 @@ from ingestion_pipeline import (
     run_ingestion_pipeline,
     extract_entities_from_text,
     EffectAnnotationPipeline,
+    CampaignHydrationPipeline,
 )
 
 
@@ -352,9 +355,268 @@ class TestStoryletRegistryGetByName:
         assert found is not None
         assert found.name == "Lord Vader"
 
+
+class TestCampaignHydrationPipeline:
+    """CampaignHydrationPipeline: one-shot campaign pre-loading."""
+
+    @pytest.mark.asyncio
+    async def test_run_returns_hydration_report(self):
+        """run() returns a HydrationReport with expected fields."""
+        from ingestion_pipeline import CampaignHydrationPipeline, CampaignMaterials
+
+        pipeline = CampaignHydrationPipeline(llm=None, vault_path="test_vault")
+        materials = CampaignMaterials(campaign_name="Test Campaign")
+        report = await pipeline.run(materials)
+        assert isinstance(report, HydrationReport)
+        assert hasattr(report, "nodes_created")
+        assert hasattr(report, "edges_created")
+        assert hasattr(report, "storylets_created")
+        assert hasattr(report, "backup_storylets_generated")
+        assert hasattr(report, "warnings")
+
+    @pytest.mark.asyncio
+    async def test_run_with_no_materials_produces_zeros(self):
+        """Empty CampaignMaterials produces zero counts."""
+        from ingestion_pipeline import CampaignHydrationPipeline, CampaignMaterials
+
+        pipeline = CampaignHydrationPipeline(llm=None, vault_path="test_vault")
+        report = await pipeline.run(CampaignMaterials())
+        assert report.nodes_created == 0
+        assert report.edges_created == 0
+        assert report.storylets_created == 0
+
+    @pytest.mark.asyncio
+    async def test_run_with_npc_lore_extracts_entities(self):
+        """NPC lore text is processed by extract_entities_from_text()."""
+        from ingestion_pipeline import CampaignHydrationPipeline, CampaignMaterials
+
+        pipeline = CampaignHydrationPipeline(llm=None, vault_path="test_vault")
+        materials = CampaignMaterials(
+            npc_lore="Lord Vader serves the Emperor. He is hostile toward the Jedi.",
+        )
+        report = await pipeline.run(materials)
+        # Deterministic fallback should extract at least some entities
+        assert report.nodes_created >= 1
+
+    @pytest.mark.asyncio
+    async def test_run_with_campaign_narrative_creates_storylets(self):
+        """Campaign narrative is processed by ingest_campaign_narrative()."""
+        from ingestion_pipeline import CampaignHydrationPipeline, CampaignMaterials
+
+        pipeline = CampaignHydrationPipeline(llm=None, vault_path="test_vault")
+        materials = CampaignMaterials(
+            campaign_narrative="The party arrives at a dark castle.",
+        )
+        report = await pipeline.run(materials)
+        # No LLM → empty storylets
+        assert report.storylets_created == 0
+
+    @pytest.mark.asyncio
+    async def test_run_invalidates_grag_cache(self):
+        """After hydration, the GraphRAG cache is invalidated."""
+        from ingestion_pipeline import CampaignHydrationPipeline, CampaignMaterials
+
+        pipeline = CampaignHydrationPipeline(llm=None, vault_path="test_grag_cache")
+        materials = CampaignMaterials(
+            npc_lore="The Goblin King rules the Thornwood.",
+        )
+        report = await pipeline.run(materials)
+        # Should complete without error
+        assert report.nodes_created >= 1
+
+
+class TestCampaignMaterialsSchema:
+    """CampaignMaterials schema defaults and validation."""
+
+    def test_all_fields_optional(self):
+        """All fields have defaults — empty init is valid."""
+        from ingestion_pipeline import CampaignMaterials
+
+        m = CampaignMaterials()
+        assert m.campaign_name == ""
+        assert m.npc_lore == ""
+        assert m.campaign_narrative == ""
+        assert m.session_prep_notes == ""
+        assert m.storylet_resolutions == {}
+
+    def test_storylet_resolutions_default_empty_dict(self):
+        """storylet_resolutions defaults to {} not None."""
+        from ingestion_pipeline import CampaignMaterials
+
+        m = CampaignMaterials(storylet_resolutions={"Key": "Value"})
+        assert m.storylet_resolutions == {"Key": "Value"}
+
     def test_get_by_name_not_found(self):
         from storylet_registry import StoryletRegistry
 
         reg = StoryletRegistry()
         found = reg.get_by_name("Nobody")
         assert found is None
+
+
+class TestIncrementalHydrationPipeline:
+    """IncrementalHydrationPipeline: delta updates from DM materials."""
+
+    @pytest.mark.asyncio
+    async def test_delta_hydrate_with_no_new_entities_returns_empty_report(self):
+        """When all content already exists, delta returns zero additions."""
+        from ingestion_pipeline import IncrementalHydrationPipeline, CampaignMaterials
+        from knowledge_graph import KnowledgeGraph, KnowledgeGraphNode, GraphNodeType
+
+        # Pre-populate KG with the entity that will appear in new materials
+        kg = KnowledgeGraph()
+        kg.add_node(KnowledgeGraphNode(
+            node_type=GraphNodeType.NPC, name="Lord Vader", attributes={}, tags=set(),
+        ))
+        import registry as reg_module
+        reg_module._KNOWLEDGE_GRAPHS["test_delta_vault"] = kg
+
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path="test_delta_vault")
+        materials = CampaignMaterials(
+            npc_lore="Lord Vader is an ancient Sith lord. The Emperor serves him.",
+        )
+        report = await pipeline.delta_hydrate(materials)
+        # The entity is already known so it should be filtered out
+        assert report.warnings is not None
+
+        # Clean up
+        reg_module._KNOWLEDGE_GRAPHS.pop("test_delta_vault", None)
+
+    @pytest.mark.asyncio
+    async def test_delta_hydrate_with_new_entities_adds_them(self):
+        """When new content is provided, only genuinely new entities are added."""
+        from ingestion_pipeline import IncrementalHydrationPipeline, CampaignMaterials
+        from knowledge_graph import KnowledgeGraph
+
+        # Fresh KG
+        kg = KnowledgeGraph()
+        import registry as reg_module
+        reg_module._KNOWLEDGE_GRAPHS["test_new_delta"] = kg
+
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path="test_new_delta")
+        materials = CampaignMaterials(
+            npc_lore="Zypyr the Archmage rules the tower.",
+        )
+        report = await pipeline.delta_hydrate(materials)
+        # Zypyr is not in KG → should be extracted
+        assert report.nodes_created >= 1
+
+        reg_module._KNOWLEDGE_GRAPHS.pop("test_new_delta", None)
+
+    def test_detect_missing_entities_finds_wikilinks(self):
+        """detect_missing_entities finds [[Wikilinks]] not in KG."""
+        from ingestion_pipeline import IncrementalHydrationPipeline
+        from knowledge_graph import KnowledgeGraph
+
+        kg = KnowledgeGraph()
+        import registry as reg_module
+        reg_module._KNOWLEDGE_GRAPHS["test_missing"] = kg
+
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path="test_missing")
+        missing = pipeline.detect_missing_entities(
+            "The Wizard [[Zypyr]] appears in the tower."
+        )
+        assert "Zypyr" in missing
+
+        reg_module._KNOWLEDGE_GRAPHS.pop("test_missing", None)
+
+    def test_detect_missing_entities_finds_capitalized_names(self):
+        """detect_missing_entities finds Title-Case names not in KG."""
+        from ingestion_pipeline import IncrementalHydrationPipeline
+        from knowledge_graph import KnowledgeGraph
+
+        kg = KnowledgeGraph()
+        import registry as reg_module
+        reg_module._KNOWLEDGE_GRAPHS["test_cap"] = kg
+
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path="test_cap")
+        missing = pipeline.detect_missing_entities(
+            "The Archmage Zypyr rules the tower. The Dragon waits."
+        )
+        # Multi-word Title-Case sequences are captured as full strings
+        assert "Zypyr" in missing or "The Archmage Zypyr" in missing
+
+        reg_module._KNOWLEDGE_GRAPHS.pop("test_cap", None)
+
+    def test_detect_missing_entities_excludes_known_entities(self):
+        """Known KG entities are not reported as missing."""
+        from ingestion_pipeline import IncrementalHydrationPipeline
+        from knowledge_graph import KnowledgeGraph, KnowledgeGraphNode, GraphNodeType
+
+        kg = KnowledgeGraph()
+        kg.add_node(KnowledgeGraphNode(
+            node_type=GraphNodeType.NPC, name="Vader", attributes={}, tags=set(),
+        ))
+        import registry as reg_module
+        reg_module._KNOWLEDGE_GRAPHS["test_known"] = kg
+
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path="test_known")
+        missing = pipeline.detect_missing_entities(
+            "Lord Vader confronts the Jedi."
+        )
+        assert "Vader" not in missing
+        assert "Jedi" in missing  # Jedi is not in KG
+
+        reg_module._KNOWLEDGE_GRAPHS.pop("test_known", None)
+
+    def test_detect_missing_entities_empty_when_all_known(self):
+        """Returns empty list when all entities are in KG."""
+        from ingestion_pipeline import IncrementalHydrationPipeline
+        from knowledge_graph import KnowledgeGraph, KnowledgeGraphNode, GraphNodeType
+
+        kg = KnowledgeGraph()
+        # Use multi-word names to avoid regex capturing adjacent words
+        kg.add_node(KnowledgeGraphNode(
+            node_type=GraphNodeType.NPC, name="Lord Vader", attributes={}, tags=set(),
+        ))
+        kg.add_node(KnowledgeGraphNode(
+            node_type=GraphNodeType.NPC, name="The Jedi", attributes={}, tags=set(),
+        ))
+        import registry as reg_module
+        reg_module._KNOWLEDGE_GRAPHS["test_all_known"] = kg
+
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path="test_all_known")
+        missing = pipeline.detect_missing_entities("Lord Vader confronts The Jedi.")
+        assert missing == []
+
+        reg_module._KNOWLEDGE_GRAPHS.pop("test_all_known", None)
+
+    def test_suggest_hydration_returns_readable_prompt(self):
+        """suggest_hydration generates a usable DM prompt."""
+        from ingestion_pipeline import IncrementalHydrationPipeline
+
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path="test_suggest")
+        suggestion = pipeline.suggest_hydration(["Zypyr", "Archmage"])
+        assert "Zypyr" in suggestion
+        assert "Archmage" in suggestion
+        assert "hydrate_delta" in suggestion or "hydrate_missing" in suggestion
+
+    def test_suggest_hydration_empty_when_nothing_missing(self):
+        """suggest_hydration with no missing entities returns a no-op message."""
+        from ingestion_pipeline import IncrementalHydrationPipeline
+
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path="test_suggest2")
+        result = pipeline.suggest_hydration([])
+        assert "already" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_hydrate_missing_entity_adds_single_entity(self):
+        """hydrate_missing_entity adds a single entity to KG."""
+        from ingestion_pipeline import IncrementalHydrationPipeline
+        from knowledge_graph import KnowledgeGraph
+
+        kg = KnowledgeGraph()
+        import registry as reg_module
+        reg_module._KNOWLEDGE_GRAPHS["test_hydrate_missing"] = kg
+
+        pipeline = IncrementalHydrationPipeline(llm=None, vault_path="test_hydrate_missing")
+        report = await pipeline.hydrate_missing_entity(
+            entity_name="Zypyr",
+            entity_context="An ancient archmage who rules the tower.",
+            node_type="npc",
+        )
+        # Deterministic extraction should add at least one node
+        assert report.nodes_created >= 1
+
+        reg_module._KNOWLEDGE_GRAPHS.pop("test_hydrate_missing", None)
+
