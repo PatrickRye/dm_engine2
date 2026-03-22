@@ -454,6 +454,13 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
         print(f"[Engine] {attacker.name} is Small/Tiny and wielding a Heavy weapon. Applying DISADVANTAGE.")
         event.payload["disadvantage"] = True
 
+    # REQ-ENV-004/005: Underwater combat penalties
+    is_underwater = any(t.lower() in ["underwater", "submerged"] for t in attacker.tags) or any(
+        c.name.lower() in ["underwater", "submerged"] for c in attacker.active_conditions
+    )
+    has_swim_speed = "swimming_speed" in attacker.tags
+    weapon_is_underwater_safe = WeaponProperty.UNDERWATER_SAFE in weapon.properties
+
     # Evaluate Spatial Logic: Range & Cover
     dist, cover = spatial_service.get_distance_and_cover(attacker.entity_uuid, target.entity_uuid, event.vault_path)
 
@@ -488,6 +495,12 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
             print(f"[Engine] Target is at long range ({dist:.1f}ft > {weapon.normal_range}ft). Applying DISADVANTAGE.")
             event.payload["disadvantage"] = True
 
+        # REQ-ENV-005: Underwater ranged — auto-miss beyond normal range (already handled above),
+        # Disadvantage within normal range unless weapon is underwater-safe
+        if is_underwater and not weapon_is_underwater_safe and not has_swim_speed:
+            print(f"[Engine] {attacker.name} is underwater with a non-aquatic ranged weapon. Applying DISADVANTAGE.")
+            event.payload["disadvantage"] = True
+
         # Check for hostile creatures within 5 feet of the attacker's edge
         check_radius = (attacker.size / 2.0) + 5.0
         nearby_uuids = spatial_service.get_targets_in_radius(attacker.x, attacker.y, check_radius, event.vault_path)
@@ -512,6 +525,11 @@ def resolve_attack_handler(event: GameEvent):  # noqa: C901
                         event.payload["disadvantage"] = True
                 break
     else:
+        # REQ-ENV-004: Underwater melee — Disadvantage unless weapon is underwater-safe or attacker has swim speed
+        if is_underwater and not weapon_is_underwater_safe and not has_swim_speed:
+            print(f"[Engine] {attacker.name} is underwater with a non-aquatic melee weapon. Applying DISADVANTAGE.")
+            event.payload["disadvantage"] = True
+
         # Enforce Reach Limits for Melee Weapons
         # Multiply by 1.5 to safely account for Euclidean distance on diagonals (5ft reach allows ~7.07ft diagonal distance)
         base_reach = 10.0 if WeaponProperty.REACH in weapon.properties else 5.0
@@ -1026,6 +1044,14 @@ def apply_damage_handler(event: GameEvent):
                     return True
             return False
 
+        # REQ-ENV-006: Submerged entities gain Fire resistance
+        is_submerged = any(t.lower() in ["underwater", "submerged"] for t in target.tags) or any(
+            c.name.lower() in ["underwater", "submerged"] for c in target.active_conditions
+        )
+        if is_submerged and damage_type == "fire" and "fire" not in [r.lower() for r in target.resistances]:
+            damage = damage // 2
+            results.append(f"[Engine] {target.name} is submerged — Fire damage halved (REQ-ENV-006).")
+
         # Check for immunities first
         is_magically_silenced = any(
             c.name.lower() == "silenced" and "silence" in c.source_name.lower() for c in target.active_conditions
@@ -1156,6 +1182,36 @@ def handle_rest_event(event: GameEvent):
                     if match:
                         maximum = int(match.group(2))
                         target.resources[res_name] = f"{maximum}/{maximum}"
+
+            # REQ-RST-001: Spend Hit Dice to regain HP during a Short Rest
+            dice_to_spend = event.payload.get("hit_dice_to_spend", 0)
+            if dice_to_spend > 0:
+                # Find the Hit Dice resource (key contains "hit dice", case-insensitive)
+                hd_key = next((k for k in target.resources if "hit dice" in k.lower()), None)
+                if hd_key:
+                    hd_match = re.match(r"(\d+)\s*/\s*(\d+)", str(target.resources[hd_key]))
+                    if hd_match:
+                        hd_current = int(hd_match.group(1))
+                        hd_max = int(hd_match.group(2))
+                        dice_available = min(dice_to_spend, hd_current)
+                        if dice_available > 0:
+                            # Determine die size from resource key, e.g. "Hit Dice (d8)" → "1d8"
+                            die_match = re.search(r"d(\d+)", hd_key, re.IGNORECASE)
+                            die_str = f"1d{die_match.group(1)}" if die_match else "1d8"
+                            con_mod = target.constitution_mod.total if hasattr(target, "constitution_mod") else 0
+                            total_heal = 0
+                            for _ in range(dice_available):
+                                total_heal += max(1, roll_dice(die_str) + con_mod)
+                            old_hp = target.hp.base_value
+                            target.hp.base_value = min(target.max_hp, old_hp + total_heal)
+                            target.resources[hd_key] = f"{hd_current - dice_available}/{hd_max}"
+                            print(
+                                f"[Engine] {target.name} spent {dice_available}x {die_str} Hit Dice "
+                                f"(+{con_mod} CON each). Healed {total_heal} HP "
+                                f"({old_hp} → {target.hp.base_value}). "
+                                f"Hit Dice remaining: {hd_current - dice_available}/{hd_max}."
+                            )
+
             print(f"[Engine] {target.name} finished a Short Rest. [SR] resources restored.")
 
 
@@ -1969,6 +2025,7 @@ def start_of_turn_handler(event: GameEvent):
         return
 
     results = []
+    was_already_dying = any(c.name == "Dying" for c in entity.active_conditions)
 
     # REQ-CLS-001: Rage Maintenance — if still raging but did NOT attack or take damage since last turn, end rage
     if any(c.name.lower() == "raging" for c in entity.active_conditions):
@@ -2027,8 +2084,55 @@ def start_of_turn_handler(event: GameEvent):
                 entity.temp_hp = cond.start_of_turn_thp
                 results.append(f"[Engine] {entity.name} gained {cond.start_of_turn_thp} Temporary HP from {cond.name}.")
 
-    # Evaluate Death Saving Throws
-    if any(c.name == "Dying" for c in entity.active_conditions):
+    # REQ-ENV-007/008: Suffocation — track breath hold and choking per creature
+    # REQ-ENV-003: Low Oxygen environment (smoke, altitude, etc.) uses same breath hold rules
+    is_underwater = any(t.lower() in ["underwater", "submerged"] for t in entity.tags) or any(
+        c.name.lower() in ["underwater", "submerged"] for c in entity.active_conditions
+    )
+    is_low_oxygen = any(c.name.lower() == "low oxygen" for c in entity.active_conditions)
+    has_water_breathing = "water_breathing" in entity.tags or any(
+        c.name.lower() == "water breathing" for c in entity.active_conditions
+    )
+    is_construct = "construct" in entity.tags
+    if (is_underwater or is_low_oxygen) and not has_water_breathing and not is_construct and entity.hp.base_value > 0:
+        con_mod = entity.constitution_mod.total if hasattr(entity, "constitution_mod") else 0
+        # Initialize Breath Hold resource if not yet set (max = max(5, (1+CON)*10) rounds)
+        if "Breath Hold" not in entity.resources:
+            max_hold = max(5, (1 + con_mod) * 10)
+            entity.resources["Breath Hold"] = f"{max_hold}/{max_hold}"
+        hb_match = re.match(r"(\d+)/(\d+)", str(entity.resources["Breath Hold"]))
+        if hb_match:
+            hb_current = int(hb_match.group(1))
+            hb_max = int(hb_match.group(2))
+            if hb_current > 0:
+                # Still holding breath — decrement
+                entity.resources["Breath Hold"] = f"{hb_current - 1}/{hb_max}"
+                results.append(f"[Engine] {entity.name} is holding breath. Breath Hold: {hb_current - 1}/{hb_max} rounds remaining.")
+            else:
+                # Breath exhausted — transition to choking or continue choking
+                max_choke = max(1, 1 + con_mod)
+                if "Choking Rounds" not in entity.resources:
+                    entity.resources["Choking Rounds"] = f"{max_choke}/{max_choke}"
+                    results.append(f"[Engine] {entity.name} has run out of breath! Choking for {max_choke} rounds. (REQ-ENV-007)")
+                else:
+                    choke_match = re.match(r"(\d+)/(\d+)", str(entity.resources["Choking Rounds"]))
+                    if choke_match:
+                        choke_current = int(choke_match.group(1))
+                        choke_max = int(choke_match.group(2))
+                        if choke_current > 0:
+                            entity.resources["Choking Rounds"] = f"{choke_current - 1}/{choke_max}"
+                            results.append(f"[Engine] {entity.name} is choking! {choke_current - 1} rounds until death. (REQ-ENV-008)")
+                        else:
+                            # Choking rounds exhausted — entity drops to 0 HP and starts dying
+                            entity.hp.base_value = 0
+                            if not any(c.name in ["Dying", "Dead"] for c in entity.active_conditions):
+                                entity.active_conditions.append(ActiveCondition(name="Dying"))
+                                entity.active_conditions.append(ActiveCondition(name="Unconscious"))
+                            results.append(f"[Engine] {entity.name} has suffocated! HP dropped to 0. (REQ-ENV-008)")
+                            print(f"[Engine] {entity.name} suffocated.")
+
+    # Evaluate Death Saving Throws (only if entity was already dying at start of turn)
+    if was_already_dying and any(c.name == "Dying" for c in entity.active_conditions):
         roll = random.randint(1, 20)
         if roll == 1:
             entity.death_saves_failures += 2

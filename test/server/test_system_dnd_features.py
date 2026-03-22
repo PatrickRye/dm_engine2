@@ -582,8 +582,9 @@ async def test_system_grapple_contest_success_and_fail(mock_dice):
 
     config = {"configurable": {"thread_id": "default"}}
 
-    # Test 1: Attacker Wins (Roll 15 vs 5)
-    with mock_dice(15, 15, 5):
+    # REQ-ACT-007 (2024): DC = 8 + Orc STR(+4) + prof(+2) = 14. Bard resists with max(STR+0, DEX+2)=+2.
+    # Test 1: Attacker wins — Bard rolls 5+2=7 < DC 14
+    with mock_dice(5):
         res = await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "grapple"}, config=config
         )
@@ -591,14 +592,14 @@ async def test_system_grapple_contest_success_and_fail(mock_dice):
         assert any(c.name == "Grappled" for c in target.active_conditions)
         assert target.movement_remaining == 0
 
-    # Test 2: Defender Wins Tie (Roll 10 vs 12, tying total at 14)
+    # Test 2: Defender wins — Bard rolls 15+2=17 >= DC 14
     target.active_conditions = []
     target.movement_remaining = 30
-    with mock_dice(10, 10, 12):
+    with mock_dice(15):
         res = await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "grapple"}, config=config
         )
-        assert "Defender wins" in res
+        assert "Defender wins" in res or "Defender succeeds" in res
         assert not any(c.name == "Grappled" for c in target.active_conditions)
         assert target.movement_remaining == 30
 
@@ -643,7 +644,8 @@ async def test_system_shove_movement_direction(mock_dice):
 
     config = {"configurable": {"thread_id": "default"}}
 
-    with mock_dice(15, 15, 5):
+    # DC = 8 + Orc STR(+4) + prof(+2) = 14. Bard rolls 5+2=7 < 14 → attacker wins.
+    with mock_dice(5):
         res = await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "shove", "shove_type": "away"}, config=config
         )
@@ -691,8 +693,8 @@ async def test_system_throw_breaks_grapple_and_knocks_prone(mock_dice):
 
     config = {"configurable": {"thread_id": "default"}}
 
-    # 1. Attacker successfully grapples Target
-    with mock_dice(15, 15, 5):
+    # 1. Attacker successfully grapples Target (DC 14, Bard rolls 5+2=7 < 14)
+    with mock_dice(5):
         await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "grapple"}, config=config
         )
@@ -700,8 +702,8 @@ async def test_system_throw_breaks_grapple_and_knocks_prone(mock_dice):
     assert any(c.name == "Grappled" for c in target.active_conditions)
     assert target.movement_remaining == 0
 
-    # 2. Attacker successfully throws Target 15 feet
-    with mock_dice(18, 18, 4):
+    # 2. Attacker successfully throws Target 15 feet (Bard rolls 4+2=6 < DC 14)
+    with mock_dice(4):
         res = await execute_grapple_or_shove.ainvoke(
             {"attacker_name": "Orc", "target_name": "Bard", "action_type": "throw", "throw_distance": 15.0}, config=config
         )

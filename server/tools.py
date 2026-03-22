@@ -23,6 +23,7 @@ from dnd_rules_engine import (
     ModifiableValue,
     NumericalModifier,
     ModifierPriority,
+    WeaponProperty,
 )
 from state import ClassLevel, PCDetails, NPCDetails, LocationDetails, FactionDetails
 from vault_io import (
@@ -388,6 +389,7 @@ async def execute_melee_attack(
     is_reaction: bool = False,
     is_legendary_action: bool = False,
     is_opportunity_attack: bool = False,
+    is_offhand: bool = False,
     manual_roll_total: int = None,
     is_critical: bool = False,
     force_auto_roll: bool = False,
@@ -397,7 +399,10 @@ async def execute_melee_attack(
     """
     STRICT REQUIREMENT: Use this tool to resolve ANY melee attack between two entities.
     Do NOT hallucinate dice rolls or damage. The engine will calculate hit/miss and exact damage.
-    Set is_reaction=True for Reactions or Readied Actions. Set is_opportunity_attack=True for Opportunity Attacks. Set is_legendary_action=True for Legendary Actions.
+    Set is_reaction=True for Reactions or Readied Actions. Set is_opportunity_attack=True for Opportunity Attacks.
+    Set is_legendary_action=True for Legendary Actions.
+    Set is_offhand=True for a Two-Weapon Fighting off-hand Bonus Action attack (REQ-WPN-003) — suppresses ability
+    modifier on damage (unless negative). The off-hand weapon must have the Light property.
     """
     vault_path = config["configurable"].get("thread_id")
     attacker = await _get_entity_by_name(attacker_name, vault_path)
@@ -461,6 +466,16 @@ async def execute_melee_attack(
             return f"SYSTEM ERROR: {attacker.name} has no Legendary Actions remaining."
         attacker.legendary_actions_current -= 1
 
+    # REQ-WPN-003: Off-hand attack requires a Light weapon
+    if is_offhand and isinstance(attacker, Creature) and attacker.equipped_weapon_uuid:
+        offhand_weapon = get_entity(attacker.equipped_weapon_uuid, vault_path)
+        if offhand_weapon and hasattr(offhand_weapon, "properties"):
+            if WeaponProperty.LIGHT not in offhand_weapon.properties:
+                return (
+                    f"SYSTEM ERROR: {attacker.name}'s equipped weapon ({offhand_weapon.name}) does not have the "
+                    f"Light property. Two-Weapon Fighting off-hand attacks require a Light weapon (REQ-WPN-003)."
+                )
+
     current_init = await _get_current_combat_initiative(config["configurable"].get("thread_id"))
     event = GameEvent(
         event_type="MeleeAttack",
@@ -474,6 +489,7 @@ async def execute_melee_attack(
             "is_opportunity_attack": is_opportunity_attack,
             "manual_roll_total": manual_roll_total,
             "is_critical": is_critical,
+            "suppress_ability_mod_damage": is_offhand,
         },
     )
 
@@ -1075,6 +1091,11 @@ async def equip_item(  # noqa: C901
             engine_creature.equipped_weapon_uuid = new_weapon.entity_uuid
         if new_ac_value is not None:
             engine_creature.ac.base_value = new_ac_value
+        # REQ-ARM-001: Heavy armor speed penalty if Str requirement not met
+        if item and isinstance(item, ArmorItem) and target_slot == "armor":
+            pc_str = yaml_data.get("strength", yaml_data.get("str", 10)) if yaml_data else 10
+            if int(pc_str) < item.strength_requirement:
+                engine_creature.speed = max(0, engine_creature.speed - 10)
 
         if old_item and (not getattr(old_item, "requires_attunement", False) or old_item.name in attuned_items):
             for mod in getattr(old_item, "modifiers", []):
@@ -1839,6 +1860,20 @@ async def perform_ability_check_or_save(  # noqa: C901
                     "\nSYSTEM ALERT: Character is in DIM LIGHT. They are lightly obscured and can hide. "
                     "If successful against enemy passive perception, use `toggle_condition` to apply 'Hidden'."
                 )
+            # REQ-ARM-002: Heavy armor stealth disadvantage
+            try:
+                async with read_markdown_entity(file_path) as (yd, _):
+                    armor_name = str(yd.get("equipment", {}).get("armor", "None")).strip()
+                    if armor_name not in ["None", "", "Unarmored"]:
+                        armor_item = await ItemCompendium.load_item(vault_path, armor_name)
+                        if armor_item and isinstance(armor_item, ArmorItem) and armor_item.stealth_disadvantage:
+                            disadvantage = True
+                            illum_alert += (
+                                f"\nSYSTEM ALERT: {character_name} is wearing {armor_name} which imposes "
+                                f"Disadvantage on Stealth checks (REQ-ARM-002)."
+                            )
+            except Exception:
+                pass
 
     exh_penalty = engine_creature.exhaustion_level * 2 if (engine_creature and isinstance(engine_creature, Creature)) else 0
     total -= exh_penalty
@@ -2341,12 +2376,14 @@ async def move_entity(  # noqa: C901
     target_y: float,
     target_z: float = None,
     movement_type: str = "walk",
+    standing_jump: bool = False,
     *,
     config: Annotated[RunnableConfig, InjectedToolArg],
 ) -> str:
     """Moves an entity to a new (X, Y, Z) coordinate on the spatial grid and visually updates the combat whiteboard.
     Valid movement_type values: 'walk', 'jump', 'climb', 'fly', 'teleport', 'crawl', 'disengage', 'forced', 'fall', 'travel'.
-    'walk' and 'crawl' will be blocked by solid walls in a straight line."""
+    'walk' and 'crawl' will be blocked by solid walls in a straight line.
+    Set standing_jump=True for a jump without a 10ft running start (REQ-MOV-010: halves both long and high jump limits)."""
     vault_path = config["configurable"].get("thread_id")
     entity = await _get_entity_by_name(entity_name, vault_path)
     if not entity:
@@ -2397,12 +2434,21 @@ async def move_entity(  # noqa: C901
                 f"4. **Magic:** Spells like Misty Step can `teleport` past obstacles."
             )
     elif movement_type.lower() == "jump":
+        # REQ-MOV-010: Standing jump halves both long and high jump limits
         str_score = (entity.strength_mod.total * 2) + 10
         run_high = 3 + entity.strength_mod.total
-        if dz > run_high or dist_3d > str_score:
+        if standing_jump:
+            max_long = str_score // 2
+            max_high = max(1, run_high // 2)
+            limit_note = f"standing long-jump: {max_long}ft, standing high-jump: {max_high}ft (halved — no running start)"
+        else:
+            max_long = str_score
+            max_high = run_high
+            limit_note = f"running long-jump: {str_score}ft, running high-jump: {run_high}ft"
+        if dz > max_high or dist_3d > max_long:
             return (
-                f"SYSTEM ERROR: Jump exceeds physical limits. Max running long-jump: {str_score}ft. "  # noqa: E501
-                f"Max running high-jump: {run_high}ft. Call perform_ability_check_or_save for Athletics to push limits."  # noqa: E501
+                f"SYSTEM ERROR: Jump exceeds physical limits. Max {limit_note}. "
+                f"Call perform_ability_check_or_save for Athletics to push limits."
             )
 
     # --- Determine if in active combat to enforce budget (Paradigm check) ---
@@ -2868,8 +2914,17 @@ async def use_ability_or_spell(  # noqa: C901
         vsm_error = ""
 
         # REQ-SND-001: Verbal Verification
-        if v_req and any(c.name.lower() in ["silenced", "gagged"] for c in getattr(caster, "active_conditions", [])):
-            vsm_error = f"SYSTEM ERROR: {caster.name} cannot cast '{ability_display_name}' because it requires Verbal (V) components and they are Silenced/Gagged. (REQ-SND-001)"
+        caster_conds = [c.name.lower() for c in getattr(caster, "active_conditions", [])]
+        caster_tags = getattr(caster, "tags", [])
+        is_underwater_no_breath = (
+            any(t in caster_tags for t in ["underwater", "submerged"]) or any(t in caster_conds for t in ["underwater", "submerged"])
+        ) and "water_breathing" not in caster_tags and not any(c == "water breathing" for c in caster_conds)
+        if v_req and (
+            any(c in caster_conds for c in ["silenced", "gagged"])
+            or is_underwater_no_breath
+        ):
+            reason = "Silenced/Gagged" if any(c in caster_conds for c in ["silenced", "gagged"]) else "submerged underwater without Water Breathing"
+            vsm_error = f"SYSTEM ERROR: {caster.name} cannot cast '{ability_display_name}' because it requires Verbal (V) components and they are {reason}. (REQ-SND-001)"
 
         # REQ-SPL-014: Bound check
         if (
@@ -3330,10 +3385,18 @@ async def spawn_summon(
 
 
 @tool
-async def take_rest(character_names: list[str], rest_type: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+async def take_rest(
+    character_names: list[str],
+    rest_type: str,
+    hit_dice_to_spend: int = 0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
     """
     Use this tool when characters explicitly take a Short or Long Rest.
     It automatically advances time and signals the engine to heal and recharge resources.
+    For Short Rests, pass hit_dice_to_spend to roll Hit Dice and regain HP (REQ-RST-001).
+    The engine rolls the dice, adds CON modifier, and applies healing up to max HP.
     """
     hours_to_advance = 8 if rest_type.lower() == "long" else 1
     await advance_time.ainvoke({"hours": hours_to_advance}, config)
@@ -3349,7 +3412,11 @@ async def take_rest(character_names: list[str], rest_type: str, *, config: Annot
             event_type="Rest",
             source_uuid=uuids[0],
             vault_path=config["configurable"].get("thread_id"),
-            payload={"rest_type": rest_type.lower(), "target_uuids": uuids},
+            payload={
+                "rest_type": rest_type.lower(),
+                "target_uuids": uuids,
+                "hit_dice_to_spend": hit_dice_to_spend,
+            },
         )
         await EventBus.adispatch(event)
 
@@ -4054,6 +4121,14 @@ async def toggle_condition(  # noqa: C901
                 f"\nSYSTEM ALERT: '{condition_name.capitalize()}' restricts actions and movement. "
                 f"Review the specific ability rules."
             )
+        elif cond_lower == "low oxygen":
+            # REQ-ENV-003: Low Oxygen Environment (smoke, altitude, thin air, etc.)
+            result_msg += (
+                f"\nSYSTEM ALERT (REQ-ENV-003): {character_name} is in a low-oxygen environment. "
+                f"Each StartOfTurn they will begin tracking Breath Hold (same as underwater suffocation rules). "
+                f"Constructs, undead, and creatures with Water Breathing or similar traits are immune — "
+                f"do NOT apply this condition to them."
+            )
 
     return result_msg
 
@@ -4187,29 +4262,27 @@ async def execute_grapple_or_shove(
     if not attacker or not target:
         return "SYSTEM ERROR: Attacker or Target not found in active memory."
 
-    att_roll1, att_roll2 = random.randint(1, 20), random.randint(1, 20)
+    # REQ-ACT-007: 2024 update — target makes Str or Dex SAVE vs attacker's DC
+    # DC = 8 + attacker STR mod + proficiency bonus (derived from character level)
+    char_level = attacker.character_level if hasattr(attacker, "character_level") and attacker.character_level > 0 else 1
+    prof_bonus = max(2, (char_level - 1) // 4 + 2)
+    save_dc = 8 + attacker.strength_mod.total + prof_bonus
+
+    tgt_roll1, tgt_roll2 = random.randint(1, 20), random.randint(1, 20)
     if advantage and not disadvantage:
-        att_roll = max(att_roll1, att_roll2)
+        tgt_roll = max(tgt_roll1, tgt_roll2)
     elif disadvantage and not advantage:
-        att_roll = min(att_roll1, att_roll2)
+        tgt_roll = min(tgt_roll1, tgt_roll2)
     else:
-        att_roll = att_roll1
+        tgt_roll = tgt_roll1
 
-    tgt_roll = random.randint(1, 20)
-
-    # Force engine to evaluate accurate modifiers natively
-    attacker_mod = attacker.strength_mod.total
-    target_mod = max(
-        target.strength_mod.total, target.dexterity_mod.total
-    )  # Target resists with better of Athletics/Acrobatics
-
-    att_total = att_roll + attacker_mod
+    target_mod = max(target.strength_mod.total, target.dexterity_mod.total)
     tgt_total = tgt_roll + target_mod
 
-    log = f"Contest: {attacker.name} ({att_roll} + {attacker_mod} = {att_total}) vs {target.name} ({tgt_roll} + {target_mod} = {tgt_total}). "
+    log = f"Grapple/Shove DC {save_dc}: {target.name} rolls {tgt_roll} + {target_mod} = {tgt_total}. "
 
-    # In D&D 5e, ties result in the situation remaining unchanged (defender wins ties).
-    if att_total > tgt_total:
+    # Target fails the save (total < DC) → attacker succeeds
+    if tgt_total < save_dc:
         log += "Attacker wins! "
         if action_type.lower() == "grapple":
             await toggle_condition.ainvoke(
@@ -4254,7 +4327,7 @@ async def execute_grapple_or_shove(
                     )
                     log += f" {target.name} lands Prone."
     else:
-        log += "Defender wins! Nothing happens."
+        log += f"Defender succeeds (rolled {tgt_total} vs DC {save_dc})! Nothing happens."
 
     return f"MECHANICAL TRUTH: {log}"
 

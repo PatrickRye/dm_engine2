@@ -114,6 +114,7 @@ class WeaponProperty(str, Enum):
     REACH = "reach"
     HEAVY = "heavy"
     SPECIAL = "special"
+    UNDERWATER_SAFE = "underwater_safe"  # REQ-ENV-004/005: weapon usable without penalty underwater
 
 
 class Weapon(BaseGameEntity):
