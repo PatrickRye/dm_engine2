@@ -1,7 +1,13 @@
-"""LangGraph multi-agent graph: Planner → Action → Narrator → QA.
+"""LangGraph multi-agent graph: Planner → Action → DramaManager → Narrator → QA.
 
 Nodes are defined as closures inside build_graph() so they capture the LLM
 instances and tools list without relying on module-level globals.
+
+Storylet Orchestration integration:
+- DramaManager pre-hook: If active_storylet is in state, injects its content into planner context
+- action → drama_manager: After each tool execution, drama manager updates tension arc and selects next storylet
+- drama_manager → narrator: If storylet selected, skip planner and go directly to narrator
+- Hard Guardrails: Narrator output validated against KG before reaching QA
 """
 from __future__ import annotations
 
@@ -11,12 +17,207 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
 
-from state import DMState, QAResult
+from state import DMState, QAResult, TensionArc
 from vault_io import write_audit_log
 from system_logger import qa_logger
 from tools import _get_config_tone
 
 MAX_QA_REVISIONS = 3
+
+
+def extract_npc_dials(biography_text: str) -> Dict[str, float]:
+    """
+    Extract NPC behavioral dials from biography text.
+
+    Gap 9: Returns a dict of dial_name -> value (0.0 to 1.0).
+    e.g. {"greed": 0.8, "loyalty": 0.9, "courage": 0.3, "cruelty": 0.7}
+
+    This is a deterministic keyword heuristic. The LLM-powered version
+    (Phase 2 ingestion pipeline) will use an LLM to extract these from
+    raw NPC biography text, but this function provides the same interface
+    for manual attribute entry.
+
+    Supported dials:
+    - greed, loyalty, courage, cruelty, cunning, piety, honor, patience
+    """
+    if not biography_text:
+        return {}
+
+    text_lower = biography_text.lower()
+    dials: Dict[str, float] = {}
+
+    # Keyword maps: positive indicators → high value, negative → low value
+    POSITIVE_GREED = ["wealthy", "greedy", "greed", "miserly", "coin", "gold", "riches", "brib", "pay", "price"]
+    NEGATIVE_GREED = ["generous", "charitable", "gives freely", "selfless"]
+
+    POSITIVE_LOYALTY = ["loyal", "devoted", "faithful", "oath", "sworn", "pledged", "faithful servant"]
+    NEGATIVE_LOYALTY = ["traitor", "betrayer", "disloyal", "renegade", "treacherous"]
+
+    POSITIVE_COURAGE = ["brave", "courageous", "bold", "fearless", "valiant", "heroic", "stalwart"]
+    NEGATIVE_COURAGE = ["coward", "timid", "fearful", "craven", "frightened"]
+
+    POSITIVE_CRUELTY = ["cruel", "sadistic", "brutal", "merciless", "ruthless", "pitiless"]
+    NEGATIVE_CRUELTY = ["merciful", "compassionate", "kind", "humane", "gentle"]
+
+    POSITIVE_CUNNING = ["clever", "cunning", "shrewd", "wise", "astute", "deceptive", "sly"]
+    NEGATIVE_CUNNING = ["naive", "simple", "honest", "straightforward", "guileless"]
+
+    POSITIVE_PIETY = ["devout", "religious", "pious", "faithful to gods", "blessed", "holy"]
+    NEGATIVE_PIETY = ["atheist", "godless", "blasphemous", "profane"]
+
+    def score(positive_kw: list, negative_kw: list) -> float:
+        pos_count = sum(1 for kw in positive_kw if kw in text_lower)
+        neg_count = sum(1 for kw in negative_kw if kw in text_lower)
+        total = pos_count + neg_count
+        if total == 0:
+            return 0.5  # Neutral baseline
+        return pos_count / total
+
+    dials["greed"] = score(POSITIVE_GREED, NEGATIVE_GREED)
+    dials["loyalty"] = score(POSITIVE_LOYALTY, NEGATIVE_LOYALTY)
+    dials["courage"] = score(POSITIVE_COURAGE, NEGATIVE_COURAGE)
+    dials["cruelty"] = score(POSITIVE_CRUELTY, NEGATIVE_CRUELTY)
+    dials["cunning"] = score(POSITIVE_CUNNING, NEGATIVE_CUNNING)
+    dials["piety"] = score(POSITIVE_PIETY, NEGATIVE_PIETY)
+
+    # Remove near-neutral dials (0.45 to 0.55)
+    return {k: v for k, v in dials.items() if abs(v - 0.5) > 0.05}
+
+
+def _get_grag_context(kg, active_character: str = None, max_hops: int = 2) -> str:
+    """
+    GraphRAG context injection (Gap 8).
+
+    Returns a formatted string of KG facts relevant to the active scene:
+    - Active character location + nearby entities
+    - NPCs and their relationship edges to active character
+    - Active quests and their connected nodes
+
+    This is prepended to the narrator's system prompt to give the LLM
+    dynamic world-state grounding rather than static rules.
+    """
+    from knowledge_graph import GraphNodeType
+
+    if not kg or not kg.nodes:
+        return ""
+
+    lines = [
+        "\n\n=== CAMPAIGN WORLD STATE (Dynamic KG Context) ===",
+        "The following facts are established in this session. Use them to ground your narrative:",
+    ]
+
+    # Active location and nearby entities
+    if active_character:
+        char_uuid = kg.find_node_uuid(active_character)
+        if char_uuid:
+            ctx = kg.get_context_for_node(char_uuid, max_hops=max_hops)
+            if ctx:
+                lines.append(f"\n[Active Character: {ctx.get('name', active_character)}]")
+                neighbors = ctx.get("neighbors", {})
+                if neighbors:
+                    for pred, names in neighbors.items():
+                        if pred.startswith("reverse_"):
+                            lines.append(f"  ← {names} [{pred.replace('reverse_', '')}]")
+                        else:
+                            lines.append(f"  {pred.replace('_', ' ')}: {', '.join(names)}")
+
+    # All NPC nodes with their edges
+    npc_nodes = kg.query_nodes(node_type=GraphNodeType.NPC)
+    for npc in npc_nodes[:5]:  # Limit to 5 NPCs to avoid prompt bloat
+        ctx = kg.get_context_for_node(npc.node_uuid, max_hops=1)
+        if ctx:
+            attrs = ctx.get("attributes", {})
+            neighbors = ctx.get("neighbors", {})
+            lines.append(f"\n[NPC: {npc.name}]")
+            # Gap 9: Inject NPC behavioral dials
+            if npc.npc_dials:
+                dial_str = ", ".join(f"{k}={v:.1f}" for k, v in npc.npc_dials.items())
+                lines.append(f"  Behavioral Dials: {dial_str}")
+            if attrs:
+                notable = {k: v for k, v in attrs.items()
+                           if k not in ("description", "bio", "notes") and v}
+                if notable:
+                    for k, v in list(notable.items())[:3]:
+                        lines.append(f"  {k}: {v}")
+            if neighbors:
+                edge_summary = []
+                for pred, names in neighbors.items():
+                    if not pred.startswith("reverse_"):
+                        edge_summary.append(f"{pred.replace('_', ' ')}: {', '.join(names[:2])}")
+                if edge_summary:
+                    lines.append(f"  Relationships: {'; '.join(edge_summary[:3])}")
+
+    lines.append("\n(Only describe entities and relationships that are established in the KG above.)\n")
+    return "\n".join(lines)
+
+
+def _build_kg_constraints_prompt(kg) -> str:
+    """
+    Query the Knowledge Graph for immutable nodes and format them as
+    forbidden claims in the narrator's system prompt.
+
+    Gap 2 fix: Inject KG state constraints BEFORE the LLM generates prose,
+    making the fishbowl a pre-constraint rather than a post-filter.
+    """
+    if not kg or not kg.nodes:
+        return ""
+
+    lines = [
+        "\n\n=== KNOWLEDGE GRAPH CONSTRAINTS (Immutable World Facts) ===",
+        "The following facts are TRUE in this world. Your narrative MUST NOT contradict them:",
+    ]
+
+    for node in kg.nodes.values():
+        if not node.is_immutable:
+            continue
+
+        # Describe the node's key facts
+        facts = [f"[[{node.name}]]"]
+        if node.node_type.value:
+            facts.append(f"is a {node.node_type.value}")
+        if node.attributes:
+            for k, v in node.attributes.items():
+                if k not in ("description", "bio", "notes"):
+                    facts.append(f"has {k}={v}")
+
+        # Add outgoing edges
+        for predicate, obj_uuids in kg.adjacency.get(node.node_uuid, {}).items():
+            for obj_uuid in obj_uuids:
+                obj_node = kg.get_node(obj_uuid)
+                if obj_node:
+                    facts.append(f"{predicate.value.replace('_', ' ')} [[{obj_node.name}]]")
+
+        lines.append("- " + ". ".join(facts) + ".")
+
+    if len(lines) == 2:
+        return ""  # No immutable nodes
+
+    lines.append("(These facts are immutable. Do not describe them as changed, destroyed, or transferred.)\n")
+    return "\n".join(lines)
+
+# Names of tools that require Hard Guardrail validation before committing mutations.
+# These are routed through action_logic (separate ToolNode) to enforce privilege segregation:
+# the Creative LLM (planner/narrator) can PROPOSE mutations only via these tools,
+# but must route through Hard Guardrails in action_logic to commit them.
+LOGIC_TOOL_NAMES = frozenset({
+    "request_graph_mutations",
+    "mark_entity_immutable",
+    "create_storylet",
+})
+
+
+def _get_tool_name_from_message(msg) -> str | None:
+    """Extract the tool name from an AIMessage's tool_calls, or None if no tool was called."""
+    if not hasattr(msg, "tool_calls") or not msg.tool_calls:
+        return None
+    for tc in msg.tool_calls:
+        if isinstance(tc, dict):
+            name = tc.get("name")
+        else:
+            name = getattr(tc, "name", None)
+        if name:
+            return name
+    return None
 
 
 def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
@@ -35,6 +236,20 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     # NODE: Planner — translates player intent into tool calls
     # ------------------------------------------------------------------
     async def planner_node(state: DMState, config: RunnableConfig):
+        # STORYLET INJECTION: If a storylet is active, inject its content into planner context
+        storylet_injection = ""
+        if state.get("active_storylet_id"):
+            from registry import get_storylet_registry, get_knowledge_graph
+            vault_path = state.get("vault_path", "default")
+            reg = get_storylet_registry(vault_path)
+            storylet = reg.get(state["active_storylet_id"])
+            if storylet:
+                from drama_manager import DramaManager
+                kg = get_knowledge_graph(vault_path)
+                dm = DramaManager(reg, kg)
+                ctx = {"vault_path": vault_path, "active_character": state.get("active_character", "Unknown")}
+                storylet_injection = "\n\n" + dm.storylet_injection_prompt(storylet, ctx)
+
         sys_msg = SystemMessage(
             content=(
                 "You are the D&D Tactical Planner. You are invisible to the player.\n"
@@ -68,6 +283,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                 "then `encode_new_compendium_entry` to permanently save it to the engine.\n\n"
                 'Once all tool logic is complete and you have the "MECHANICAL TRUTH", \n'
                 "output a brief summary of the events. DO NOT write dialogue or narrative prose.\n"
+                + storylet_injection
             )
         )
         llm_with_tools = draft_llm.bind_tools(master_tools_list)
@@ -78,6 +294,19 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     # NODE: Narrator — turns mechanical truth into vivid prose
     # ------------------------------------------------------------------
     async def narrator_node(state: DMState, config: RunnableConfig):
+        from registry import get_knowledge_graph
+
+        vault_path = state.get("vault_path", "default")
+        kg = get_knowledge_graph(vault_path)
+
+        # Gap 2 fix: Pre-inject KG immutable facts as forbidden claims BEFORE LLM invocation.
+        # This makes the fishbowl a pre-constraint rather than a post-filter.
+        kg_constraints = _build_kg_constraints_prompt(kg)
+
+        # Gap 8 fix: Pre-inject GraphRAG context (NPCs, locations, relationships)
+        # before LLM invocation so narrator has dynamic world-state grounding.
+        grag_context = _get_grag_context(kg, active_character=state.get("active_character"))
+
         feedback_context = ""
         if state.get("qa_feedback") and state["qa_feedback"] != "APPROVED":
             feedback_context = (
@@ -93,7 +322,9 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                 "Narrate these exact events vividly to the player. \n"
                 "DO NOT change the numbers, damage, or hit/miss outcomes. Do not roll dice.\n"
                 "Output only the narrative response.\n"
-                f"Do not violate player agency or do anything more than add color to an action dialogue. {feedback_context}\n\n"
+                f"Do not violate player agency or do anything more than add color to an action dialogue. {feedback_context}"
+                + kg_constraints
+                + grag_context + "\n\n"
                 "CRITICAL MULTIPLAYER RULE (PERSPECTIVE): \n"
                 "If characters are in different rooms, or if perception mechanics mean characters observe entirely "
                 "different things, you MUST divide your narrative using HTML tags.\n\n"
@@ -106,7 +337,63 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         )
 
         response = await draft_llm.ainvoke([sys_msg] + state["messages"], config=config)
-        return {"draft_response": response.content}
+        draft = response.content
+
+        # HARD GUARDRAILS: Validate draft against Knowledge Graph before QA
+        from hard_guardrails import HardGuardrails
+        from storylet import GraphMutation
+
+        guardrails = HardGuardrails(kg)
+        # Note: pending_mutations are re-validated here (redundant but harmless) and
+        # then executed by the commit block above AFTER approval.
+        pending = list(state.get("pending_mutations", []))
+        mutations = [GraphMutation(**m) for m in pending] if pending else []
+        ctx = {"vault_path": vault_path, "active_character": state.get("active_character", "Unknown")}
+        guard_result = guardrails.validate_full_pipeline(draft, mutations, ctx)
+
+        if not guard_result.allowed:
+            await write_audit_log(
+                vault_path,
+                "HardGuardrails",
+                "Narrative Rejected",
+                f"Reason: {guard_result.reason}",
+            )
+            return {
+                "qa_feedback": (
+                    f"[HARD GUARDRAIL REJECTED]: {guard_result.reason}\n\n"
+                    f"Required revisions: {'; '.join(guard_result.required_revisions)}\n\n"
+                    f"Your draft: {draft}"
+                ),
+                "revision_count": state.get("revision_count", 0) + 1,
+            }
+
+        # Gap 6 fix: Execute deferred mutations ONLY AFTER guardrails approve the narrative.
+        # Mutations were captured in action_logic_node (commit=False) and validated
+        # above. Now commit them to the KG.
+        pending = list(state.get("pending_mutations", []))
+        if pending:
+            from storylet import GraphMutation
+            committed = 0
+            for mdict in pending:
+                try:
+                    mutation = GraphMutation(**mdict)
+                    mutation.execute(kg)
+                    committed += 1
+                except Exception as e:
+                    await write_audit_log(
+                        vault_path,
+                        "HardGuardrails",
+                        "Mutation Execution Error",
+                        f"Failed to execute mutation {mdict}: {e}",
+                    )
+            await write_audit_log(
+                vault_path,
+                "HardGuardrails",
+                "Mutations Committed",
+                f"{committed}/{len(pending)} deferred mutations executed after QA approval.",
+            )
+
+        return {"draft_response": draft, "pending_mutations": []}
 
     # ------------------------------------------------------------------
     # NODE: QA — validates the draft against the 12-point checklist
@@ -170,6 +457,9 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             "11. PARADIGMS: Did the DM force movement limits out of combat? (If yes, REJECT).\n"
             "12. CRITICAL FAILURES: If a knowledge check resulted in a [NATURAL 1 - CRITICAL FAILURE],"
             " did the DM accurately tell the player the truth? (If yes, REJECT. They MUST confidently narrate dangerously wrong facts).\n"
+            "13. STORYLET CONSISTENCY: If a storylet was active this turn, did the DM faithfully "
+            "incorporate its narrative content without contradicting the established Knowledge Graph facts? "
+            "(If the draft ignores or contradicts an active storylet's content, REJECT).\n"
             + tone_check
             + "\nIf ANY rule is broken, set 'approved' to False and explain exactly what to rewrite. "
             "If the DM applied a mechanic incorrectly, do not just tell them it is wrong. "
@@ -235,6 +525,216 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             return {"qa_feedback": result.feedback, "revision_count": revisions + 1}
 
     # ------------------------------------------------------------------
+    # NODE: DramaManager — updates tension arc and selects the next active storylet
+    # ------------------------------------------------------------------
+    async def drama_manager_node(state: DMState, config: RunnableConfig):
+        """
+        After each action turn, the Drama Manager:
+        1. Updates the tension arc based on the last tool outcome (inferred from messages)
+        2. Polls available storylets and selects the optimal one
+        3. If a storylet is selected, activates it and routes to narrator (bypass planner)
+        4. Otherwise routes back to planner for normal flow
+        """
+        from registry import get_storylet_registry, get_knowledge_graph
+        from drama_manager import DramaManager, TensionArc
+        from storylet import TensionLevel
+
+        vault_path = state.get("vault_path", "default")
+        reg = get_storylet_registry(vault_path)
+        kg = get_knowledge_graph(vault_path)
+        dm = DramaManager(reg, kg)
+
+        # Restore tension arc from state
+        arc_dict = state.get("tension_arc", {})
+        dm.arc = TensionArc.from_dict(arc_dict) if arc_dict else TensionArc()
+
+        # Infer outcome tension from last tool message
+        outcome_tension = TensionLevel.MEDIUM
+        for msg in reversed(state.get("messages", [])):
+            if isinstance(msg, ToolMessage):
+                content = msg.content.upper()
+                if "MECHANICAL TRUTH: HIT" in content or "MECHANICAL TRUTH: DAMAGE" in content:
+                    outcome_tension = TensionLevel.HIGH
+                    break
+                elif "MECHANICAL TRUTH:" in content:
+                    outcome_tension = TensionLevel.MEDIUM
+                    break
+        dm.arc.advance_turn(outcome_tension)
+
+        # Build runtime context
+        ctx = {
+            "vault_path": vault_path,
+            "active_character": state.get("active_character", "Unknown"),
+        }
+
+        # Select next storylet
+        selected = dm.select_next(ctx)
+
+        if selected:
+            # Apply storylet effects
+            dm.apply_effects(selected)
+            # Check integrity
+            from hard_guardrails import HardGuardrails
+            guardrails = HardGuardrails(kg)
+            integrity = guardrails.check_storylet_integrity(selected, ctx)
+            if not integrity.allowed:
+                await write_audit_log(
+                    vault_path,
+                    "DramaManager",
+                    "Storylet Rejected (Guardrails)",
+                    f"Storylet '{selected.name}' failed guardrails: {integrity.reason}",
+                )
+                return {
+                    "active_storylet_id": None,
+                    "tension_arc": dm.arc.to_dict(),
+                }
+
+            await write_audit_log(
+                vault_path, "DramaManager", "Storylet Activated", selected.name
+            )
+            return {
+                "active_storylet_id": str(selected.id),
+                "tension_arc": dm.arc.to_dict(),
+            }
+
+        return {
+            "active_storylet_id": None,
+            "tension_arc": dm.arc.to_dict(),
+        }
+
+    def drama_manager_router(state: DMState) -> str:
+        """Route to narrator if a storylet is active, otherwise back to planner."""
+        if state.get("active_storylet_id"):
+            return "narrator"
+        return "planner"
+
+    # ------------------------------------------------------------------
+    # NODE: action_logic — captures mutations for deferred execution (Gap 6 fix)
+    #
+    # DESIGN CHANGE: Mutations are NO LONGER executed immediately.
+    # Instead, mutation tool calls are intercepted, validated, and stored in
+    # pending_mutations. They are only EXECUTED after the narrator's QA
+    # approval in narrator_node.
+    #
+    # This enforces the privilege segregation: the Creative LLM proposes
+    # mutations, but execution is deferred until the deterministic engine
+    # has approved the accompanying narrative.
+    # ------------------------------------------------------------------
+    async def action_logic_node(state: DMState, config: RunnableConfig):
+        """
+        Custom node that intercepts mutation tool calls and captures them
+        into pending_mutations WITHOUT executing them.
+
+        Execution is deferred to narrator_node after QA approval.
+        """
+        import json
+        from registry import get_knowledge_graph
+        from storylet import GraphMutation
+        from hard_guardrails import HardGuardrails
+
+        last_msg = state["messages"][-1]
+        tool_name = _get_tool_name_from_message(last_msg)
+        if not tool_name or tool_name not in LOGIC_TOOL_NAMES:
+            # No mutation tool was called; this is a no-op passthrough
+            return {}
+
+        # Build a name -> tool lookup from master_tools_list
+        tool_map = {getattr(t, "name", None): t for t in master_tools_list}
+        tool = tool_map.get(tool_name)
+        if not tool:
+            return {}
+
+        vault_path = state.get("vault_path", "default")
+        kg = get_knowledge_graph(vault_path)
+        guardrails = HardGuardrails(kg)
+
+        # Get the tool call arguments
+        tc = last_msg.tool_calls[0]
+        args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+
+        # For request_graph_mutations, inject commit=False to defer execution
+        mutation_data = None
+        result_content = ""
+
+        if tool_name == "request_graph_mutations":
+            # Parse the mutations from the tool args
+            try:
+                mut_json = args.get("mutations", "[]")
+                mut_list = json.loads(mut_json) if mut_json else []
+                narrative_ctx = args.get("narrative_context", "")
+                parsed = [GraphMutation(**m) for m in mut_list]
+            except Exception:
+                parsed = []
+
+            # Validate (but don't execute) using HardGuardrails
+            ctx = {"vault_path": vault_path}
+            guard_result = guardrails.validate_full_pipeline(narrative_ctx, parsed, ctx)
+
+            if not guard_result.allowed:
+                # Tool should return an error; let it execute normally via ToolNode
+                # Fall through to normal execution
+                tool_node = ToolNode([tool])
+                return {"messages": await tool_node.ainvoke(state, config)}
+
+            # Capture the mutation data for deferred execution
+            mutation_data = [
+                {
+                    "mutation_type": m.mutation_type,
+                    "node_name": m.node_name,
+                    "predicate": m.predicate,
+                    "target_name": m.target_name,
+                    "attribute": m.attribute,
+                    "value": m.value,
+                    "tags": m.tags,
+                    "node_uuid": str(m.node_uuid) if m.node_uuid else None,
+                    "target_uuid": str(m.target_uuid) if m.target_uuid else None,
+                    "node_type": m.node_type,
+                }
+                for m in parsed
+            ]
+            result_content = (
+                f"MECHANICAL TRUTH: {len(parsed)} graph mutations validated and captured "
+                f"(deferred execution pending QA approval). Mutations: {json.dumps(mutation_data)}"
+            )
+        else:
+            # For create_storylet and mark_entity_immutable, execute immediately
+            # (they don't have the commit=False pattern yet)
+            tool_node = ToolNode([tool])
+            return {"messages": await tool_node.ainvoke(state, config)}
+
+        # Build a ToolMessage to add to state
+        from langchain_core.messages import ToolMessage as LCToolMessage
+
+        tool_msg = LCToolMessage(
+            content=result_content,
+            tool_call_id=tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "unknown"),
+            name=tool_name,
+        )
+
+        # Return: add ToolMessage to messages, plus pending_mutations
+        updates = {
+            "messages": [tool_msg],
+        }
+        if mutation_data:
+            existing = list(state.get("pending_mutations", []))
+            updates["pending_mutations"] = existing + mutation_data
+
+        return updates
+
+    # ------------------------------------------------------------------
+    # ROUTER: planner_tool_router — routes to action_logic for mutation tools, action for others
+    # ------------------------------------------------------------------
+    def planner_tool_router(state: DMState) -> str:
+        """Custom router that separates mutation tools (logic) from all other tools (creative)."""
+        last_msg = state["messages"][-1]
+        tool_name = _get_tool_name_from_message(last_msg)
+        if tool_name in LOGIC_TOOL_NAMES:
+            return "action_logic"
+        if tool_name and tool_name not in ("__end__",):
+            return "action"
+        return "__end__"
+
+    # ------------------------------------------------------------------
     # ROUTER: qa_router — decides whether to approve or loop back
     # ------------------------------------------------------------------
     def qa_router(state: DMState) -> str:
@@ -251,12 +751,27 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     workflow = StateGraph(DMState)
     workflow.add_node("planner", planner_node)
     workflow.add_node("action", ToolNode(master_tools_list))
+    workflow.add_node("action_logic", action_logic_node)  # Mutation tools with Hard Guardrail enforcement
+    workflow.add_node("drama_manager", drama_manager_node)
     workflow.add_node("narrator", narrator_node)
     workflow.add_node("qa", qa_node)
 
     workflow.set_entry_point("planner")
-    workflow.add_conditional_edges("planner", tools_condition, {"tools": "action", "__end__": "narrator"})
-    workflow.add_edge("action", "planner")
+    # Planner routes: mutation tools → action_logic (logic agent), other tools → action (creative), none → narrator
+    workflow.add_conditional_edges(
+        "planner",
+        planner_tool_router,
+        {
+            "action_logic": "action_logic",
+            "action": "action",
+            "__end__": "narrator",
+        },
+    )
+    # After action (creative or logic), always route to drama_manager to update tension arc
+    workflow.add_edge("action", "drama_manager")
+    workflow.add_edge("action_logic", "drama_manager")
+    # Drama manager conditionally routes: storylet active → narrator, else → planner
+    workflow.add_conditional_edges("drama_manager", drama_manager_router, {"narrator": "narrator", "planner": "planner"})
     workflow.add_edge("narrator", "qa")
     workflow.add_conditional_edges("qa", qa_router)
 

@@ -1,7 +1,18 @@
-from typing import TypedDict, Annotated, List, Optional
+from typing import TypedDict, Annotated, List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+
+from storylet import TensionLevel
+
+
+class TensionArc(BaseModel):
+    """Tracks the session's dramatic pacing."""
+    current_tension: TensionLevel = TensionLevel.MEDIUM
+    target_tension: TensionLevel = TensionLevel.MEDIUM
+    consecutive_low: int = 0
+    consecutive_high: int = 0
+    session_turns: int = 0
 
 
 class DMState(TypedDict):
@@ -11,6 +22,11 @@ class DMState(TypedDict):
     draft_response: str
     qa_feedback: str
     revision_count: int
+    # Storylet orchestration fields
+    knowledge_graph: Any  # KnowledgeGraph instance (set at runtime)
+    active_storylet_id: Optional[str] = None  # UUID string of active storylet
+    pending_mutations: List[Dict[str, Any]] = Field(default_factory=list)
+    tension_arc: Dict[str, Any] = Field(default_factory=dict)  # Serialized TensionArc
 
 
 class QAResult(BaseModel):

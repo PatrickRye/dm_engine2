@@ -8,7 +8,7 @@ import aiofiles
 from filelock.asyncio import AsyncSoftFileLock
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool, InjectedToolArg
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Any
 from contextlib import asynccontextmanager
 import glob
 from dnd_rules_engine import (
@@ -20,6 +20,65 @@ from dnd_rules_engine import (
     ActiveCondition,
     parse_duration_to_seconds,
 )
+
+# -------------------------------------------------------------------
+# Modifier serialization helpers — bridges engine state to YAML
+# -------------------------------------------------------------------
+
+
+def _serialize_modifiers(modifiers: list[NumericalModifier]) -> list[dict]:
+    """Serialize a list of NumericalModifiers to a plain dict list for YAML."""
+    return [
+        {
+            "priority": m.priority.value,
+            "value": m.value,
+            "source_name": m.source_name,
+            "duration_seconds": m.duration_seconds,
+            "duration_events": m.duration_events,
+        }
+        for m in modifiers
+    ]
+
+
+def _deserialize_modifiers(data: list[dict]) -> list[NumericalModifier]:
+    """Deserialize a YAML list back into NumericalModifier objects."""
+    result = []
+    for m in data:
+        try:
+            result.append(
+                NumericalModifier(
+                    priority=ModifierPriority(m["priority"]),
+                    value=int(m["value"]),
+                    source_name=m.get("source_name", "unknown"),
+                    duration_seconds=int(m.get("duration_seconds", -1)),
+                    duration_events=int(m.get("duration_events", -1)),
+                )
+            )
+        except (ValueError, KeyError):
+            pass  # Skip malformed entries
+    return result
+
+
+def _load_modifiable_value(yaml_data: dict, field_name: str, fallback_base_value: int) -> ModifiableValue:
+    """
+    Construct a ModifiableValue from YAML, restoring both base_value and any active modifiers.
+
+    Expected YAML layout for a field like 'strength_mod':
+        strength_mod: 3
+        strength_mod_modifiers:
+          - priority: 2
+            value: 2
+            source_name: Rage
+            duration_seconds: -1
+    """
+    base = yaml_data.get(field_name, fallback_base_value)
+    mod_list = yaml_data.get(f"{field_name}_modifiers", [])
+    modifiers = _deserialize_modifiers(mod_list) if mod_list else []
+    mv = ModifiableValue(base_value=int(base))
+    mv.modifiers = modifiers
+    return mv
+
+
 from compendium_manager import CompendiumManager
 from spatial_engine import spatial_service
 from registry import clear_registry, get_all_entities
@@ -29,6 +88,7 @@ from langchain_core.messages import HumanMessage
 from prompts import VISION_MAP_INGESTION_PROMPT
 import base64
 import json
+
 
 # -------------------------------------------------------------------
 # Module-level mtime watermarks to avoid redundant expensive work
@@ -150,41 +210,43 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
             icon_url=yaml_data.get("icon_url", ""),
             height=float(yaml_data.get("height", yaml_data.get("size", 5.0))),
             max_hp=int(yaml_data.get("max_hp", yaml_data.get("hp", 10))),
-            hp=ModifiableValue(base_value=yaml_data.get("hp", 10)),
+            hp=_load_modifiable_value(yaml_data, "hp", int(yaml_data.get("max_hp", yaml_data.get("hp", 10)))),
             temp_hp=int(yaml_data.get("temp_hp", 0)),
-            ac=ModifiableValue(base_value=yaml_data.get("ac", 10)),
-            strength_mod=ModifiableValue(
-                base_value=yaml_data.get(
-                    "strength_mod", math.floor((yaml_data.get("strength", yaml_data.get("str", 10)) - 10) / 2)
-                )
+            ac=_load_modifiable_value(yaml_data, "ac", 10),
+            strength_mod=_load_modifiable_value(
+                yaml_data,
+                "strength_mod",
+                math.floor((yaml_data.get("strength", yaml_data.get("str", 10)) - 10) / 2),
             ),
-            dexterity_mod=ModifiableValue(
-                base_value=yaml_data.get(
-                    "dexterity_mod", math.floor((yaml_data.get("dexterity", yaml_data.get("dex", 10)) - 10) / 2)
-                )
+            dexterity_mod=_load_modifiable_value(
+                yaml_data,
+                "dexterity_mod",
+                math.floor((yaml_data.get("dexterity", yaml_data.get("dex", 10)) - 10) / 2),
             ),
-            constitution_mod=ModifiableValue(
-                base_value=yaml_data.get(
-                    "constitution_mod", math.floor((yaml_data.get("constitution", yaml_data.get("con", 10)) - 10) / 2)
-                )
+            constitution_mod=_load_modifiable_value(
+                yaml_data,
+                "constitution_mod",
+                math.floor((yaml_data.get("constitution", yaml_data.get("con", 10)) - 10) / 2),
             ),
-            intelligence_mod=ModifiableValue(
-                base_value=yaml_data.get(
-                    "intelligence_mod", math.floor((yaml_data.get("intelligence", yaml_data.get("int", 10)) - 10) / 2)
-                )
+            intelligence_mod=_load_modifiable_value(
+                yaml_data,
+                "intelligence_mod",
+                math.floor((yaml_data.get("intelligence", yaml_data.get("int", 10)) - 10) / 2),
             ),
-            wisdom_mod=ModifiableValue(
-                base_value=yaml_data.get(
-                    "wisdom_mod", math.floor((yaml_data.get("wisdom", yaml_data.get("wis", 10)) - 10) / 2)
-                )
+            wisdom_mod=_load_modifiable_value(
+                yaml_data,
+                "wisdom_mod",
+                math.floor((yaml_data.get("wisdom", yaml_data.get("wis", 10)) - 10) / 2),
             ),
-            charisma_mod=ModifiableValue(
-                base_value=yaml_data.get(
-                    "charisma_mod", math.floor((yaml_data.get("charisma", yaml_data.get("cha", 10)) - 10) / 2)
-                )
+            charisma_mod=_load_modifiable_value(
+                yaml_data,
+                "charisma_mod",
+                math.floor((yaml_data.get("charisma", yaml_data.get("cha", 10)) - 10) / 2),
             ),
-            spell_save_dc=ModifiableValue(base_value=yaml_data.get("spell_save_dc", 10)),
-            spell_attack_bonus=ModifiableValue(base_value=int(str(yaml_data.get("spell_atk", "0")).replace("+", ""))),
+            spell_save_dc=_load_modifiable_value(yaml_data, "spell_save_dc", 10),
+            spell_attack_bonus=_load_modifiable_value(
+                yaml_data, "spell_attack_bonus", int(str(yaml_data.get("spell_atk", "0")).replace("+", "")),
+            ),
             active_mechanics=yaml_data.get("active_mechanics", []),
             resources=yaml_data.get("resources", {}),
             active_conditions=(
@@ -281,7 +343,7 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
 
 
 async def initialize_engine_from_vault(vault_path: str):
-    """Reads characters and active combatants from the vault into the Deterministic Engine. Employs lazy hydration for everything else."""
+    """Reads characters, knowledge graph, and storylets from the vault into memory. Employs lazy hydration for everything else."""
     await auto_ingest_maps_from_vault(vault_path)
 
     j_dir = get_journals_dir(vault_path)
@@ -334,9 +396,19 @@ async def initialize_engine_from_vault(vault_path: str):
         except Exception:
             pass
 
+    # 3. Load Knowledge Graph from WORLD_GRAPH.md
+    from registry import get_knowledge_graph
+    kg = get_knowledge_graph(vault_path)
+    await sync_knowledge_graph_from_vault(vault_path, kg)
+
+    # 4. Load Storylet Registry from STORYLETS/
+    from registry import get_storylet_registry
+    storylet_reg = get_storylet_registry(vault_path)
+    await sync_storylet_registry_from_vault(vault_path, storylet_reg)
+
 
 async def sync_engine_to_vault(vault_path: str):
-    """Writes current Engine state (HP, etc.) back to the Obsidian files."""
+    """Writes current Engine state (HP, KG, storylets) back to the Obsidian files."""
     print("Syncing Engine state back to Vault...")
     for uid, entity in get_all_entities(vault_path).items():
         if not hasattr(entity, "_filepath"):
@@ -353,8 +425,36 @@ async def sync_engine_to_vault(vault_path: str):
             # Update the YAML with the new deterministic values
             if isinstance(entity, Creature):
                 yaml_data["hp"] = entity.hp.base_value
+                if entity.hp.modifiers:
+                    yaml_data["hp_modifiers"] = _serialize_modifiers(entity.hp.modifiers)
                 yaml_data["temp_hp"] = entity.temp_hp
                 yaml_data["ac"] = entity.ac.base_value
+                if entity.ac.modifiers:
+                    yaml_data["ac_modifiers"] = _serialize_modifiers(entity.ac.modifiers)
+                yaml_data["strength_mod"] = entity.strength_mod.base_value
+                if entity.strength_mod.modifiers:
+                    yaml_data["strength_mod_modifiers"] = _serialize_modifiers(entity.strength_mod.modifiers)
+                yaml_data["dexterity_mod"] = entity.dexterity_mod.base_value
+                if entity.dexterity_mod.modifiers:
+                    yaml_data["dexterity_mod_modifiers"] = _serialize_modifiers(entity.dexterity_mod.modifiers)
+                yaml_data["constitution_mod"] = entity.constitution_mod.base_value
+                if entity.constitution_mod.modifiers:
+                    yaml_data["constitution_mod_modifiers"] = _serialize_modifiers(entity.constitution_mod.modifiers)
+                yaml_data["intelligence_mod"] = entity.intelligence_mod.base_value
+                if entity.intelligence_mod.modifiers:
+                    yaml_data["intelligence_mod_modifiers"] = _serialize_modifiers(entity.intelligence_mod.modifiers)
+                yaml_data["wisdom_mod"] = entity.wisdom_mod.base_value
+                if entity.wisdom_mod.modifiers:
+                    yaml_data["wisdom_mod_modifiers"] = _serialize_modifiers(entity.wisdom_mod.modifiers)
+                yaml_data["charisma_mod"] = entity.charisma_mod.base_value
+                if entity.charisma_mod.modifiers:
+                    yaml_data["charisma_mod_modifiers"] = _serialize_modifiers(entity.charisma_mod.modifiers)
+                yaml_data["spell_save_dc"] = entity.spell_save_dc.base_value
+                if entity.spell_save_dc.modifiers:
+                    yaml_data["spell_save_dc_modifiers"] = _serialize_modifiers(entity.spell_save_dc.modifiers)
+                yaml_data["spell_attack_bonus"] = entity.spell_attack_bonus.base_value
+                if entity.spell_attack_bonus.modifiers:
+                    yaml_data["spell_attack_bonus_modifiers"] = _serialize_modifiers(entity.spell_attack_bonus.modifiers)
                 yaml_data["x"] = entity.x
                 yaml_data["y"] = entity.y
                 yaml_data["z"] = entity.z
@@ -403,6 +503,16 @@ async def sync_engine_to_vault(vault_path: str):
                 pass
         except Exception as e:
             print(f"Failed to save {entity.name}: {e}")
+
+    # Sync Knowledge Graph to WORLD_GRAPH.md
+    from registry import get_knowledge_graph
+    kg = get_knowledge_graph(vault_path)
+    await sync_knowledge_graph_to_vault(vault_path, kg)
+
+    # Sync Storylet Registry to STORYLETS/
+    from registry import get_storylet_registry
+    storylet_reg = get_storylet_registry(vault_path)
+    await sync_storylet_registry_to_vault(vault_path, storylet_reg)
 
 
 async def sync_engine_from_vault_updates(vault_path: str) -> str:
@@ -609,3 +719,121 @@ async def upsert_journal_section(  # noqa: C901
             await f.writelines(out_lines)
 
     return f"Success: {mode.capitalize()}ed content to '{section_header}' in {entity_name}.md."
+
+
+# ---------------------------------------------------------------------
+# Knowledge Graph persistence
+# WORLD_GRAPH.md — YAML frontmatter encoding the full graph
+# ---------------------------------------------------------------------
+async def sync_knowledge_graph_to_vault(vault_path: str, kg: Any) -> str:
+    """
+    Persists the KnowledgeGraph to server/Journals/WORLD_GRAPH.md.
+    Returns a status message.
+    """
+    import yaml
+
+    j_dir = get_journals_dir(vault_path)
+    os.makedirs(j_dir, exist_ok=True)
+    filepath = os.path.join(j_dir, "WORLD_GRAPH.md")
+
+    # Serialize nodes
+    nodes_list = []
+    for node in kg.nodes.values():
+        nodes_list.append({
+            "node_uuid": str(node.node_uuid),
+            "node_type": node.node_type.value,
+            "name": node.name,
+            "attributes": node.attributes,
+            "tags": list(node.tags),
+            "is_immutable": node.is_immutable,
+        })
+
+    # Serialize edges (use names for readability; UUIDs are stable too)
+    edges_list = []
+    for edge in kg.edges:
+        sub = kg.get_node(edge.subject_uuid)
+        obj = kg.get_node(edge.object_uuid)
+        edges_list.append({
+            "edge_uuid": str(edge.edge_uuid),
+            "subject_name": sub.name if sub else str(edge.subject_uuid),
+            "predicate": edge.predicate.value,
+            "object_name": obj.name if obj else str(edge.object_uuid),
+            "weight": edge.weight,
+        })
+
+    yaml_data = {"nodes": nodes_list, "edges": edges_list}
+    yaml_str = await asyncio.to_thread(yaml.dump, yaml_data, sort_keys=False, default_flow_style=False)
+    content = f"---\n{yaml_str}---\n# World Knowledge Graph\n\nAuto-generated. Do not edit manually.\n"
+
+    async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
+        await f.write(content)
+
+    return f"MECHANICAL TRUTH: Synced Knowledge Graph ({len(nodes_list)} nodes, {len(edges_list)} edges) to vault."
+
+
+async def sync_knowledge_graph_from_vault(vault_path: str, kg: Any) -> str:
+    """
+    Loads the KnowledgeGraph from server/Journals/WORLD_GRAPH.md into the provided kg instance.
+    Returns a status message.
+    """
+    filepath = os.path.join(get_journals_dir(vault_path), "WORLD_GRAPH.md")
+    if not os.path.exists(filepath):
+        return "No WORLD_GRAPH.md found; starting with empty Knowledge Graph."
+
+    yaml_data, _ = await read_markdown_entity_no_lock(filepath)
+    nodes_data = yaml_data.get("nodes", [])
+    edges_data = yaml_data.get("edges", [])
+
+    # Rebuild adjacency maps
+    for node_data in nodes_data:
+        from knowledge_graph import KnowledgeGraphNode, GraphNodeType
+        node = KnowledgeGraphNode(
+            node_uuid=uuid.UUID(node_data["node_uuid"]),
+            node_type=GraphNodeType(node_data["node_type"]),
+            name=node_data["name"],
+            attributes=node_data.get("attributes", {}),
+            tags=set(node_data.get("tags", [])),
+            is_immutable=node_data.get("is_immutable", False),
+        )
+        kg.add_node(node)
+
+    for edge_data in edges_data:
+        from knowledge_graph import KnowledgeGraphEdge, GraphPredicate
+        sub_name = edge_data.get("subject_name", "")
+        obj_name = edge_data.get("object_name", "")
+        sub_uuid = kg.find_node_uuid(sub_name) or uuid.UUID(edge_data.get("subject_uuid", sub_name))
+        obj_uuid = kg.find_node_uuid(obj_name) or uuid.UUID(edge_data.get("object_uuid", obj_name))
+        if sub_uuid and obj_uuid:
+            edge = KnowledgeGraphEdge(
+                edge_uuid=uuid.UUID(edge_data["edge_uuid"]) if edge_data.get("edge_uuid") else uuid.uuid4(),
+                subject_uuid=sub_uuid,
+                predicate=GraphPredicate(edge_data["predicate"]),
+                object_uuid=obj_uuid,
+                weight=edge_data.get("weight", 1.0),
+            )
+            kg.add_edge(edge)
+
+    kg._rebuild_adjacency()
+    return f"Loaded Knowledge Graph: {len(nodes_data)} nodes, {len(edges_data)} edges from vault."
+
+
+# ---------------------------------------------------------------------
+# Storylet Registry persistence
+# server/Journals/STORYLETS/{name}.md — one file per storylet
+# ---------------------------------------------------------------------
+async def sync_storylet_registry_to_vault(vault_path: str, registry: Any) -> str:
+    """
+    Persists all storylets from the registry to server/Journals/STORYLETS/.
+    Returns a status message.
+    """
+    count = await registry.save_to_vault(vault_path)
+    return f"MECHANICAL TRUTH: Synced {count} storylets to vault."
+
+
+async def sync_storylet_registry_from_vault(vault_path: str, registry: Any) -> str:
+    """
+    Loads all storylets from server/Journals/STORYLETS/ into the registry.
+    Returns a status message.
+    """
+    count = await registry.load_from_vault(vault_path)
+    return f"Loaded {count} storylets from vault."

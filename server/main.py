@@ -101,6 +101,11 @@ from tools import (
     spawn_summon,
     refresh_vault_data,
     report_rule_challenge,
+    create_storylet,
+    list_active_storylets,
+    mark_entity_immutable,
+    request_graph_mutations,
+    sync_knowledge_graph,
     _get_config_tone,
     _get_entity_by_name,
     _calculate_reach,
@@ -158,6 +163,11 @@ MASTER_TOOLS_LIST = [
     spawn_summon,
     refresh_vault_data,
     report_rule_challenge,
+    create_storylet,
+    list_active_storylets,
+    mark_entity_immutable,
+    request_graph_mutations,
+    sync_knowledge_graph,
 ]
 
 # 1. INITIALIZE THE APP FIRST

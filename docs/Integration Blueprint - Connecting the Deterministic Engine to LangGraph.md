@@ -1,83 +1,215 @@
 # Integration Blueprint: Connecting the Deterministic Engine to LangGraph
 
-To fully realize the hybrid Neuro-Symbolic architecture, we must bridge your existing `LangGraph` setup in `main.py` with the new deterministic `dnd_rules_engine.py`. The goal is to demote the primary LLM from "Rules Arbiter" to "Intent Planner" and "Narrator."
+> **Status**: Partially implemented. Core architecture is in place; 9 significant gaps remain.
+> Last reviewed: 2026-03-22
 
-## Step 1: Initialize the Game State (in `vault_io.py`)
+## Architecture Overview (What Was Built)
 
-Currently, `vault_io.py` reads Markdown text. We need to parse the YAML frontmatter into our new Pydantic objects (`Creature`, `Weapon`) and cache them in the Engine's memory on startup.
-
-**Updates required in `vault_io.py`:**
-
-1. Create a `load_campaign_state()` function that runs when `main.py` starts up.
-    
-2. It should parse all character and monster markdown files in the Obsidian vault.
-    
-3. Instantiate them using `Creature(**yaml_data)` which automatically registers their UUIDs in `BaseGameEntity._registry`.
-    
-
-## Step 2: Create Deterministic Tools (in `tools.py`)
-
-The LLM (Planner Agent) will no longer write narrative combat text directly. Instead, it will emit structured tool calls to the engine.
-
-**Updates required in `tools.py`:**
-
-Add Langchain tools that act as wrappers for the `EventBus`.
+The hybrid Neuro-Symbolic architecture is realized as a 5-node LangGraph:
 
 ```
-from langchain_core.tools import tool
-from dnd_rules_engine import GameEvent, EventBus, BaseGameEntity
-
-@tool
-def execute_melee_attack(attacker_name: str, target_name: str) -> str:
-    """Use this tool when a character attempts to attack a target with a melee weapon."""
-    
-    # 1. Lookup UUIDs by name (you'll need a helper function for this)
-    attacker_uuid = get_uuid_by_name(attacker_name) 
-    target_uuid = get_uuid_by_name(target_name)
-
-    # 2. Fire the Event into the Deterministic Engine
-    event = GameEvent(
-        event_type="MeleeAttack",
-        source_uuid=attacker_uuid,
-        target_uuid=target_uuid
-    )
-    result = EventBus.dispatch(event)
-    
-    # 3. Return the absolute mechanical truth to the LLM
-    # E.g., "HIT! Kaelen deals 8 slashing damage. Lyra has 6 HP remaining."
-    if result.payload.get("hit"):
-        return f"HIT! Dealt {result.payload['damage']} damage."
-    return "MISS! The attack failed to beat the target's AC."
+planner_node → action/action_logic → drama_manager → narrator → qa → END
+                     ↑                       ↑
+                  ToolNode              ToolNode
 ```
 
-## Step 3: Restructure LangGraph (in `main.py`)
+### Current Node Responsibilities
 
-Your current `main.py` likely has a straightforward graph: `Agent -> Tools -> Agent -> QA -> End`.
+| Node | Role |
+|------|------|
+| `planner_node` | Translates player intent into deterministic tool calls. System prompt forbids narrative. |
+| `action` (ToolNode) | Executes all tools via `EventBus.dispatch()`. |
+| `action_logic` (ToolNode) | Executes mutation/storylet tools with Hard Guardrail enforcement. |
+| `drama_manager` | Updates tension arc, selects active storylet, routes to narrator if storylet active. |
+| `narrator_node` | Converts mechanical truth to vivid prose. Runs Hard Guardrails validation before QA. |
+| `qa_node` | 13-point validation checklist. Max 3 revision loops before force-approve. |
 
-We need to split the Agent into two distinct personas to enforce the separation of concerns.
+### New Files
 
-**Updates required in `main.py`:**
+| File | Purpose |
+|------|---------|
+| `knowledge_graph.py` | In-memory directed labeled KG with CRUD, path-finding, adjacency index. |
+| `hard_guardrails.py` | Deterministic validation: immutable nodes, graph consistency, Wikilink existence. |
+| `storylet.py` | Pydantic schema: GraphQuery, GraphMutation, StoryletPrerequisites, Storylet, TensionLevel. |
+| `storylet_registry.py` | Storylet polling engine + Obsidian vault persistence at `server/Journals/STORYLETS/`. |
+| `drama_manager.py` | TensionArc + DramaManager: selects storylets by tension, applies effects. |
+| `graph_sync.py` | Bidirectional sync between flat entity registry and Knowledge Graph. |
+| `registry.py` | Per-vault KG and StoryletRegistry singletons. |
 
-Redesign your `StateGraph` into this flow:
+---
 
-1. **`planner_node`**: Reads user input (`DMState['messages']`). Its system prompt STRICTLY FORBIDS writing narrative. It is only allowed to output JSON tool calls to `execute_melee_attack`, `cast_spell`, or `move`.
-    
-2. **`tool_node`**: Executes the deterministic Python tools and appends the result to the state.
-    
-3. **`narrator_node`**: Reads the user input AND the deterministic tool results. Its system prompt dictates: _"You are the Narrator. Read the mechanical outcome provided by the system. Describe the action vividly. DO NOT alter the math, damage, or hit/miss outcome."_
-    
-4. **`qa_node`**: Receives the `narrator_node` output. Because the engine guaranteed the math, this node only checks if the Narrator hallucinated a lore fact or controlled the player character unfairly.
-    
+## Gaps and Required Fixes
 
-## Step 4: Serialize the Aftermath (in `vault_io.py`)
+Sorted by severity (highest first).
 
-After the `narrator_node` finishes and the `qa_node` approves the draft, the current state of the objects in Python memory must be synced back to the local Markdown vault to prevent data loss.
+---
 
-1. Iterate over `BaseGameEntity._registry.values()`.
-    
-2. Use `model_dump(exclude={'_registry'})` to convert the `Creature` objects back to dicts.
-    
-3. Use the YAML parsing techniques already present in `vault_io.py` to overwrite the frontmatter of `Kaelen.md`, `Goblin.md`, updating their current `hp.base_value` and any active `Modifiers`.
-    
+### [CRITICAL] Gap 6: Mutations Validated But Never Executed
 
-By adopting this structure, the LLM will act purely as the graphical interface and storyteller, while the invisible Python engine enforces the D&D 5e mechanics flawlessly.
+**What the design requires**: After Hard Guardrails approve proposed mutations, they must be committed to the Knowledge Graph.
+
+**Current state** (FIXED 2026-03-22): `request_graph_mutations` was executing mutations immediately (before narration). The `pending_mutations` field in DMState was dead code.
+
+**Fix implemented**:
+- Added `commit: bool = True` parameter to `request_graph_mutations` — when `False`, validates and returns mutation data without executing
+- Custom `action_logic_node` intercepts mutation tool calls, captures them into `pending_mutations` WITHOUT executing
+- `narrator_node` executes deferred mutations ONLY AFTER guardrails approve the narrative, then clears `pending_mutations`
+
+```python
+# In narrator_node, after guard_result.allowed == True:
+pending = list(state.get("pending_mutations", []))
+for mdict in pending:
+    mutation = GraphMutation(**mdict)
+    mutation.execute(kg)  # Commits after QA approval
+return {"draft_response": draft, "pending_mutations": []}
+```
+
+---
+
+### [HIGH] Gap 2: Narrative Guardrails Run AFTER Narrator, Not Before
+
+**What the design requires**: Hard guardrails should intercept *before* the LLM generates prose that violates world state, not after. The fishbowl should be a pre-constraint, not a post-filter.
+
+**Current state**: `narrator_node` calls LLM → validates output → rejects if bad → loops. Force-approve at `MAX_QA_REVISIONS` means rejected content can still slip through.
+
+**Fix**: Inject KG state constraints directly into the narrator's system prompt before LLM invocation. The validation then becomes a sanity check rather than the primary enforcement mechanism.
+
+1. Before invoking LLM in `narrator_node`, query the KG for immutable facts relevant to the current scene
+2. Pre-format them as forbidden claims in the system prompt
+3. Keep the post-hoc validation as defense-in-depth
+
+---
+
+### [HIGH] Gap 7: Storylet Prerequisites Can't Query Engine State
+
+**What the design requires**: Prerequisites should check *"the global world state"* which includes both the Knowledge Graph AND the entity engine state (HP, conditions, resources, position).
+
+**Current state**: `GraphQuery.evaluate(kg, ctx)` only queries the KG. It cannot check `"Kaelen's HP < max_hp"` or `"Lyra is concentrating on Haste"` because those live in `Creature` objects, not the KG.
+
+**Fix**: Extend `StoryletPrerequisites.is_met()` to also accept the entity registry. Add `query_type` values like `engine_state_check` that read from `get_all_entities()`:
+
+```python
+if query_type == "engine_state_check":
+    # Check entity.hp.base_value, entity.active_conditions, etc.
+```
+
+---
+
+### [HIGH] Gap 1: State-Space Validation Only Checks Wikilinks, Not Claims
+
+**What the design requires** (Task 4.3): *"If the AI generates text stating that a king has granted the participants a legendary magical sword, the validation layer executes a graph query to confirm the king actually possesses the sword."*
+
+**Current state**: `validate_narrative_claim` only checks that `[[Wikilinks]]` correspond to existing KG nodes. It does not verify relationships or attribute claims.
+
+**Fix**: Implement SVO (subject-verb-object) extraction from prose:
+
+1. Parse sentences into (subject, verb, object) triples
+2. For each triple, determine if it implies a KG relationship change
+3. Cross-reference against KG edges: `"king gives sword"` → verify `(King) --[POSSESSES]--> (Sword)` exists
+4. Reject if the implied relationship doesn't exist in KG
+
+---
+
+### [HIGH] Gap 3: Three Clue Rule and Ingestion Pipeline Are Absent
+
+**What the design requires**:
+- Phase 2 (World Builder): NLP pipeline to extract entities, infer edges, assign NPC behavioral dials.
+- Phase 3 (Campaign Builder): Sequence-to-storylet conversion with Three Clue Rule redundancy.
+- Inverse Three Clue Redundancy: *"for any essential conclusion, the architecture must provide at least three distinct vectors of discovery."*
+
+**Current state**: All storylets are created manually via `create_storylet` tool. No algorithmic generation, no chokepoint detection, no auto-generated backup paths.
+
+**Fix** (incremental):
+1. Build `IngestionPipeline` class with Phase 1 entity extraction using LLM
+2. Build `three_clue_analyzer` that traverses storylet dependency graph, identifies bottlenecks, uses LLM to generate N-2 additional storylets per bottleneck
+3. Task 3.3 (Effect Annotation) is also absent — parse storylet resolution text and encode as Graph Mutations
+
+---
+
+### [HIGH] Gap 5: Privilege Segregation Incomplete
+
+**What the design requires** (Task 4.2): *"The Creative Agent can read from the Knowledge Graph but cannot execute write commands."*
+
+**Current state**: `action_logic` handles mutation tools, but the narrator can write prose that implies world state changes without emitting any mutation. The KG is never updated to reflect narrative claims.
+
+**Fix**: QA node must cross-check: if narrative implies a world state change (item transferred, NPC attitude shifted, relationship altered), a corresponding mutation must have been committed. If the prose claims a change without a mutation, reject it.
+
+---
+
+### [MEDIUM] Gap 8: Drama Manager Ignores Relationship Web
+
+**What the design requires**: *"When an event occurs at one node in the web, the tension reverberates through the interconnected threads."* Storylet selection should weight based on PC-NPC relationship edges.
+
+**Current state**: `DramaManager.select_next()` only considers tension level and priority. It never examines KG edges between PCs and NPCs.
+
+**Fix**: In `select_next`, calculate a `relationship_weight` boost for storylets involving NPCs with strong relationship edges to the active character. Query KG for `HOSTILE_TOWARD` / `ALLIED_WITH` edges between NPC and active character.
+
+---
+
+### [MEDIUM] Gap 9: No GraphRAG Context Injection
+
+**What the design requires** (Task 1.1): *"a basic GraphRAG query function capable of returning a multi-hop context window for a given node."* When the narrator describes a scene, it should receive the NPC's attributes, edges, and nearby nodes.
+
+**Current state**: `planner_node` and `narrator_node` have no GraphRAG retrieval step. System prompts contain static rules but no dynamically retrieved world state.
+
+**Fix**: Before each LLM invocation, query the KG for:
+1. Active location node + all entities connected to it
+2. Active NPC nodes + their behavioral dials and relationship edges
+3. Any quest-relevant edges involving the active character
+
+Inject this as contextual grounding in the system prompt.
+
+---
+
+### [MEDIUM] Gap 4: NPC Dial-Based Behavioral Parameters Absent
+
+**What the design requires** (Phase 2, NPC Parameterization): *"The pipeline scans NPC biographical text and outputs 2-3 core continuous variables (e.g., `greed: 0.8`, `loyalty: 0.9`) stored as node attributes."*
+
+**Current state**: `KnowledgeGraphNode.attributes` is a `Dict[str, Any]` — structurally capable, but nothing creates or uses NPC dials.
+
+**Fix**:
+1. Add `npc_dials: Dict[str, float]` field to `KnowledgeGraphNode` (or use namespaced attributes)
+2. Build LLM-powered `extract_npc_dials(biography_text) -> Dict[str, float]` function
+3. Inject dials into narrator context when active scene involves an NPC
+
+---
+
+## Implementation Order
+
+| # | Priority | Fix | Status | Files | Test File |
+|---|----------|-----|--------|-------|-----------|
+| 1 | ~~CRITICAL~~ | Mutations executed after guardrail approval | **DONE** ✅ | `graph.py`, `tools.py` | `test_mutation_capture.py` |
+| 2 | HIGH | Pre-inject KG constraints into narrator prompt | **DONE** ✅ | `graph.py` | `test_narrator_kg_context.py` |
+| 3 | HIGH | Engine state queries in storylet prereqs | **DONE** ✅ | `storylet.py` | `test_storylet_engine_prereqs.py` |
+| 4 | HIGH | SVO claim validation | **DONE** ✅ | `hard_guardrails.py` | `test_svo_validation.py` |
+| 5 | HIGH | Three Clue redundancy analyzer | **DONE** ✅ | `storylet_analyzer.py` (new) | `test_three_clue_analyzer.py` |
+| 6 | HIGH | QA cross-check: narrative claims vs mutations | Pending | `graph.py`, `qa_node` | `test_qa_mutation_crosscheck.py` |
+| 7 | MEDIUM | Relationship-weighted storylet selection | **DONE** ✅ | `drama_manager.py` | `test_drama_manager_relationships.py` |
+| 8 | MEDIUM | GraphRAG context injection | **DONE** ✅ | `graph.py` | `test_grag_context_injection.py` |
+| 9 | MEDIUM | NPC dial extraction and injection | **DONE** ✅ | `knowledge_graph.py`, `graph.py` | `test_npc_dials.py` |
+
+---
+
+## Step 1: Initialize the Game State (COMPLETED ✓)
+
+`initialize_engine_from_vault()` in `vault_io.py` parses character/monster YAML and hydrates the engine registry. Modified files are synced back via `sync_engine_to_vault()`.
+
+**Key enhancement added 2026-03-22**: `ModifiableValue` modifiers (Rage, Bless, Geas, etc.) are now persisted to/from YAML using `_{field}_modifiers` keys, ensuring active effects survive across server restarts.
+
+---
+
+## Step 2: Deterministic Tools (COMPLETED ✓)
+
+All tools in `tools.py` use `EventBus.dispatch()` directly. The tools are the Langchain `@tool` wrappers around the deterministic engine. No changes needed.
+
+---
+
+## Step 3: LangGraph Restructuring (COMPLETED ✓)
+
+`graph.py` implements the 5-node architecture as designed. The `action_logic` ToolNode enforces privilege segregation for mutation tools.
+
+---
+
+## Step 4: Serialize Aftermath (COMPLETED ✓)
+
+`sync_engine_to_vault()` syncs entity state back to Obsidian files. KG syncs to `WORLD_GRAPH.md`. Storylet Registry syncs to `server/Journals/STORYLETS/`.

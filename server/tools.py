@@ -1782,6 +1782,59 @@ async def perform_ability_check_or_save(  # noqa: C901
                 advantage = True
                 social_alert += f"\nSYSTEM ALERT (REQ-ENC-004): {character_name} has Advantage on social checks against {t_ent.name} because they are Charmed!"
 
+    # Query Environmental Lighting to alert the DM for Stealth and Perception checks
+    illum_alert = ""
+    illum = "bright"
+    if engine_creature and isinstance(engine_creature, Creature):
+        illum = spatial_service.get_illumination(engine_creature.x, engine_creature.y, engine_creature.z, vault_path)
+
+        has_enhanced_vision = any(
+            s in tag for tag in engine_creature.tags for s in ["darkvision", "blindsight", "truesight", "tremorsense"]
+        )
+        is_deafened = any(c.name.lower() == "deafened" for c in engine_creature.active_conditions)
+        has_sunlight_sensitivity = "sunlight_sensitivity" in engine_creature.tags
+
+        in_sunlight = False
+        if illum == "bright":
+            for light in spatial_service.get_map_data(vault_path).active_lights:
+                if "sun" in light.label.lower():
+                    dist = spatial_service.calculate_distance(
+                        engine_creature.x, engine_creature.y, engine_creature.z, light.x, light.y, light.z, vault_path
+                    )
+                    if dist <= light.bright_radius:
+                        in_sunlight = True
+                        break
+
+        if clean_skill in ["perception", "investigation"]:
+            is_blinded = any(c.name.lower() == "blinded" for c in engine_creature.active_conditions)
+            has_blindsight = any(s in tag for tag in engine_creature.tags for s in ["blindsight", "truesight"])
+
+            in_silence = False
+            if HAS_GIS:
+                ent_poly = spatial_service._get_entity_bbox(engine_creature)
+                if ent_poly:
+                    for tz in spatial_service.get_map_data(vault_path).active_terrain:
+                        if "silence" in [tag.lower() for tag in tz.tags] and tz.polygon and tz.polygon.intersects(ent_poly):
+                            in_silence = True
+                            break
+
+            if in_sunlight and has_sunlight_sensitivity:
+                illum_alert += "\nSYSTEM ALERT: Character has Sunlight Sensitivity and is in direct sunlight. Disadvantage (-5 to Passive) on sight-based checks."
+                disadvantage = True
+            elif is_blinded and not has_blindsight:
+                illum_alert += (
+                    "\nSYSTEM ALERT: Character is BLINDED. Sight-based checks automatically fail (Hearing/Smell still work)."
+                )
+            elif illum == "darkness" and not has_enhanced_vision:
+                illum_alert += "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. Sight-based checks automatically fail (Hearing/Smell still work)."
+            elif illum == "dim" and not has_enhanced_vision:
+                illum_alert += "\nSYSTEM ALERT (REQ-VIS-012): Character is in DIM LIGHT. Disadvantage (-5 to Passive) on sight-based checks."
+                disadvantage = True
+
+            if is_deafened or in_silence:
+                reason = "DEAFENED" if is_deafened else "in a magically SILENCED zone"
+                illum_alert += f"\nSYSTEM ALERT: Character is {reason}. Hearing-based checks automatically fail."
+
     is_pc = any(t in engine_creature.tags for t in ["pc", "player"]) if engine_creature else False
     if is_pc and not is_passive and not force_auto_roll and manual_roll_total is None:
         auto_settings = get_roll_automations(character_name)
@@ -1857,108 +1910,58 @@ async def perform_ability_check_or_save(  # noqa: C901
 
         total = base_roll + total_mod + bonus_total
 
-    # Query Environmental Lighting to alert the DM for Stealth and Perception checks
-    illum_alert = ""
-    if engine_creature and isinstance(engine_creature, Creature):
-        illum = spatial_service.get_illumination(engine_creature.x, engine_creature.y, engine_creature.z, vault_path)
-
-        has_enhanced_vision = any(
-            s in tag for tag in engine_creature.tags for s in ["darkvision", "blindsight", "truesight", "tremorsense"]
-        )
-        is_deafened = any(c.name.lower() == "deafened" for c in engine_creature.active_conditions)
-        has_sunlight_sensitivity = "sunlight_sensitivity" in engine_creature.tags
-
-        in_sunlight = False
+    if engine_creature and isinstance(engine_creature, Creature) and clean_skill == "stealth":
         if illum == "bright":
-            for light in spatial_service.get_map_data(vault_path).active_lights:
-                if "sun" in light.label.lower():
-                    dist = spatial_service.calculate_distance(
-                        engine_creature.x, engine_creature.y, engine_creature.z, light.x, light.y, light.z, vault_path
-                    )
-                    if dist <= light.bright_radius:
-                        in_sunlight = True
-                        break
-
-        if clean_skill in ["perception", "investigation"]:
-            is_blinded = any(c.name.lower() == "blinded" for c in engine_creature.active_conditions)
-            has_blindsight = any(s in tag for tag in engine_creature.tags for s in ["blindsight", "truesight"])
-
-            in_silence = False
-            if HAS_GIS:
-                ent_poly = spatial_service._get_entity_bbox(engine_creature)
-                if ent_poly:
-                    for tz in spatial_service.get_map_data(vault_path).active_terrain:
-                        if "silence" in [tag.lower() for tag in tz.tags] and tz.polygon and tz.polygon.intersects(ent_poly):
-                            in_silence = True
-                            break
-
-            if in_sunlight and has_sunlight_sensitivity:
-                illum_alert += "\nSYSTEM ALERT: Character has Sunlight Sensitivity and is in direct sunlight. Disadvantage (-5 to Passive) on sight-based checks."
-            elif is_blinded and not has_blindsight:
-                illum_alert += (
-                    "\nSYSTEM ALERT: Character is BLINDED. Sight-based checks automatically fail (Hearing/Smell still work)."
-                )
-            elif illum == "darkness" and not has_enhanced_vision:
-                illum_alert += "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. Sight-based checks automatically fail (Hearing/Smell still work)."
-            elif illum == "dim" and not has_enhanced_vision:
-                illum_alert += "\nSYSTEM ALERT: Character is in DIM LIGHT. Disadvantage (-5 to Passive) on sight-based checks."
-
-            if is_deafened or in_silence:
-                reason = "DEAFENED" if is_deafened else "in a magically SILENCED zone"
-                illum_alert += f"\nSYSTEM ALERT: Character is {reason}. Hearing-based checks automatically fail."
-
-        elif clean_skill == "stealth":
-            if illum == "bright":
-                illum_alert = (
-                    "\nSYSTEM ALERT: Character is in BRIGHT LIGHT. They cannot hide without physical cover or invisibility."
-                )
-            elif illum == "darkness":
-                illum_alert = "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. They are heavily obscured and can hide freely."
-            elif illum == "dim":
-                illum_alert = "\nSYSTEM ALERT: Character is in DIM LIGHT. They are lightly obscured and can hide."
-            # REQ-ARM-002: Heavy armor stealth disadvantage
-            try:
-                async with read_markdown_entity(file_path) as (yd, _):
-                    armor_name = str(yd.get("equipment", {}).get("armor", "None")).strip()
-                    if armor_name not in ["None", "", "Unarmored"]:
-                        armor_item = await ItemCompendium.load_item(vault_path, armor_name)
-                        if armor_item and isinstance(armor_item, ArmorItem) and armor_item.stealth_disadvantage:
-                            disadvantage = True
-                            illum_alert += (
-                                f"\nSYSTEM ALERT: {character_name} is wearing {armor_name} which imposes "
-                                f"Disadvantage on Stealth checks (REQ-ARM-002)."
-                            )
-            except Exception:
-                pass
-
-        # REQ-VIS-002: Evaluate stealth natively
-        if illum != "bright":
-            max_pp = 0
-            is_pc_stealth = any(t in engine_creature.tags for t in ["pc", "player", "party_npc"])
-            for uid, ent in get_all_entities(vault_path).items():
-                if isinstance(ent, Creature) and ent.hp.base_value > 0 and ent.entity_uuid != engine_creature.entity_uuid:
-                    is_ent_pc = any(t in ent.tags for t in ["pc", "player", "party_npc"])
-                    if is_pc_stealth != is_ent_pc:
-                        dist = 0
-                        if HAS_GIS:
-                            dist = spatial_service.calculate_distance(
-                                ent.x, ent.y, ent.z, engine_creature.x, engine_creature.y, engine_creature.z, vault_path
-                            )
-                        distance_penalty = int(dist // 10)
-                        pp = 10 + ent.wisdom_mod.total - distance_penalty
-                        if pp > max_pp:
-                            max_pp = pp
-            hide_dc = max(15, max_pp)
-            if total >= hide_dc:
-                if not any(c.name.lower() == "invisible" for c in engine_creature.active_conditions):
-                    engine_creature.active_conditions.append(ActiveCondition(name="Invisible", source_name="Hide Action"))
-                illum_alert += f"\nSYSTEM ALERT (REQ-VIS-002): {character_name} rolled {total} (>= DC {hide_dc}). They succeeded and gained the 'Invisible' condition!"
-            else:
-                illum_alert += f"\nSYSTEM ALERT (REQ-VIS-002): {character_name} rolled {total} (failed to beat DC {hide_dc}). They remain visible."
-        else:
-            illum_alert += (
-                f"\nSYSTEM ALERT (REQ-VIS-002): {character_name} failed to hide (cannot hide in bright light without cover)."
+            illum_alert = (
+                "\nSYSTEM ALERT: Character is in BRIGHT LIGHT. They cannot hide without physical cover or invisibility."
             )
+        elif illum == "darkness":
+            illum_alert = "\nSYSTEM ALERT: Character is in TOTAL DARKNESS. They are heavily obscured and can hide freely."
+        elif illum == "dim":
+            illum_alert = "\nSYSTEM ALERT: Character is in DIM LIGHT. They are lightly obscured and can hide."
+        # REQ-ARM-002: Heavy armor stealth disadvantage
+        try:
+            async with read_markdown_entity(file_path) as (yd, _):
+                armor_name = str(yd.get("equipment", {}).get("armor", "None")).strip()
+                if armor_name not in ["None", "", "Unarmored"]:
+                    armor_item = await ItemCompendium.load_item(vault_path, armor_name)
+                    if armor_item and isinstance(armor_item, ArmorItem) and armor_item.stealth_disadvantage:
+                        disadvantage = True
+                        illum_alert += (
+                            f"\nSYSTEM ALERT: {character_name} is wearing {armor_name} which imposes "
+                            f"Disadvantage on Stealth checks (REQ-ARM-002)."
+                        )
+        except Exception:
+            pass
+
+    # REQ-VIS-002: Evaluate stealth natively
+    if illum != "bright":
+        max_pp = 0
+        is_pc_stealth = any(t in engine_creature.tags for t in ["pc", "player", "party_npc"])
+        for uid, ent in get_all_entities(vault_path).items():
+            if isinstance(ent, Creature) and ent.hp.base_value > 0 and ent.entity_uuid != engine_creature.entity_uuid:
+                is_ent_pc = any(t in ent.tags for t in ["pc", "player", "party_npc"])
+                if is_pc_stealth != is_ent_pc:
+                    dist = 0
+                    if HAS_GIS:
+                        dist = spatial_service.calculate_distance(
+                            ent.x, ent.y, ent.z, engine_creature.x, engine_creature.y, engine_creature.z, vault_path
+                        )
+                    distance_penalty = int(dist // 10)
+                    pp = 10 + ent.wisdom_mod.total - distance_penalty
+                    if pp > max_pp:
+                        max_pp = pp
+        hide_dc = max(15, max_pp)
+        if total >= hide_dc:
+            if not any(c.name.lower() == "invisible" for c in engine_creature.active_conditions):
+                engine_creature.active_conditions.append(ActiveCondition(name="Invisible", source_name="Hide Action"))
+            illum_alert += f"\nSYSTEM ALERT (REQ-VIS-002): {character_name} rolled {total} (>= DC {hide_dc}). They succeeded and gained the 'Invisible' condition!"
+        else:
+            illum_alert += f"\nSYSTEM ALERT (REQ-VIS-002): {character_name} rolled {total} (failed to beat DC {hide_dc}). They remain visible."
+    else:
+        illum_alert += (
+            f"\nSYSTEM ALERT (REQ-VIS-002): {character_name} failed to hide (cannot hide in bright light without cover)."
+        )
 
     exh_penalty = engine_creature.exhaustion_level * 2 if (engine_creature and isinstance(engine_creature, Creature)) else 0
     total -= exh_penalty
@@ -5159,3 +5162,360 @@ async def reveal_illusion(
             f"MECHANICAL TRUTH (REQ-ILL-003): '{illusion_label}' has been globally revealed — "
             f"it is now transparent to all creatures (no longer blocks line of sight)."
         )
+
+
+# =============================================================================
+# STORYLET ORCHESTRATION TOOLS
+# =============================================================================
+
+
+@tool
+async def create_storylet(  # noqa: C901
+    name: str,
+    description: str,
+    tension_level: str = "medium",
+    prerequisites: str = "{}",
+    content: str = "",
+    effects: str = "[]",
+    tags: str = "[]",
+    max_occurrences: int = 1,
+    priority_override: int = 0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Creates a new storylet in the storylet registry. Storylets are narrative
+    units anchored to the Knowledge Graph that drive campaign pacing.
+
+    Args:
+        name: Human-readable name for the storylet.
+        description: Short description of the narrative beat.
+        tension_level: 'low', 'medium', or 'high' — controls when the Drama Manager selects this.
+        prerequisites: JSON-encoded StoryletPrerequisites (e.g., '{"all_of": [{"query_type": "node_exists", "node_name": "Goblin Cave"}]}').
+        content: The narrative text or prompt template. Use {variable} for runtime substitution.
+        effects: JSON-encoded list of StoryletEffects (graph mutations applied when storylet fires).
+        tags: JSON-encoded list of string tags for categorization.
+        max_occurrences: How many times this storylet can fire (-1 = unlimited).
+        priority_override: Higher = selected first when multiple storylets are valid.
+    """
+    import json
+    from registry import get_storylet_registry
+    from storylet import (
+        Storylet,
+        StoryletPrerequisites,
+        StoryletEffect,
+        GraphQuery,
+        GraphMutation,
+        TensionLevel,
+    )
+
+    vault_path = config["configurable"].get("thread_id")
+
+    try:
+        prereq_data = json.loads(prerequisites) if prerequisites else {}
+        effects_data = json.loads(effects) if effects else []
+        tags_list = json.loads(tags) if tags else []
+    except json.JSONDecodeError as e:
+        return f"SYSTEM ERROR: Invalid JSON in prerequisites/effects/tags: {e}"
+
+    # Reconstruct GraphQueries
+    def restore_query(qdata: dict) -> GraphQuery:
+        return GraphQuery(
+            query_type=qdata.get("query_type", "node_exists"),
+            node_uuid=uuid.UUID(qdata["node_uuid"]) if qdata.get("node_uuid") else None,
+            node_name=qdata.get("node_name"),
+            node_type=qdata.get("node_type"),
+            predicate=qdata.get("predicate"),
+            target_uuid=uuid.UUID(qdata["target_uuid"]) if qdata.get("target_uuid") else None,
+            target_name=qdata.get("target_name"),
+            attribute=qdata.get("attribute"),
+            op=qdata.get("op", "eq"),
+            value=qdata.get("value"),
+        )
+
+    def restore_mutation(mdata: dict) -> GraphMutation:
+        return GraphMutation(
+            mutation_type=mdata.get("mutation_type", "add_edge"),
+            node_uuid=uuid.UUID(mdata["node_uuid"]) if mdata.get("node_uuid") else None,
+            node_name=mdata.get("node_name"),
+            node_type=mdata.get("node_type"),
+            predicate=mdata.get("predicate"),
+            target_uuid=uuid.UUID(mdata["target_uuid"]) if mdata.get("target_uuid") else None,
+            target_name=mdata.get("target_name"),
+            attribute=mdata.get("attribute"),
+            value=mdata.get("value"),
+            tags=mdata.get("tags"),
+        )
+
+    def restore_effect(edata: dict) -> StoryletEffect:
+        return StoryletEffect(
+            id=uuid.UUID(edata["id"]) if edata.get("id") else uuid.uuid4(),
+            graph_mutations=[restore_mutation(m) for m in edata.get("graph_mutations", [])],
+            flag_changes=edata.get("flag_changes", {}),
+            attribute_mods=edata.get("attribute_mods", {}),
+        )
+
+    try:
+        tension = TensionLevel(tension_level.lower())
+    except ValueError:
+        return f"SYSTEM ERROR: Invalid tension_level '{tension_level}'. Must be 'low', 'medium', or 'high'."
+
+    prerequisites_obj = StoryletPrerequisites(
+        all_of=[restore_query(q) for q in prereq_data.get("all_of", [])],
+        any_of=[restore_query(q) for q in prereq_data.get("any_of", [])],
+        none_of=[restore_query(q) for q in prereq_data.get("none_of", [])],
+    )
+    effects_list = [restore_effect(e) for e in effects_data]
+
+    storylet = Storylet(
+        name=name,
+        description=description,
+        tension_level=tension,
+        prerequisites=prerequisites_obj,
+        content=content,
+        effects=effects_list,
+        tags=set(tags_list),
+        max_occurrences=max_occurrences,
+        priority_override=priority_override if priority_override else None,
+    )
+
+    registry = get_storylet_registry(vault_path)
+    registry.register(storylet)
+
+    # Persist to vault
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(registry.save_to_vault(vault_path))
+        else:
+            loop.run_until_complete(registry.save_to_vault(vault_path))
+    except RuntimeError:
+        pass  # No event loop available
+
+    return (
+        f"MECHANICAL TRUTH: Created storylet '{name}' (id={storylet.id}, tension={tension_level}). "
+        f"Prerequisites: {len(prerequisites_obj.all_of)} required, {len(prerequisites_obj.any_of)} optional. "
+        f"Effects: {len(effects_list)} mutations."
+    )
+
+
+@tool
+async def list_active_storylets(
+    tension_filter: str = "",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Returns all storylets whose prerequisites are currently met.
+
+    Use this to discover what narrative beats are available given the current
+    Knowledge Graph state.
+
+    Args:
+        tension_filter: Optional 'low', 'medium', or 'high' to filter by tension level.
+    """
+    from registry import get_storylet_registry, get_knowledge_graph
+    from storylet import TensionLevel
+
+    vault_path = config["configurable"].get("thread_id")
+    registry = get_storylet_registry(vault_path)
+    kg = get_knowledge_graph(vault_path)
+
+    ctx = {"vault_path": vault_path}
+    tension = None
+    if tension_filter:
+        try:
+            tension = TensionLevel(tension_filter.lower())
+        except ValueError:
+            return f"SYSTEM ERROR: Invalid tension_filter '{tension_filter}'. Must be 'low', 'medium', or 'high'."
+
+    candidates = registry.poll(kg, ctx, tension=tension)
+
+    if not candidates:
+        return "No storylets currently have their prerequisites met."
+
+    lines = [f"Active storylets ({len(candidates)}):"]
+    for s in candidates:
+        lines.append(
+            f"  - [{s.tension_level.value}] {s.name} (id={s.id}, fires={s.current_occurrences}/{s.max_occurrences})"
+        )
+        if s.description:
+            lines.append(f"      {s.description}")
+    return "\n".join(lines)
+
+
+@tool
+async def mark_entity_immutable(
+    entity_name: str,
+    reason: str = "",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Marks an entity as immutable in the Knowledge Graph. Immutable entities
+    cannot be modified or deleted by storylet effects — this is a hard guardrail
+    for plot-critical NPCs, artifacts, or locations.
+
+    Args:
+        entity_name: The name of the entity in the Knowledge Graph.
+        reason: Why is this entity immutable? (logged for audit)
+    """
+    from registry import get_knowledge_graph
+
+    vault_path = config["configurable"].get("thread_id")
+    kg = get_knowledge_graph(vault_path)
+
+    node = kg.get_node_by_name(entity_name)
+    if not node:
+        return f"SYSTEM ERROR: Entity '{entity_name}' not found in Knowledge Graph."
+
+    node.is_immutable = True
+    return (
+        f"MECHANICAL TRUTH: '{entity_name}' is now immutable in the Knowledge Graph. "
+        f"Reason: {reason or 'Not specified'}. "
+        f"Storylet effects attempting to modify this entity will be rejected by Hard Guardrails."
+    )
+
+
+@tool
+async def request_graph_mutations(
+    mutations: str,
+    narrative_context: str = "",
+    commit: bool = True,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Requests a set of GraphMutations to be validated and applied by Hard Guardrails.
+    This is the ONLY pathway for storylet effects to modify the Knowledge Graph.
+
+    All mutations are validated against the KG before being committed:
+    - Immutable nodes cannot be modified
+    - Nodes must exist for add_edge, remove_node, set_attribute
+    - No LLM calls — pure deterministic validation
+
+    Args:
+        mutations: JSON-encoded list of GraphMutation dicts.
+        narrative_context: The narrative text this mutation batch is associated with.
+        commit: If True (default), execute mutations immediately after validation.
+                If False, validate and return mutation data for deferred execution
+                (the graph will commit them after narrator + QA approval).
+    """
+    import json
+    from registry import get_knowledge_graph, get_storylet_registry
+    from storylet import GraphMutation
+    from hard_guardrails import HardGuardrails
+
+    vault_path = config["configurable"].get("thread_id")
+    kg = get_knowledge_graph(vault_path)
+    guardrails = HardGuardrails(kg)
+
+    try:
+        mut_data = json.loads(mutations) if mutations else []
+    except json.JSONDecodeError as e:
+        return f"SYSTEM ERROR: Invalid JSON in mutations: {e}"
+
+    parsed_mutations = []
+    for m in mut_data:
+        try:
+            parsed_mutations.append(GraphMutation(**m))
+        except Exception as e:
+            return f"SYSTEM ERROR: Invalid mutation: {e}"
+
+    ctx = {"vault_path": vault_path}
+    result = guardrails.validate_full_pipeline(narrative_context, parsed_mutations, ctx)
+
+    if not result.allowed:
+        revisions = "; ".join(result.required_revisions) if result.required_revisions else "Rewrite to avoid invalid claims."
+        return (
+            f"SYSTEM ERROR: Guardrail rejection. {result.reason}\n"
+            f"Required revisions: {revisions}"
+        )
+
+    if not commit:
+        # Deferred execution mode: return validated mutation data for the graph to commit later.
+        # Include the raw mutation dicts so the graph can re-validate and execute.
+        mutation_summaries = [
+            {
+                "mutation_type": m.mutation_type,
+                "node_name": m.node_name,
+                "predicate": m.predicate,
+                "target_name": m.target_name,
+                "attribute": m.attribute,
+                "value": m.value,
+                "tags": m.tags,
+                "node_uuid": str(m.node_uuid) if m.node_uuid else None,
+                "target_uuid": str(m.target_uuid) if m.target_uuid else None,
+                "node_type": m.node_type,
+            }
+            for m in parsed_mutations
+        ]
+        return (
+            f"MECHANICAL TRUTH: {len(parsed_mutations)} graph mutations validated "
+            f"(deferred execution). commit=False — pending narrator approval.\n"
+            f"Mutations: {json.dumps(mutation_summaries)}"
+        )
+
+    # Execute validated mutations (commit=True, the default)
+    for mutation in parsed_mutations:
+        mutation.execute(kg)
+
+    # Update active storylet occurrence counter if one is active
+    active_storylet_id = config["configurable"].get("active_storylet_id")
+    if active_storylet_id:
+        registry = get_storylet_registry(vault_path)
+        try:
+            storylet = registry.get(uuid.UUID(active_storylet_id))
+            if storylet:
+                storylet.current_occurrences += 1
+        except (ValueError, TypeError):
+            pass
+
+    return f"MECHANICAL TRUTH: {len(parsed_mutations)} graph mutations committed. Knowledge Graph updated."
+
+
+@tool
+async def sync_knowledge_graph(
+    direction: str = "to_vault",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Syncs the Knowledge Graph with the Obsidian vault.
+
+    Args:
+        direction: 'to_vault' (registry → KG) or 'from_vault' (KG → registry).
+    """
+    from registry import get_knowledge_graph
+    import asyncio
+
+    vault_path = config["configurable"].get("thread_id")
+
+    if direction == "to_vault":
+        from vault_io import sync_knowledge_graph_to_vault
+        kg = get_knowledge_graph(vault_path)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(sync_knowledge_graph_to_vault(vault_path, kg))
+            else:
+                result = loop.run_until_complete(sync_knowledge_graph_to_vault(vault_path, kg))
+        except Exception as e:
+            return f"SYSTEM ERROR: Failed to sync KG to vault: {e}"
+        return result
+
+    elif direction == "from_vault":
+        from vault_io import sync_knowledge_graph_from_vault
+        kg = get_knowledge_graph(vault_path)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(sync_knowledge_graph_from_vault(vault_path, kg))
+            else:
+                result = loop.run_until_complete(sync_knowledge_graph_from_vault(vault_path, kg))
+        except Exception as e:
+            return f"SYSTEM ERROR: Failed to sync KG from vault: {e}"
+        return result
+
+    return "SYSTEM ERROR: direction must be 'to_vault' or 'from_vault'."
