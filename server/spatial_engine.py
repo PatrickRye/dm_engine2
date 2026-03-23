@@ -166,6 +166,10 @@ class SpatialQueryService:
     The lock is acquired for the full duration of every public method that
     reads or writes shared state, preventing races when concurrent async
     dispatches (via asyncio.to_thread) touch the same vault from multiple threads.
+
+    Singleton constraint: must only be instantiated once per process.
+    Multiple instances share the class-level lock but maintain independent
+    per-vault map data. In practice, a single instance is shared globally.
     """
 
     # Shared reentrant lock — all instances share the same lock since this is a singleton.
@@ -201,10 +205,6 @@ class SpatialQueryService:
     def map_data(self) -> MapData:
         """Fallback helper for backward compatibility in test suites."""
         return self.get_map_data("default")
-
-    @map_data.setter
-    def map_data(self, value: MapData):
-        self._map_data["default"] = value
 
     @locked
     def get_map_data(self, vault_path: str = "default") -> MapData:

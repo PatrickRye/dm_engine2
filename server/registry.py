@@ -91,7 +91,7 @@ def get_candidate_uuids_by_prefix(name_lower: str, vault_path: str) -> set:
         if len(name_lower) < 3 or vault_path not in _PREFIX_INDEX:
             return set()
         prefix = name_lower[:3]
-        return _PREFIX_INDEX.get(vault_path, {}).get(prefix, set())
+        return set(_PREFIX_INDEX.get(vault_path, {}).get(prefix, set()))
 
 
 def clear_registry(vault_path: str = None) -> None:

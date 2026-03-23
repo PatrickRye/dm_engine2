@@ -2,6 +2,7 @@
 # To run the tests, execute `python test_dnd_rules_engine.py` in your terminal.
 
 import asyncio
+import sys
 import uuid
 import random
 import re
@@ -193,7 +194,17 @@ class ConditionalDamageWeapon(MagicWeaponDecorator):
     """A decorator that deals extra damage based on target properties."""
 
     conditions: List[DamageCondition]
-    _subscribed = False
+    # Class-level flag: shared across all instances. Reset in tests to force re-subscription.
+    _subscribed: bool = False
+
+    def __init__(self, *, weapon: Weapon, **data):
+        super().__init__(weapon=weapon, **data)
+        # Subscribe once globally (not per-instance).
+        # EventBus.subscribe deduplicates by handler identity, so re-subscription is safe.
+        with _CDW_LOCK:
+            if not ConditionalDamageWeapon._subscribed:
+                EventBus.subscribe("MeleeAttack", self.handle_attack, priority=50)
+                ConditionalDamageWeapon._subscribed = True
 
     def handle_attack(self, event: "GameEvent"):
         # This handler should run before the main resolve_attack_handler
@@ -210,27 +221,15 @@ class ConditionalDamageWeapon(MagicWeaponDecorator):
                 if "extra_damage_dice" not in event.payload:
                     event.payload["extra_damage_dice"] = []
                 event.payload["extra_damage_dice"].append(condition.extra_damage_dice)
-                print(
-                    f"[Engine] BONUS: {self.name} will deal extra {condition.extra_damage_dice} "
-                    f"{condition.damage_type} damage to the {condition.required_tag}!"
+                sys.stderr.write(
+                    f"[{threading.current_thread().name}] BONUS: {self.name} will deal extra "
+                    f"{condition.extra_damage_dice} {condition.damage_type} damage to "
+                    f"the {condition.required_tag}!\n"
                 )
 
 
 # Module-level lock to avoid Pydantic PrivateAttr deepcopy issues.
-# _subscribed is a class variable so it's shared across all instances.
 _CDW_LOCK = threading.RLock()
-
-
-def __cdw_init(self, *, weapon: Weapon, **data):
-    super(ConditionalDamageWeapon, self).__init__(weapon=weapon, **data)
-    with _CDW_LOCK:
-        if not ConditionalDamageWeapon._subscribed:
-            EventBus.subscribe("MeleeAttack", self.handle_attack, priority=50)
-            ConditionalDamageWeapon._subscribed = True
-
-
-# Patch after class definition to avoid Pydantic deepcopy on _CDW_LOCK
-ConditionalDamageWeapon.__init__ = __cdw_init
 
 
 class ActiveCondition(BaseModel):
@@ -377,13 +376,16 @@ class EventBus:
         with cls._lock:
             if event_type not in cls._listeners:
                 cls._listeners[event_type] = []
+            # Deduplicate: skip if the same handler is already registered
+            if any(h == handler for h, _ in cls._listeners[event_type]):
+                return
             cls._listeners[event_type].append((handler, priority))
             # Sort by priority, lowest number first
             cls._listeners[event_type].sort(key=lambda x: x[1])
 
     @classmethod
     def dispatch(cls, event: GameEvent) -> GameEvent:
-        print(f"\n--- Dispatched Event: {event.event_type} ---")
+        sys.stderr.write(f"[{threading.current_thread().name}] --- Event: {event.event_type} ---\n")
 
         # Acquire lock for the full dispatch cycle (handles reentrancy from
         # handler -> dispatch calls within the same thread via RLock).
@@ -391,7 +393,7 @@ class EventBus:
             event.status = EventStatus.PRE_EVENT
             cls._notify(event)
             if event.status == EventStatus.CANCELLED:
-                print("Event was CANCELLED during Pre-Event.")
+                sys.stderr.write(f"[{threading.current_thread().name}] Event was CANCELLED during Pre-Event.\n")
                 return event
 
             event.status = EventStatus.EXECUTION

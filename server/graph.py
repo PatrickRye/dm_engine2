@@ -24,8 +24,12 @@ from state import DMState, QAResult, TensionArc
 from vault_io import write_audit_log
 from system_logger import qa_logger
 from tools import _get_config_tone
+from mutation_manager import MutationManager
 
 MAX_QA_REVISIONS = 3
+
+# Mutation manager — extracted from pending_mutations flow across graph nodes
+_mutation_manager = MutationManager()
 
 # ---------------------------------------------------------------------
 # TTL + LRU Cache: GraphRAG context (invalidated on KG writes)
@@ -133,7 +137,10 @@ def _get_grag_context(kg, vault_path: str = None, active_character: str = None, 
             # Evict oldest entry if at capacity
             if len(_grag_cache) >= _GRAG_CACHE_MAX_SIZE:
                 oldest_key = min(_grag_cache, key=lambda k: _grag_cache[k][0])
-                del _grag_cache[oldest_key]
+                # TOCTOU guard: re-check after min() — key may have been removed by
+                # _invalidate_grag_cache() on another thread since we acquired the lock
+                if oldest_key in _grag_cache:
+                    del _grag_cache[oldest_key]
 
             # Compute and cache
             result = _compute_grag_context(kg, vault_path, active_character, max_hops)
@@ -290,9 +297,10 @@ def _build_kg_constraints_prompt(kg, vault_path: str = "default") -> str:
 
     Cached per vault (120s TTL) — invalidated by _invalidate_grag_cache when KG is mutated.
     """
-    # Check cache — include kg id so different KG instances don't collide
+    # Check cache — use hex(id(kg)) so different KG instances don't collide
+    # hex() gives stable string representation vs raw int id which can be reused
     now = time.monotonic()
-    kg_id = id(kg)
+    kg_id = hex(id(kg))
     with _kg_constraints_cache_lock:
         if vault_path in _kg_constraints_cache:
             ts, cached, cached_kg_id = _kg_constraints_cache[vault_path]
@@ -583,19 +591,14 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         # Skip this check when the next rejection would hit MAX_QA_REVISIONS (force-commit
         # will execute mutations anyway, so let them through to commit_node).
         pending_mutations = list(state.get("pending_mutations", []))
-        if pending_mutations and (revisions + 1) < MAX_QA_REVISIONS:
-            # Mutations still pending means narrator_node didn't execute them.
-            # This is anomalous — reject and force narrator to reprocess.
+        leak_msg = _mutation_manager.detect_leak(pending_mutations, revisions)
+        if leak_msg:
             await write_audit_log(
                 vault, "QA Agent", "Mutation Leak Detected",
                 f"{len(pending_mutations)} mutations leaked into QA without execution. Rejecting."
             )
             return {
-                "qa_feedback": (
-                    f"[MUTATION LEAK DETECTED]: {len(pending_mutations)} deferred mutations "
-                    "were not executed before reaching QA. This is an engine error. "
-                    "The narrator must execute pending mutations before QA review."
-                ),
+                "qa_feedback": leak_msg,
                 "revision_count": revisions + 1,
                 "pending_mutations": [],
             }
@@ -620,13 +623,14 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
 
         # Cross-check 3: Re-validate SVO claims in QA (independent backstop)
         if draft and pending_mutations:
-            from hard_guardrails import HardGuardrails
             from storylet import GraphMutation
 
-            guardrails = HardGuardrails(kg)
+            guardrails, _ = _mutation_manager.validate_pending(
+                pending_mutations, draft, kg,
+                {"vault_path": vault, "active_character": state.get("active_character", "Unknown")}
+            )
             mutations = [GraphMutation(**m) for m in pending_mutations]
-            ctx = {"vault_path": vault, "active_character": state.get("active_character", "Unknown")}
-            svo_result = guardrails.validate_svo_claims(draft, mutations, ctx)
+            svo_result = guardrails.validate_svo_claims(draft, mutations, {})
             if not svo_result.allowed:
                 await write_audit_log(vault, "QA Agent", "SVO Claim Rejected (QA backstop)", svo_result.reason)
                 return {
@@ -878,27 +882,17 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                 vault_path, "DramaManager", "Storylet Activated", selected.name
             )
 
-            # Collect witness_events from all effects and convert to pending_mutations
-            from registry import get_all_entities
-            pending = []
-            for effect in selected.effects:
-                for event_id in effect.witness_events:
-                    entities = get_all_entities(vault_path)
-                    for ent in entities.values():
-                        if getattr(ent, "name", None):
-                            pending.append({
-                                "mutation_type": "add_witness",
-                                "node_name": ent.name,
-                                "value": event_id,
-                            })
+            existing = list(state.get("pending_mutations", []))
+            pending = _mutation_manager.accumulate_from_storylet_effects(
+                existing, selected, vault_path
+            )
 
             result = {
                 "active_storylet_id": str(selected.id),
                 "tension_arc": dm.arc.to_dict(),
             }
             if pending:
-                existing = list(state.get("pending_mutations", []))
-                result["pending_mutations"] = existing + pending
+                result["pending_mutations"] = pending
             return result
 
         return {
@@ -1072,7 +1066,9 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         }
         if mutation_data:
             existing = list(state.get("pending_mutations", []))
-            updates["pending_mutations"] = existing + mutation_data
+            updates["pending_mutations"] = _mutation_manager.accumulate_from_tool_calls(
+                existing, mutation_data
+            )
 
         return updates
 
@@ -1101,7 +1097,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
 
         # Detect new player turn: HumanMessage means a fresh turn started.
         # Clear any stale pending_mutations from a QA-rejected previous turn.
-        if isinstance(last_msg, HumanMessage) and state.get("pending_mutations"):
+        if _mutation_manager.should_clear_on_human_message(state):
             updates["pending_mutations"] = []
             await write_audit_log(
                 state.get("vault_path", "default"),
@@ -1220,161 +1216,20 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     # This ensures the checkpointer never saves a state where mutations are
     # committed but the narrative is rejected — fixing the rollback/checkpointer
     # issue that required speculative execution.
-    # ------------------------------------------------------------------
-
-    def _update_attitude_edge(
-        kg,
-        node,
-        old_val: int,
-        new_val: int,
-        party_uuid,
-    ) -> None:
-        """
-        When disposition_toward_party or faction_standing crosses a threshold,
-        auto-add/update/remove the HOSTILE_TOWARD or ALLIED_WITH edge to the party.
-        Thresholds: <30 hostile, >70 friendly, 30-70 neutral.
-        """
-        if party_uuid is None:
-            return
-
-        def _current_attitude() -> Optional[str]:
-            """Returns 'hostile', 'friendly', or None based on existing edges."""
-            for edge in kg.edges:
-                if edge.subject_uuid != node.node_uuid:
-                    continue
-                if edge.object_uuid != party_uuid:
-                    continue
-                if edge.predicate == GraphPredicate.HOSTILE_TOWARD:
-                    return "hostile"
-                if edge.predicate == GraphPredicate.ALLIED_WITH:
-                    return "friendly"
-            return None
-
-        def _set_attitude(predicate: GraphPredicate) -> None:
-            # Remove any existing attitude edge first
-            for edge in list(kg.edges):
-                if (
-                    edge.subject_uuid == node.node_uuid
-                    and edge.object_uuid == party_uuid
-                    and edge.predicate in (GraphPredicate.HOSTILE_TOWARD, GraphPredicate.ALLIED_WITH)
-                ):
-                    kg.remove_edge(edge.edge_uuid)
-            # Add new attitude edge
-            kg.add_edge(
-                KnowledgeGraphEdge(
-                    subject_uuid=node.node_uuid,
-                    predicate=predicate,
-                    object_uuid=party_uuid,
-                )
-            )
-
-        old_state = "hostile" if old_val < 30 else ("friendly" if old_val > 70 else None)
-        new_state = "hostile" if new_val < 30 else ("friendly" if new_val > 70 else None)
-
-        if old_state == new_state:
-            return  # No threshold crossed
-
-        if new_state is None:
-            # Back to neutral — remove attitude edge
-            _set_attitude(GraphPredicate.HOSTILE_TOWARD)  # removes both types first
-        elif new_state == "hostile":
-            _set_attitude(GraphPredicate.HOSTILE_TOWARD)
-        elif new_state == "friendly":
-            _set_attitude(GraphPredicate.ALLIED_WITH)
-
     async def commit_node(state: DMState, config: RunnableConfig):
         from registry import get_knowledge_graph
 
         vault_path = state.get("vault_path", "default")
         kg = get_knowledge_graph(vault_path)
         pending = list(state.get("pending_mutations", []))
-        mutation_errors: List[str] = []
         narrative_context = state.get("draft_response", "")
 
         if pending:
-            from storylet import GraphMutation
-            from knowledge_graph import GraphPredicate, KnowledgeGraphEdge
-
-            committed = 0
-            newly_created_entities: List[str] = []
-            # Snapshot attitude values before mutations so we can detect threshold crossings
-            party_uuid = kg.find_node_uuid("The Party") or kg.find_node_uuid("Party")
-
-            for mdict in pending:
-                try:
-                    mutation = GraphMutation(**mdict)
-                    mutation.execute(kg)
-                    committed += 1
-                    if mutation.mutation_type == "add_node" and mutation.node_name:
-                        newly_created_entities.append(mutation.node_name)
-
-                    # Auto-update attitude edges when disposition/standing crosses threshold
-                    if mutation.mutation_type == "set_attribute" and mutation.attribute in (
-                        "disposition_toward_party",
-                        "faction_standing",
-                    ):
-                        node = kg.get_node(mutation._resolve_node_uuid(kg)) if mutation._resolve_node_uuid(kg) else None
-                        if not node:
-                            continue
-
-                        if mutation.attribute == "disposition_toward_party":
-                            new_val = mutation.value
-                            old_val = node.attributes.get("disposition_toward_party", 50)
-                            _update_attitude_edge(kg, node, old_val, new_val, party_uuid)
-                        elif mutation.attribute == "faction_standing":
-                            # value is a dict like {"party": X} or {"character_name": X}
-                            new_standing = mutation.value or {}
-                            old_standing = node.attributes.get("faction_standing", {})
-                            party_key = "party"
-                            old_val = old_standing.get(party_key, 50)
-                            new_val = new_standing.get(party_key, old_val)
-                            _update_attitude_edge(kg, node, old_val, new_val, party_uuid)
-                except Exception as e:
-                    err_msg = (
-                        f"Mutation execution failed: {mdict.get('mutation_type')} "
-                        f"on {mdict.get('node_name')}: {e}"
-                    )
-                    mutation_errors.append(err_msg)
-                    await write_audit_log(
-                        vault_path,
-                        "CommitNode",
-                        "Mutation Execution Error",
-                        err_msg,
-                    )
-            await write_audit_log(
-                vault_path,
-                "CommitNode",
-                "Mutations Committed",
-                f"{committed}/{len(pending)} deferred mutations executed after QA approval.",
+            mutation_errors, _ = await _mutation_manager.execute_pending(
+                pending, kg, vault_path, draft_llm, narrative_context
             )
-            # Invalidate GraphRAG cache since KG was modified
-            _invalidate_grag_cache(vault_path)
-
-            # Emergent Worldbuilding: flesh out newly created entities
-            for entity_name in newly_created_entities:
-                try:
-                    from ingestion_pipeline import EmergentWorldBuilder
-                    # Use the draft_llm from the graph closure for LLM-powered fleshing
-                    builder = EmergentWorldBuilder(llm=draft_llm, vault_path=vault_path)
-                    report = await builder.on_entity_created(
-                        entity_name=entity_name,
-                        context=narrative_context,
-                    )
-                    await write_audit_log(
-                        vault_path,
-                        "EmergentWorldBuilder",
-                        "Entity Hydrated",
-                        f"Entity '{entity_name}' fleshed out: "
-                        f"{report.storylets_created} storylets, {report.edges_created} edges created."
-                        + (f" Warnings: {report.warnings}" if report.warnings else ""),
-                    )
-                except Exception as e:
-                    await write_audit_log(
-                        vault_path,
-                        "EmergentWorldBuilder",
-                        "Hydration Skipped",
-                        f"Could not hydrate '{entity_name}': {e}",
-                    )
+        else:
+            mutation_errors = []
 
         await write_audit_log(
             vault_path, "CommitNode", "Turn Complete",
@@ -1385,7 +1240,6 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             "qa_feedback": "APPROVED",
             "pending_mutations": [],
             "mutation_errors": mutation_errors,
-            # Keep kg_snapshot as the committed state record
         }
 
     # ------------------------------------------------------------------
