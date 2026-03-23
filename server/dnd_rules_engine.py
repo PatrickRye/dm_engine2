@@ -5,6 +5,7 @@ import asyncio
 import uuid
 import random
 import re
+import threading
 from enum import Enum, IntEnum
 from typing import ClassVar, Dict, Any, List, Callable, Optional, Tuple
 from pydantic import BaseModel, Field, PrivateAttr
@@ -349,37 +350,49 @@ class GameEvent(BaseModel):
 
 
 class EventBus:
-    """Manages the lifecycle and listeners for all game events."""
+    """
+    Manages the lifecycle and listeners for all game events.
+
+    Thread-safety: uses a reentrant lock so that synchronous dispatch cycles
+    (dispatch -> _notify -> handler -> dispatch) never deadlock. The lock also
+    allows concurrent dispatches from different threads (via asyncio.to_thread)
+    to safely coexist since they each acquire the lock independently.
+    """
 
     _listeners: ClassVar[Dict[str, List[Tuple[Callable, int]]]] = {}
+    _lock: ClassVar[threading.RLock] = threading.RLock()
 
     @classmethod
     def subscribe(cls, event_type: str, handler: Callable, priority: int = 10):
-        if event_type not in cls._listeners:
-            cls._listeners[event_type] = []
-        cls._listeners[event_type].append((handler, priority))
-        # Sort by priority, lowest number first
-        cls._listeners[event_type].sort(key=lambda x: x[1])
+        with cls._lock:
+            if event_type not in cls._listeners:
+                cls._listeners[event_type] = []
+            cls._listeners[event_type].append((handler, priority))
+            # Sort by priority, lowest number first
+            cls._listeners[event_type].sort(key=lambda x: x[1])
 
     @classmethod
     def dispatch(cls, event: GameEvent) -> GameEvent:
         print(f"\n--- Dispatched Event: {event.event_type} ---")
 
-        event.status = EventStatus.PRE_EVENT
-        cls._notify(event)
-        if event.status == EventStatus.CANCELLED:
-            print("Event was CANCELLED during Pre-Event.")
+        # Acquire lock for the full dispatch cycle (handles reentrancy from
+        # handler -> dispatch calls within the same thread via RLock).
+        with cls._lock:
+            event.status = EventStatus.PRE_EVENT
+            cls._notify(event)
+            if event.status == EventStatus.CANCELLED:
+                print("Event was CANCELLED during Pre-Event.")
+                return event
+
+            event.status = EventStatus.EXECUTION
+            cls._notify(event)
+
+            event.status = EventStatus.POST_EVENT
+            cls._notify(event)
+
+            event.status = EventStatus.RESOLVED
+            cls._notify(event)
             return event
-
-        event.status = EventStatus.EXECUTION
-        cls._notify(event)
-
-        event.status = EventStatus.POST_EVENT
-        cls._notify(event)
-
-        event.status = EventStatus.RESOLVED
-        cls._notify(event)
-        return event
 
     @classmethod
     async def adispatch(cls, event: "GameEvent") -> "GameEvent":
@@ -389,8 +402,15 @@ class EventBus:
 
     @classmethod
     def _notify(cls, event: GameEvent):
+        # Called while holding _lock — safe even when handlers synchronously re-dispatch.
         for handler, _ in cls._listeners.get(event.event_type, []):
             handler(event)
+
+    @classmethod
+    def clear_listeners(cls) -> None:
+        """Thread-safe clear of all listeners. Use instead of direct _listeners.clear()."""
+        with cls._lock:
+            cls._listeners.clear()
 
 
 # ==========================================

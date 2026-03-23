@@ -1,7 +1,8 @@
+import threading
 import uuid
 import math
 from collections import OrderedDict
-from typing import Any, List, Tuple, Dict, Optional, Protocol
+from typing import Any, List, Tuple, Dict, Optional, Protocol, ClassVar
 from pydantic import BaseModel, Field, PrivateAttr
 
 
@@ -159,7 +160,16 @@ class SpatialQueryService:
     """
     A headless, deterministic spatial engine utilizing GIS libraries.
     Provides mathematical answers to mechanical game logic without rendering.
+
+    Thread-safe: all mutable state is protected by a class-level reentrant lock.
+    The lock is acquired for the full duration of every public method that
+    reads or writes shared state, preventing races when concurrent async
+    dispatches (via asyncio.to_thread) touch the same vault from multiple threads.
     """
+
+    # Shared reentrant lock — all instances share the same lock since this is a singleton.
+    # RLock allows reentrant acquisition so dispatch -> handler -> dispatch cycles don't deadlock.
+    _lock: ClassVar[threading.RLock] = threading.RLock()
 
     def __init__(self):
         self._map_data: Dict[str, MapData] = {}
@@ -277,14 +287,15 @@ class SpatialQueryService:
 
     def reveal_fog_of_war(self, x: float, y: float, radius: float, vault_path: str = "default"):
         """Adds a circular area to the explored regions of the current map."""
-        qx, qy, qr = round(x, 1), round(y, 1), round(radius, 1)
-        md = self.get_map_data(vault_path)
-        for ex, ey, er in md.explored_areas:
-            dist = math.hypot(qx - ex, qy - ey)
-            if dist + qr <= er:
-                return
+        with self._lock:
+            qx, qy, qr = round(x, 1), round(y, 1), round(radius, 1)
+            md = self.get_map_data(vault_path)
+            for ex, ey, er in md.explored_areas:
+                dist = math.hypot(qx - ex, qy - ey)
+                if dist + qr <= er:
+                    return
 
-        md.explored_areas.append((qx, qy, qr))
+            md.explored_areas.append((qx, qy, qr))
 
     def _rebuild_indices(self, vault_path: str = "default"):
         """Rebuilds all R-tree indices and derived caches when map geometry changes."""
@@ -879,75 +890,76 @@ class SpatialQueryService:
         if not HAS_GIS:
             return 0.0, "None"
 
-        self.get_map_data(vault_path)
-        source = self._entities.get(vault_path, {}).get(source_uuid)
-        target = self._entities.get(vault_path, {}).get(target_uuid)
-        if not source or not target:
-            return 5.0, "None"
+        with self._lock:
+            self.get_map_data(vault_path)
+            source = self._entities.get(vault_path, {}).get(source_uuid)
+            target = self._entities.get(vault_path, {}).get(target_uuid)
+            if not source or not target:
+                return 5.0, "None"
 
-        dist = self.calculate_distance(source.x, source.y, source.z, target.x, target.y, target.z, vault_path)
+            dist = self.calculate_distance(source.x, source.y, source.z, target.x, target.y, target.z, vault_path)
 
-        source_hash = self._get_entity_spatial_hash(source)
-        target_hash = self._get_entity_spatial_hash(target)
-        cache_key = ("cover", source_hash, target_hash)
+            source_hash = self._get_entity_spatial_hash(source)
+            target_hash = self._get_entity_spatial_hash(target)
+            cache_key = ("cover", source_hash, target_hash)
 
-        if cache_key in self._raycast_cache.get(vault_path, {}):
-            return dist, self._raycast_cache[vault_path][cache_key]
+            if cache_key in self._raycast_cache.get(vault_path, {}):
+                return dist, self._raycast_cache[vault_path][cache_key]
 
-        source_poly = self._get_entity_bbox(source)
-        target_poly = self._get_entity_bbox(target)
+            source_poly = self._get_entity_bbox(source)
+            target_poly = self._get_entity_bbox(target)
 
-        source_corners = list(source_poly.exterior.coords)[:-1]
-        target_corners = list(target_poly.exterior.coords)[:-1]
+            source_corners = list(source_poly.exterior.coords)[:-1]
+            target_corners = list(target_poly.exterior.coords)[:-1]
 
-        s_z = source.z + getattr(source, "height", 5.0)
-        t_z = target.z + (getattr(target, "height", 5.0) / 2.0)
+            s_z = source.z + getattr(source, "height", 5.0)
+            t_z = target.z + (getattr(target, "height", 5.0) / 2.0)
 
-        best_visible_corners = 0
-        for s_corner in source_corners:
-            visible_corners = 0
-            for t_corner in target_corners:
-                line = LineString([s_corner, t_corner])
-                blocked = False
-                wall_candidates = list(self.wall_idx[vault_path].intersection(line.bounds))
-                for cid in wall_candidates:
-                    wall = self._wall_map[vault_path][cid]
-                    if not wall.is_solid:
-                        continue
-                    # Use intersection() directly — avoids the redundant intersects() pre-check
-                    inter = line.intersection(wall.line)
-                    if inter.is_empty:
-                        continue
-                    if line.length > 0:
-                        # math.hypot avoids allocating a Shapely Point just for distance
-                        frac_dist = math.hypot(inter.x - s_corner[0], inter.y - s_corner[1])
-                        fraction = frac_dist / line.length
-                    else:
-                        fraction = 0.0
+            best_visible_corners = 0
+            for s_corner in source_corners:
+                visible_corners = 0
+                for t_corner in target_corners:
+                    line = LineString([s_corner, t_corner])
+                    blocked = False
+                    wall_candidates = list(self.wall_idx[vault_path].intersection(line.bounds))
+                    for cid in wall_candidates:
+                        wall = self._wall_map[vault_path][cid]
+                        if not wall.is_solid:
+                            continue
+                        # Use intersection() directly — avoids the redundant intersects() pre-check
+                        inter = line.intersection(wall.line)
+                        if inter.is_empty:
+                            continue
+                        if line.length > 0:
+                            # math.hypot avoids allocating a Shapely Point just for distance
+                            frac_dist = math.hypot(inter.x - s_corner[0], inter.y - s_corner[1])
+                            fraction = frac_dist / line.length
+                        else:
+                            fraction = 0.0
 
-                    ray_z = s_z + fraction * (t_z - s_z)
-                    if wall.z <= ray_z <= wall.z + wall.height:
-                        blocked = True
-                        break
-                if not blocked:
-                    visible_corners += 1
+                        ray_z = s_z + fraction * (t_z - s_z)
+                        if wall.z <= ray_z <= wall.z + wall.height:
+                            blocked = True
+                            break
+                    if not blocked:
+                        visible_corners += 1
 
-            if visible_corners > best_visible_corners:
-                best_visible_corners = visible_corners
+                if visible_corners > best_visible_corners:
+                    best_visible_corners = visible_corners
+                if best_visible_corners == 4:
+                    break
+
             if best_visible_corners == 4:
-                break
+                cover = "None"
+            elif best_visible_corners >= 2:
+                cover = "Half"
+            elif best_visible_corners == 1:
+                cover = "Three-Quarters"
+            else:
+                cover = "Total"
 
-        if best_visible_corners == 4:
-            cover = "None"
-        elif best_visible_corners >= 2:
-            cover = "Half"
-        elif best_visible_corners == 1:
-            cover = "Three-Quarters"
-        else:
-            cover = "Total"
-
-        self._cache_set(vault_path, cache_key, cover)
-        return dist, cover
+            self._cache_set(vault_path, cache_key, cover)
+            return dist, cover
 
     def get_intervening_creatures(
         self, source_uuid: uuid.UUID, target_uuid: uuid.UUID, vault_path: str = "default"
@@ -955,32 +967,34 @@ class SpatialQueryService:
         """Returns a list of entity UUIDs that intersect the straight line between source and target."""
         if not HAS_GIS:
             return []
-        source = self._entities.get(vault_path, {}).get(source_uuid)
-        target = self._entities.get(vault_path, {}).get(target_uuid)
-        if not source or not target:
-            return []
-        path = LineString([(source.x, source.y), (target.x, target.y)])
-        candidates = list(self.entity_idx[vault_path].intersection(path.bounds))
-        interveners = []
-        for cid in candidates:
-            e_uuid = self._id_to_uuid[vault_path][cid]
-            if e_uuid in [source_uuid, target_uuid]:
-                continue
-            e_obj = self._entities[vault_path][e_uuid]
-            if getattr(e_obj, "hp", None) and e_obj.hp.base_value <= 0:
-                continue
-            if path.intersects(self._get_entity_bbox(e_obj)):
-                interveners.append(e_uuid)
-        return interveners
+        with self._lock:
+            source = self._entities.get(vault_path, {}).get(source_uuid)
+            target = self._entities.get(vault_path, {}).get(target_uuid)
+            if not source or not target:
+                return []
+            path = LineString([(source.x, source.y), (target.x, target.y)])
+            candidates = list(self.entity_idx[vault_path].intersection(path.bounds))
+            interveners = []
+            for cid in candidates:
+                e_uuid = self._id_to_uuid[vault_path][cid]
+                if e_uuid in [source_uuid, target_uuid]:
+                    continue
+                e_obj = self._entities[vault_path][e_uuid]
+                if getattr(e_obj, "hp", None) and e_obj.hp.base_value <= 0:
+                    continue
+                if path.intersects(self._get_entity_bbox(e_obj)):
+                    interveners.append(e_uuid)
+            return interveners
 
     def has_line_of_sight(self, source_uuid: uuid.UUID, target_uuid: uuid.UUID, vault_path: str = "default") -> bool:
         """Determines if the center point of the target is visible."""
         target = self._entities.get(vault_path, {}).get(target_uuid)
-        if not target:
-            return False
-        return self.has_line_of_sight_to_point(
-            source_uuid, target.x, target.y, target.z + (getattr(target, "height", 5.0) / 2.0), vault_path
-        )
+        with self._lock:
+            if not target:
+                return False
+            return self.has_line_of_sight_to_point(
+                source_uuid, target.x, target.y, target.z + (getattr(target, "height", 5.0) / 2.0), vault_path
+            )
 
     def calculate_path_terrain_costs(
         self,
@@ -993,56 +1007,57 @@ class SpatialQueryService:
         vault_path: str = "default",
     ) -> Tuple[float, float]:
         """Calculates how much of a path traverses normal terrain vs difficult terrain."""
-        total_distance = self.calculate_distance(start_x, start_y, start_z, end_x, end_y, end_z, vault_path)
-        md = self.get_map_data(vault_path)
-        if not HAS_GIS or not md.active_terrain:
-            return total_distance, 0.0
-
-        path = LineString([(start_x, start_y), (end_x, end_y)])
-        min_z = min(start_z, end_z)
-        max_z = max(start_z, end_z)
-
-        # Fast path: use pre-built terrain union for flat ground-level movement (covers ~99% of calls)
-        is_flat_path = min_z <= 0.1 and max_z <= 5.0
-        cached_union = self._terrain_union_cache.get(vault_path)
-        if is_flat_path and cached_union is not None:
-            union_poly = cached_union
-        else:
-            # Elevated or non-standard path: build union from per-z-filtered candidates
-            terrain_candidates = list(self.terrain_idx[vault_path].intersection(path.bounds))
-            difficult_polys = []
-            for cid in terrain_candidates:
-                zone = self._terrain_map[vault_path][cid]
-                if zone.is_difficult and (max_z >= zone.z and min_z <= zone.z + max(zone.height, 0.1)):
-                    if zone.polygon:
-                        difficult_polys.append(zone.polygon)
-            if not difficult_polys:
+        with self._lock:
+            total_distance = self.calculate_distance(start_x, start_y, start_z, end_x, end_y, end_z, vault_path)
+            md = self.get_map_data(vault_path)
+            if not HAS_GIS or not md.active_terrain:
                 return total_distance, 0.0
-            union_poly = unary_union(difficult_polys)
 
-        intersection = path.intersection(union_poly)
+            path = LineString([(start_x, start_y), (end_x, end_y)])
+            min_z = min(start_z, end_z)
+            max_z = max(start_z, end_z)
 
-        difficult_distance = 0.0
-        if not intersection.is_empty:
-            lines = []
-            if intersection.geom_type == "LineString":
-                lines = [intersection]
-            elif intersection.geom_type == "MultiLineString":
-                lines = list(intersection.geoms)
+            # Fast path: use pre-built terrain union for flat ground-level movement (covers ~99% of calls)
+            is_flat_path = min_z <= 0.1 and max_z <= 5.0
+            cached_union = self._terrain_union_cache.get(vault_path)
+            if is_flat_path and cached_union is not None:
+                union_poly = cached_union
+            else:
+                # Elevated or non-standard path: build union from per-z-filtered candidates
+                terrain_candidates = list(self.terrain_idx[vault_path].intersection(path.bounds))
+                difficult_polys = []
+                for cid in terrain_candidates:
+                    zone = self._terrain_map[vault_path][cid]
+                    if zone.is_difficult and (max_z >= zone.z and min_z <= zone.z + max(zone.height, 0.1)):
+                        if zone.polygon:
+                            difficult_polys.append(zone.polygon)
+                if not difficult_polys:
+                    return total_distance, 0.0
+                union_poly = unary_union(difficult_polys)
 
-            total_2d = path.length
-            if total_2d > 0:
-                for line in lines:
-                    coords = list(line.coords)
-                    if len(coords) >= 2:
-                        z1 = start_z + (end_z - start_z) * (path.project(Point(coords[0])) / total_2d)
-                        z2 = start_z + (end_z - start_z) * (path.project(Point(coords[-1])) / total_2d)
-                        difficult_distance += self.calculate_distance(
-                            coords[0][0], coords[0][1], z1, coords[-1][0], coords[-1][1], z2, vault_path
-                        )
+            intersection = path.intersection(union_poly)
 
-        difficult_distance = min(difficult_distance, total_distance)
-        return total_distance - difficult_distance, difficult_distance
+            difficult_distance = 0.0
+            if not intersection.is_empty:
+                lines = []
+                if intersection.geom_type == "LineString":
+                    lines = [intersection]
+                elif intersection.geom_type == "MultiLineString":
+                    lines = list(intersection.geoms)
+
+                total_2d = path.length
+                if total_2d > 0:
+                    for line in lines:
+                        coords = list(line.coords)
+                        if len(coords) >= 2:
+                            z1 = start_z + (end_z - start_z) * (path.project(Point(coords[0])) / total_2d)
+                            z2 = start_z + (end_z - start_z) * (path.project(Point(coords[-1])) / total_2d)
+                            difficult_distance += self.calculate_distance(
+                                coords[0][0], coords[0][1], z1, coords[-1][0], coords[-1][1], z2, vault_path
+                            )
+
+            difficult_distance = min(difficult_distance, total_distance)
+            return total_distance - difficult_distance, difficult_distance
 
     def check_path_collision(
         self,
@@ -1061,77 +1076,78 @@ class SpatialQueryService:
         viewer_uuid: if set and check_vision=True, illusion walls revealed for this viewer are skipped (REQ-ILL)."""
         if not HAS_GIS:
             return False
-        self.get_map_data(vault_path)
+        with self._lock:
+            self.get_map_data(vault_path)
 
-        viewer_str = str(viewer_uuid) if viewer_uuid else None
-        cache_key = (
-            "path",
-            round(start_x, 1),
-            round(start_y, 1),
-            round(start_z, 1),
-            round(end_x, 1),
-            round(end_y, 1),
-            round(end_z, 1),
-            round(entity_height, 1),
-            check_vision,
-            viewer_str,
-        )
-        if cache_key in self._raycast_cache.get(vault_path, {}):
-            return self._raycast_cache[vault_path][cache_key]
+            viewer_str = str(viewer_uuid) if viewer_uuid else None
+            cache_key = (
+                "path",
+                round(start_x, 1),
+                round(start_y, 1),
+                round(start_z, 1),
+                round(end_x, 1),
+                round(end_y, 1),
+                round(end_z, 1),
+                round(entity_height, 1),
+                check_vision,
+                viewer_str,
+            )
+            if cache_key in self._raycast_cache.get(vault_path, {}):
+                return self._raycast_cache[vault_path][cache_key]
 
-        path = LineString([(start_x, start_y), (end_x, end_y)])
-        wall_candidates = list(self.wall_idx[vault_path].intersection(path.bounds))
-        for cid in wall_candidates:
-            wall = self._wall_map[vault_path][cid]
-            blocks = wall.is_visible if check_vision else wall.is_solid
-            # REQ-ILL: Skip illusion walls that have been revealed for this viewer
-            if check_vision and wall.is_illusion and viewer_str and viewer_str in wall.revealed_for:
-                continue
-            if blocks and path.intersects(wall.line):
-                inter = path.intersection(wall.line)
-                if inter.is_empty:
+            path = LineString([(start_x, start_y), (end_x, end_y)])
+            wall_candidates = list(self.wall_idx[vault_path].intersection(path.bounds))
+            for cid in wall_candidates:
+                wall = self._wall_map[vault_path][cid]
+                blocks = wall.is_visible if check_vision else wall.is_solid
+                # REQ-ILL: Skip illusion walls that have been revealed for this viewer
+                if check_vision and wall.is_illusion and viewer_str and viewer_str in wall.revealed_for:
                     continue
+                if blocks and path.intersects(wall.line):
+                    inter = path.intersection(wall.line)
+                    if inter.is_empty:
+                        continue
 
-                if path.length > 0:
-                    fraction = Point(start_x, start_y).distance(inter) / path.length
-                else:
-                    fraction = 0.0
+                    if path.length > 0:
+                        fraction = Point(start_x, start_y).distance(inter) / path.length
+                    else:
+                        fraction = 0.0
 
-                cross_z = start_z + fraction * (end_z - start_z)
-                if not (cross_z + entity_height <= wall.z or cross_z >= wall.z + wall.height):
-                    self._cache_set(vault_path, cache_key, wall)
-                    return wall
-        self._cache_set(vault_path, cache_key, False)
-        return None
+                    cross_z = start_z + fraction * (end_z - start_z)
+                    if not (cross_z + entity_height <= wall.z or cross_z >= wall.z + wall.height):
+                        self._cache_set(vault_path, cache_key, wall)
+                        return wall
+            self._cache_set(vault_path, cache_key, False)
+            return None
 
     def get_illumination(self, target_x: float, target_y: float, target_z: float, vault_path: str = "default") -> str:
         """Determines the highest level of illumination at a specific point, respecting Line of Sight."""
         if not HAS_GIS:
             return "bright"
+        with self._lock:
+            md = self.get_map_data(vault_path)
+            highest_illum = "darkness"
 
-        md = self.get_map_data(vault_path)
-        highest_illum = "darkness"
+            for light in md.active_lights:
+                # Resolve light position: entity-attached follows entity, static uses own coords
+                if light.attached_to_entity_uuid:
+                    ent = self._entities.get(vault_path, {}).get(light.attached_to_entity_uuid)
+                    if not ent:
+                        continue
+                    lx, ly, lz = ent.x, ent.y, ent.z
+                else:
+                    lx, ly, lz = light.x, light.y, light.z
+                dist = self.calculate_distance(lx, ly, lz, target_x, target_y, target_z, vault_path)
+                if dist <= light.dim_radius:
+                    if not self.check_path_collision(
+                        lx, ly, lz, target_x, target_y, target_z,
+                        entity_height=0.1, check_vision=True, vault_path=vault_path,
+                    ):
+                        if dist <= light.bright_radius:
+                            return "bright"
+                        highest_illum = "dim"
 
-        for light in md.active_lights:
-            # Resolve light position: entity-attached follows entity, static uses own coords
-            if light.attached_to_entity_uuid:
-                ent = self._entities.get(vault_path, {}).get(light.attached_to_entity_uuid)
-                if not ent:
-                    continue
-                lx, ly, lz = ent.x, ent.y, ent.z
-            else:
-                lx, ly, lz = light.x, light.y, light.z
-            dist = self.calculate_distance(lx, ly, lz, target_x, target_y, target_z, vault_path)
-            if dist <= light.dim_radius:
-                if not self.check_path_collision(
-                    lx, ly, lz, target_x, target_y, target_z,
-                    entity_height=0.1, check_vision=True, vault_path=vault_path,
-                ):
-                    if dist <= light.bright_radius:
-                        return "bright"
-                    highest_illum = "dim"
-
-        return highest_illum
+            return highest_illum
 
     def has_line_of_sight_to_point(
         self, source_uuid: uuid.UUID, target_x: float, target_y: float, target_z: float = 0.0, vault_path: str = "default"
@@ -1139,46 +1155,47 @@ class SpatialQueryService:
         """Checks if a source entity has unbroken line of sight to a specific coordinate from ANY of its corners."""
         if not HAS_GIS:
             return True
-        self.get_map_data(vault_path)
+        with self._lock:
+            self.get_map_data(vault_path)
 
-        source = self._entities.get(vault_path, {}).get(source_uuid)
-        if not source:
+            source = self._entities.get(vault_path, {}).get(source_uuid)
+            if not source:
+                return False
+
+            source_hash = self._get_entity_spatial_hash(source)
+            cache_key = ("los_point", source_hash, round(target_x, 1), round(target_y, 1), round(target_z, 1))
+            if cache_key in self._raycast_cache.get(vault_path, {}):
+                return self._raycast_cache[vault_path][cache_key]
+
+            source_poly = self._get_entity_bbox(source)
+            source_corners = list(source_poly.exterior.coords)[:-1]
+
+            s_z = source.z + getattr(source, "height", 5.0)
+
+            for s_corner in source_corners:
+                path = LineString([s_corner, (target_x, target_y)])
+                corner_blocked = False
+                wall_candidates = list(self.wall_idx[vault_path].intersection(path.bounds))
+                for cid in wall_candidates:
+                    wall = self._wall_map[vault_path][cid]
+                    if wall.is_visible and path.intersects(wall.line):
+                        inter = path.intersection(wall.line)
+                        if inter.is_empty:
+                            continue
+                        if path.length > 0:
+                            fraction = Point(s_corner).distance(inter) / path.length
+                        else:
+                            fraction = 0.0
+
+                        ray_z = s_z + fraction * (target_z - s_z)
+                        if wall.z <= ray_z <= wall.z + wall.height:
+                            corner_blocked = True
+                            break
+                if not corner_blocked:
+                    self._cache_set(vault_path, cache_key, True)
+                    return True
+            self._cache_set(vault_path, cache_key, False)
             return False
-
-        source_hash = self._get_entity_spatial_hash(source)
-        cache_key = ("los_point", source_hash, round(target_x, 1), round(target_y, 1), round(target_z, 1))
-        if cache_key in self._raycast_cache.get(vault_path, {}):
-            return self._raycast_cache[vault_path][cache_key]
-
-        source_poly = self._get_entity_bbox(source)
-        source_corners = list(source_poly.exterior.coords)[:-1]
-
-        s_z = source.z + getattr(source, "height", 5.0)
-
-        for s_corner in source_corners:
-            path = LineString([s_corner, (target_x, target_y)])
-            corner_blocked = False
-            wall_candidates = list(self.wall_idx[vault_path].intersection(path.bounds))
-            for cid in wall_candidates:
-                wall = self._wall_map[vault_path][cid]
-                if wall.is_visible and path.intersects(wall.line):
-                    inter = path.intersection(wall.line)
-                    if inter.is_empty:
-                        continue
-                    if path.length > 0:
-                        fraction = Point(s_corner).distance(inter) / path.length
-                    else:
-                        fraction = 0.0
-
-                    ray_z = s_z + fraction * (target_z - s_z)
-                    if wall.z <= ray_z <= wall.z + wall.height:
-                        corner_blocked = True
-                        break
-            if not corner_blocked:
-                self._cache_set(vault_path, cache_key, True)
-                return True
-        self._cache_set(vault_path, cache_key, False)
-        return False
 
     def get_shape_points(
         self, shape: str, size: float, origin_x: float, origin_y: float, target_x: float = None, target_y: float = None
@@ -1186,74 +1203,76 @@ class SpatialQueryService:
         """Returns the boundary coordinates of an AoE shape for precise TerrainZone generation."""
         if not HAS_GIS:
             return []
-        shape = shape.lower()
-        aoe_poly = None
+        with self._lock:
+            shape = shape.lower()
+            aoe_poly = None
 
-        if shape in ["circle", "sphere", "cylinder"]:
-            aoe_poly = Point(origin_x, origin_y).buffer(size)
-        elif shape == "cube":
-            aoe_poly = box(origin_x - size / 2, origin_y - size / 2, origin_x + size / 2, origin_y + size / 2)
-        elif shape in ["cone", "line"]:
-            if target_x is None or target_y is None:
-                return []
-            dx, dy = target_x - origin_x, target_y - origin_y
-            dist_2d = math.hypot(dx, dy)
-            vx, vy = (dx / dist_2d, dy / dist_2d) if dist_2d > 0 else (1.0, 0.0)
+            if shape in ["circle", "sphere", "cylinder"]:
+                aoe_poly = Point(origin_x, origin_y).buffer(size)
+            elif shape == "cube":
+                aoe_poly = box(origin_x - size / 2, origin_y - size / 2, origin_x + size / 2, origin_y + size / 2)
+            elif shape in ["cone", "line"]:
+                if target_x is None or target_y is None:
+                    return []
+                dx, dy = target_x - origin_x, target_y - origin_y
+                dist_2d = math.hypot(dx, dy)
+                vx, vy = (dx / dist_2d, dy / dist_2d) if dist_2d > 0 else (1.0, 0.0)
 
-            if shape == "cone":
-                if vx == 0 and vy == 0:
-                    aoe_poly = Point(origin_x, origin_y).buffer(size * 0.5)
-                else:
-                    angle_deg = 53.1
-                    angle_xy = math.atan2(vy, vx)
-                    start_angle = angle_xy - math.radians(angle_deg / 2)
-                    end_angle = angle_xy + math.radians(angle_deg / 2)
+                if shape == "cone":
+                    if vx == 0 and vy == 0:
+                        aoe_poly = Point(origin_x, origin_y).buffer(size * 0.5)
+                    else:
+                        angle_deg = 53.1
+                        angle_xy = math.atan2(vy, vx)
+                        start_angle = angle_xy - math.radians(angle_deg / 2)
+                        end_angle = angle_xy + math.radians(angle_deg / 2)
 
-                    points = [(origin_x, origin_y)]
-                    num_segments = max(4, int(angle_deg / 15))
-                    for i in range(num_segments + 1):
-                        theta = start_angle + i * (end_angle - start_angle) / num_segments
-                        points.append((origin_x + size * math.cos(theta), origin_y + size * math.sin(theta)))
-                    aoe_poly = Polygon(points)
-            else:  # Line
-                ex, ey = origin_x + vx * size, origin_y + vy * size
-                if origin_x == ex and origin_y == ey:
-                    aoe_poly = Point(origin_x, origin_y).buffer(2.5)
-                else:
-                    aoe_poly = LineString([(origin_x, origin_y), (ex, ey)]).buffer(2.5)
+                        points = [(origin_x, origin_y)]
+                        num_segments = max(4, int(angle_deg / 15))
+                        for i in range(num_segments + 1):
+                            theta = start_angle + i * (end_angle - start_angle) / num_segments
+                            points.append((origin_x + size * math.cos(theta), origin_y + size * math.sin(theta)))
+                        aoe_poly = Polygon(points)
+                else:  # Line
+                    ex, ey = origin_x + vx * size, origin_y + vy * size
+                    if origin_x == ex and origin_y == ey:
+                        aoe_poly = Point(origin_x, origin_y).buffer(2.5)
+                    else:
+                        aoe_poly = LineString([(origin_x, origin_y), (ex, ey)]).buffer(2.5)
 
-        if aoe_poly:
-            if aoe_poly.geom_type == "Polygon":
-                return list(aoe_poly.exterior.coords)
-            elif aoe_poly.geom_type == "MultiPolygon":
-                return list(aoe_poly.geoms[0].exterior.coords)
-        return []
+            if aoe_poly:
+                if aoe_poly.geom_type == "Polygon":
+                    return list(aoe_poly.exterior.coords)
+                elif aoe_poly.geom_type == "MultiPolygon":
+                    return list(aoe_poly.geoms[0].exterior.coords)
+            return []
 
     def render_ascii_map(self, vault_path: str = "default", width: int = 40, height: int = 20) -> str:
         """Generates a simple 2D ASCII graphical representation for the UI or debugging."""
         if not HAS_GIS:
             return "Map engine disabled."
-        md = self.get_map_data(vault_path)
-        grid = [["." for _ in range(width)] for _ in range(height)]
+        with self._lock:
+            md = self.get_map_data(vault_path)
+            grid = [["." for _ in range(width)] for _ in range(height)]
 
-        for wall in md.active_walls:
-            sx, sy = int(wall.start[0] / md.grid_scale), int(wall.start[1] / md.grid_scale)
-            ex, ey = int(wall.end[0] / md.grid_scale), int(wall.end[1] / md.grid_scale)
-            if 0 <= sx < width and 0 <= sy < height:
-                grid[sy][sx] = "#"
-            if 0 <= ex < width and 0 <= ey < height:
-                grid[ey][ex] = "#"
+            for wall in md.active_walls:
+                sx, sy = int(wall.start[0] / md.grid_scale), int(wall.start[1] / md.grid_scale)
+                ex, ey = int(wall.end[0] / md.grid_scale), int(wall.end[1] / md.grid_scale)
+                if 0 <= sx < width and 0 <= sy < height:
+                    grid[sy][sx] = "#"
+                if 0 <= ex < width and 0 <= ey < height:
+                    grid[ey][ex] = "#"
 
-        for uid, eid in self._uuid_to_id.get(vault_path, {}).items():
-            entity = self._entities[vault_path].get(uid)
-            if entity:
-                x = int(entity.x / md.grid_scale)
-                y = int(entity.y / md.grid_scale)
-                if 0 <= x < width and 0 <= y < height:
-                    char = "P" if "pc" in getattr(entity, "tags", []) else "E"
-                    grid[y][x] = f"**{char}**"
+            for uid, eid in self._uuid_to_id.get(vault_path, {}).items():
+                entity = self._entities[vault_path].get(uid)
+                if entity:
+                    x = int(entity.x / md.grid_scale)
+                    y = int(entity.y / md.grid_scale)
+                    if 0 <= x < width and 0 <= y < height:
+                        char = "P" if "pc" in getattr(entity, "tags", []) else "E"
+                        grid[y][x] = f"**{char}**"
 
-        return "\n".join([" ".join(row) for row in grid])
+            return "\n".join([" ".join(row) for row in grid])
 
 
 # Singleton instance for the engine to use

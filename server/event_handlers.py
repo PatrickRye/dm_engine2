@@ -2322,7 +2322,7 @@ def resolve_ability_check_handler(event: GameEvent):
 
 def register_core_handlers():
     """Registers all standard handlers to the Event Bus. Can be called to reset state."""
-    EventBus._listeners.clear()
+    EventBus.clear_listeners()
     EventBus.subscribe("AbilityCheck", resolve_ability_check_handler, priority=10)
     EventBus.subscribe("MeleeAttack", shield_spell_reaction_handler, priority=1)
     EventBus.subscribe("MeleeAttack", resolve_attack_handler, priority=10)
