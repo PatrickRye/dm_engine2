@@ -3,6 +3,8 @@ from typing import Dict, Any, Optional
 
 _ACTIVE_ENTITIES: Dict[str, Dict[uuid.UUID, Any]] = {}
 _NAME_INDEX: Dict[str, Dict[str, uuid.UUID]] = {}
+# Prefix index: vault_path -> first-3-chars (lowercase) -> set of entity UUIDs
+_PREFIX_INDEX: Dict[str, Dict[str, set]] = {}
 
 # Per-vault Knowledge Graph and Storylet Registry instances
 _KNOWLEDGE_GRAPHS: Dict[str, Any] = {}  # vault_path -> KnowledgeGraph
@@ -18,11 +20,23 @@ def register_entity(entity: Any, vault_path: str = "default") -> None:
     if vp not in _ACTIVE_ENTITIES:
         _ACTIVE_ENTITIES[vp] = {}
         _NAME_INDEX[vp] = {}
+        _PREFIX_INDEX[vp] = {}
+    else:
+        # Ensure PREFIX_INDEX exists even if vault was created manually (e.g. test setup)
+        if vp not in _PREFIX_INDEX:
+            _PREFIX_INDEX[vp] = {}
 
     if hasattr(entity, "entity_uuid"):
         _ACTIVE_ENTITIES[vp][entity.entity_uuid] = entity
         if hasattr(entity, "name"):
-            _NAME_INDEX[vp][entity.name.lower()] = entity.entity_uuid
+            name_lower = entity.name.lower()
+            _NAME_INDEX[vp][name_lower] = entity.entity_uuid
+            # Populate prefix index (first 3 chars)
+            if len(name_lower) >= 3:
+                prefix = name_lower[:3]
+                if prefix not in _PREFIX_INDEX[vp]:
+                    _PREFIX_INDEX[vp][prefix] = set()
+                _PREFIX_INDEX[vp][prefix].add(entity.entity_uuid)
 
 
 def get_entity(uid: uuid.UUID, vault_path: str = None) -> Optional[Any]:
@@ -41,8 +55,13 @@ def remove_entity(uid: uuid.UUID) -> None:
     for vp, vault in _ACTIVE_ENTITIES.items():
         if uid in vault:
             ent = vault[uid]
-            if hasattr(ent, "name") and ent.name.lower() in _NAME_INDEX.get(vp, {}):
-                del _NAME_INDEX[vp][ent.name.lower()]
+            if hasattr(ent, "name"):
+                name_lower = ent.name.lower()
+                if name_lower in _NAME_INDEX.get(vp, {}):
+                    del _NAME_INDEX[vp][name_lower]
+                if len(name_lower) >= 3:
+                    prefix = name_lower[:3]
+                    _PREFIX_INDEX.get(vp, {}).get(prefix, set()).discard(uid)
             del vault[uid]
             break
 
@@ -52,6 +71,18 @@ def get_all_entities(vault_path: str = "default") -> Dict[uuid.UUID, Any]:
     return _ACTIVE_ENTITIES.get(vault_path, {})
 
 
+def get_candidate_uuids_by_prefix(name_lower: str, vault_path: str) -> set:
+    """
+    Return entity UUIDs whose names share the first 3 characters with name_lower.
+    Used to narrow entity search before full substring comparison.
+    Returns an empty set if name_lower has fewer than 3 chars.
+    """
+    if len(name_lower) < 3 or vault_path not in _PREFIX_INDEX:
+        return set()
+    prefix = name_lower[:3]
+    return _PREFIX_INDEX.get(vault_path, {}).get(prefix, set())
+
+
 def clear_registry(vault_path: str = None) -> None:
     """Clears all entities from the global state."""
     if vault_path:
@@ -59,9 +90,12 @@ def clear_registry(vault_path: str = None) -> None:
             _ACTIVE_ENTITIES[vault_path].clear()
         if vault_path in _NAME_INDEX:
             _NAME_INDEX[vault_path].clear()
+        if vault_path in _PREFIX_INDEX:
+            _PREFIX_INDEX[vault_path].clear()
     else:
         _ACTIVE_ENTITIES.clear()
         _NAME_INDEX.clear()
+        _PREFIX_INDEX.clear()
 
 
 # ---------------------------------------------------------------------

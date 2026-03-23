@@ -34,6 +34,11 @@ _GRAG_CACHE_MAX_SIZE = 32
 # { (vault_path, active_character): (timestamp, result_str) }
 _grag_cache: Dict[Tuple[str, str], Tuple[float, str]] = {}
 
+# KG immutable constraints are vault-wide (don't depend on active_character)
+# { vault_path: (timestamp, constraints_str, kg_id) }  — kg_id ensures different KG instances don't collide
+_kg_constraints_cache: Dict[str, Tuple[float, str, int]] = {}
+_KG_CONSTRAINTS_TTL_SECONDS = 120.0  # Longer TTL — KG changes are rare
+
 
 def extract_npc_dials(biography_text: str) -> Dict[str, float]:
     """
@@ -232,13 +237,25 @@ def _compute_grag_context(kg, vault_path: str, active_character: str, max_hops: 
             if ctrl_names:
                 lines.append(f"  Controls: {', '.join(ctrl_names)}")
 
+    # PC (PLAYER) nodes — show what they've witnessed (scene provenance)
+    pc_nodes = kg.query_nodes(node_type=GraphNodeType.PLAYER)
+    for pc in pc_nodes[:5]:  # Limit to 5 PCs
+        witnessed = pc.attributes.get("witnessed", set())
+        if isinstance(witnessed, list):
+            witnessed = set(witnessed)
+        lines.append(f"\n[PC: {pc.name}]")
+        if witnessed:
+            lines.append(f"  witnessed: {', '.join(sorted(witnessed))}")
+        else:
+            lines.append(f"  witnessed: (none)")
+
     lines.append("\n(Only describe entities and relationships that are established in the KG above.)\n")
     return "\n".join(lines)
 
 
 def _invalidate_grag_cache(vault_path: str = None) -> None:
     """
-    Invalidate the GraphRAG context cache.
+    Invalidate the GraphRAG context cache and KG constraints cache.
 
     Called after KG writes (mutations committed) so that the next
     narrator_node invocation re-fetches fresh KG context instead of
@@ -249,18 +266,30 @@ def _invalidate_grag_cache(vault_path: str = None) -> None:
         keys_to_delete = [k for k in _grag_cache if k[0] == vault_path]
         for k in keys_to_delete:
             del _grag_cache[k]
+        _kg_constraints_cache.pop(vault_path, None)
     else:
         _grag_cache.clear()
+        _kg_constraints_cache.clear()
 
 
-def _build_kg_constraints_prompt(kg) -> str:
+def _build_kg_constraints_prompt(kg, vault_path: str = "default") -> str:
     """
     Query the Knowledge Graph for immutable nodes and format them as
     forbidden claims in the narrator's system prompt.
 
     Gap 2 fix: Inject KG state constraints BEFORE the LLM generates prose,
     making the fishbowl a pre-constraint rather than a post-filter.
+
+    Cached per vault (120s TTL) — invalidated by _invalidate_grag_cache when KG is mutated.
     """
+    # Check cache — include kg id so different KG instances don't collide
+    now = time.monotonic()
+    kg_id = id(kg)
+    if vault_path in _kg_constraints_cache:
+        ts, cached, cached_kg_id = _kg_constraints_cache[vault_path]
+        if kg_id == cached_kg_id and now - ts < _KG_CONSTRAINTS_TTL_SECONDS:
+            return cached
+
     if not kg or not kg.nodes:
         return ""
 
@@ -295,7 +324,9 @@ def _build_kg_constraints_prompt(kg) -> str:
         return ""  # No immutable nodes
 
     lines.append("(These facts are immutable. Do not describe them as changed, destroyed, or transferred.)\n")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    _kg_constraints_cache[vault_path] = (now, result, kg_id)
+    return result
 
 # Names of tools that require Hard Guardrail validation before committing mutations.
 # These are routed through action_logic (separate ToolNode) to enforce privilege segregation:
@@ -403,7 +434,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
 
         # Gap 2 fix: Pre-inject KG immutable facts as forbidden claims BEFORE LLM invocation.
         # This makes the fishbowl a pre-constraint rather than a post-filter.
-        kg_constraints = _build_kg_constraints_prompt(kg)
+        kg_constraints = _build_kg_constraints_prompt(kg, vault_path)
 
         # Gap 8 fix: Pre-inject GraphRAG context (NPCs, locations, relationships)
         # before LLM invocation so narrator has dynamic world-state grounding.
@@ -793,6 +824,16 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     break
         dm.arc.advance_turn(outcome_tension)
 
+        # Decrement storylet deadlines each session turn
+        deactivated = dm.registry.decrement_deadlines()
+        if deactivated > 0:
+            await write_audit_log(
+                vault_path,
+                "DramaManager",
+                "Storylet Deadlines Expired",
+                f"{deactivated} storylet(s) auto-deactivated (deadline reached).",
+            )
+
         # Build runtime context
         ctx = {
             "vault_path": vault_path,
@@ -827,10 +868,28 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             await write_audit_log(
                 vault_path, "DramaManager", "Storylet Activated", selected.name
             )
+
+            # Collect witness_events from all effects and convert to pending_mutations
+            from registry import get_all_entities
+            pending = []
+            for effect in selected.effects:
+                for event_id in effect.witness_events:
+                    entities = get_all_entities(vault_path)
+                    for ent in entities.values():
+                        if getattr(ent, "name", None):
+                            pending.append({
+                                "mutation_type": "add_witness",
+                                "node_name": ent.name,
+                                "value": event_id,
+                            })
+
             result = {
                 "active_storylet_id": str(selected.id),
                 "tension_arc": dm.arc.to_dict(),
             }
+            if pending:
+                existing = list(state.get("pending_mutations", []))
+                result["pending_mutations"] = existing + pending
             return result
 
         return {

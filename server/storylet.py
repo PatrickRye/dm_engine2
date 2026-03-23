@@ -27,6 +27,13 @@ class TensionLevel(str, Enum):
     HIGH = "high"
 
 
+class UrgencyLevel(str, Enum):
+    FLEXIBLE = "flexible"      # No time pressure — fire whenever relevant
+    APPROACHING = "approaching"  # Time-sensitive but not critical
+    URGENT = "urgent"            # Should fire soon for narrative impact
+    CRITICAL = "critical"        # Near deadline — if not now, opportunity passes
+
+
 class ComparisonOp(str, Enum):
     EQ = "eq"
     NE = "ne"
@@ -274,6 +281,70 @@ class GraphQuery(BaseModel):
                     return self._compare(edge_attr_val, self.op, self.value)
                 return False
 
+            # --- Witness check: has PC witnessed a specific event/clue ---
+            if self.query_type == "witness_check":
+                node_uuid = self._resolve_node_uuid(kg)
+                if node_uuid is None:
+                    return False
+                node = kg.get_node(node_uuid)
+                if node is None:
+                    return False
+                witnessed = node.attributes.get("witnessed", set())
+                if self.op == ComparisonOp.HAS_TAG:
+                    return self.value in witnessed
+                if self.op == ComparisonOp.NOT_HAS_TAG:
+                    return self.value not in witnessed
+                if self.op == ComparisonOp.IN:
+                    return any(v in witnessed for v in (self.value or []))
+                if self.op == ComparisonOp.NOT_IN:
+                    return all(v not in witnessed for v in (self.value or []))
+                return self.value in witnessed
+
+            # --- Backstory claim check: player has approved backstory edge ---
+            if self.query_type == "backstory_claim_check":
+                # node_name = PC name, attribute = predicate, value = target entity name
+                node_uuid = self._resolve_node_uuid(kg)
+                if node_uuid is None:
+                    return False
+                node = kg.get_node(node_uuid)
+                if node is None:
+                    return False
+                # Find edges from PC with player_backstory source attribution
+                target_uuid = kg.find_node_uuid(self.value) if self.value else None
+
+                # Fast path: both predicate and target specified → O(1) lookup
+                if self.attribute and target_uuid:
+                    try:
+                        pred = GraphPredicate(self.attribute)
+                        edge_obj = kg.get_edge(node_uuid, pred, target_uuid)
+                        if edge_obj is not None:
+                            edge_attrs = getattr(edge_obj, "attributes", {}) or {}
+                            if edge_attrs.get("source") == "player_backstory":
+                                return self._compare(True, self.op, True)
+                    except ValueError:
+                        pass
+                    return False
+
+                # Slow path: iterate adjacency for this node (bounded by outdegree, not all edges)
+                for pred, obj_uuids in kg.adjacency.get(node_uuid, {}).items():
+                    for obj_uuid in obj_uuids:
+                        if target_uuid is not None and obj_uuid != target_uuid:
+                            continue
+                        if self.attribute:
+                            try:
+                                if pred != GraphPredicate(self.attribute):
+                                    continue
+                            except ValueError:
+                                continue
+                        edge_obj = kg.get_edge(node_uuid, pred, obj_uuid)
+                        if edge_obj is None:
+                            continue
+                        edge_attrs = getattr(edge_obj, "attributes", {}) or {}
+                        if edge_attrs.get("source") != "player_backstory":
+                            continue
+                        return self._compare(True, self.op, True)
+                return False
+
             return False
         except Exception:
             return False
@@ -450,6 +521,22 @@ class GraphMutation(BaseModel):
                     break
                 return
 
+            if self.mutation_type == "add_witness":
+                # Records that a PC witnessed an event/clue.
+                # node_name = PC name, value = event identifier string
+                uid = self._resolve_node_uuid(kg)
+                if not uid:
+                    return
+                node = kg.get_node(uid)
+                if not node:
+                    return
+                witnessed = node.attributes.get("witnessed", set())
+                if isinstance(witnessed, list):
+                    witnessed = set(witnessed)
+                witnessed.add(self.value)
+                node.attributes["witnessed"] = witnessed
+                return
+
         except Exception as e:
             # Mutations are deterministic — if they fail, we log and continue
             import sys
@@ -491,6 +578,7 @@ class StoryletEffect(BaseModel):
     graph_mutations: List[GraphMutation] = Field(default_factory=list)
     flag_changes: Dict[str, bool] = Field(default_factory=dict)
     attribute_mods: Dict[str, int] = Field(default_factory=dict)
+    witness_events: List[str] = Field(default_factory=list)  # auto-committed per active PC on fire
 
 
 # ---------------------------------------------------------------------
@@ -509,6 +597,9 @@ class Storylet(BaseModel):
     current_occurrences: int = 0
     is_active: bool = True
     priority_override: Optional[int] = None
+    # Urgency / deadline fields
+    urgency: UrgencyLevel = UrgencyLevel.FLEXIBLE  # time-pressure tier
+    deadline_turns: Optional[int] = None  # session turns remaining; None = no deadline
 
     def can_fire(self, kg: KnowledgeGraph, ctx: Dict[str, Any]) -> bool:
         if not self.is_active:

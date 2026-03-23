@@ -11,10 +11,30 @@ No LLM calls — pure Python deterministic selection logic.
 
 import re
 import uuid
+from functools import lru_cache
 from typing import Dict, Any, Optional, List
 
-from storylet import Storylet, TensionLevel
+from storylet import Storylet, TensionLevel, UrgencyLevel
 from storylet_registry import StoryletRegistry
+
+
+@lru_cache(maxsize=500)
+def _storylet_npcs_cached(storylet_id: uuid.UUID, name: str, content: str, tags_str: str) -> tuple:
+    """
+    Cached NPC name extraction for storylets.
+    Cached by (storylet_id, name, content, frozenset(tags)) so invalidates on content change.
+    Returns tuple so it's hashable for lru_cache.
+    """
+    tags = tags_str.split("|") if tags_str else []
+    names: List[str] = []
+    for tag in tags:
+        if tag.startswith("npc:"):
+            names.append(tag[4:].strip())
+    for match in re.finditer(r"\[\[([^\]]+)\]\]", content):
+        names.append(match.group(1).strip())
+    if name:
+        names.append(name)
+    return tuple(set(names))
 
 
 class TensionArc:
@@ -102,23 +122,11 @@ class DramaManager:
         Looks at: storylet name, description, content, and tags.
         Tags formatted as 'npc:Name' are preferred; falls back to
         extracting [[Wikilink]]-style names from content.
+
+        Results cached via _storylet_npcs_cached (module-level LRU, maxsize=500).
         """
-        names: List[str] = []
-
-        # From tags: 'npc:King Aldric' format
-        for tag in storylet.tags:
-            if tag.startswith("npc:"):
-                names.append(tag[4:].strip())
-
-        # From content: [[Wikilink]] patterns
-        for match in re.finditer(r"\[\[([^\]]+)\]\]", storylet.content):
-            names.append(match.group(1).strip())
-
-        # From name
-        if storylet.name:
-            names.append(storylet.name)
-
-        return list(set(names))
+        tags_str = "|".join(sorted(storylet.tags))
+        return list(_storylet_npcs_cached(storylet.id, storylet.name, storylet.content, tags_str))
 
     def _relationship_weight(self, storylet: Storylet, active_character: str) -> float:
         """
@@ -157,6 +165,26 @@ class DramaManager:
 
         return weight
 
+    def _urgency_boost(self, storylet: Storylet) -> float:
+        """
+        Calculate urgency boost for a storylet based on its urgency tier and deadline proximity.
+
+        This is a SOFT signal — it biases select_next toward urgent storylets
+        without overriding tension arc or relationship weighting. The LLM-DM receives
+        urgency signals via storylet_injection_prompt and adds time-pressure language.
+        """
+        urgency = storylet.urgency
+        # Deadline proximity boost: within 2 turns, boost regardless of tier
+        if storylet.deadline_turns is not None and storylet.deadline_turns <= 2:
+            return 2.0
+        if urgency == UrgencyLevel.CRITICAL:
+            return 1.5
+        if urgency == UrgencyLevel.URGENT:
+            return 1.0
+        if urgency == UrgencyLevel.APPROACHING:
+            return 0.5
+        return 0.0
+
     def select_next(self, ctx: Dict[str, Any]) -> Optional[Storylet]:
         """
         Select the optimal storylet given current tension arc and available candidates.
@@ -183,12 +211,13 @@ class DramaManager:
         if not tension_bucket:
             tension_bucket = candidates  # Fall back to any valid storylet
 
-        # Sort: priority_override desc, current_occurrences asc, relationship_weight desc
+        # Sort: priority_override desc, current_occurrences asc, relationship_weight desc, urgency_boost desc
         tension_bucket.sort(
             key=lambda s: (
                 -(s.priority_override or 0),
                 s.current_occurrences,
                 -self._relationship_weight(s, active_character),
+                -self._urgency_boost(s),
             )
         )
 
@@ -229,10 +258,24 @@ class DramaManager:
         narrative into the planner/narrator context.
         """
         content = self.inject_storylet(storylet, ctx)
+
+        # Build urgency signal for the LLM-DM
+        urgency_signal = ""
+        if storylet.urgency != UrgencyLevel.FLEXIBLE:
+            deadline_str = ""
+            if storylet.deadline_turns is not None:
+                deadline_str = f" (deadline: {storylet.deadline_turns} turn{'s' if storylet.deadline_turns != 1 else ''})"
+            urgency_signal = f" | Urgency: {storylet.urgency.value.upper()}{deadline_str}"
+            if storylet.urgency in (UrgencyLevel.URGENT, UrgencyLevel.CRITICAL):
+                urgency_signal += (
+                    " — Incorporate time-pressure language: 'time is running out', "
+                    "'meanwhile', 'before it's too late'."
+                )
+
         return (
             f"[STORYLET DRIVE — '{storylet.name}']:\n"
             f"The following narrative beat is active and MUST be incorporated into your response:\n\n"
             f"{content}\n\n"
-            f"Tags: {', '.join(sorted(storylet.tags))} | Tension: {storylet.tension_level.value}\n"
+            f"Tags: {', '.join(sorted(storylet.tags))} | Tension: {storylet.tension_level.value}{urgency_signal}\n"
             f"Inject this faithfully. Do not contradict established campaign facts."
         )

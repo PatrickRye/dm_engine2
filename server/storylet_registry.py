@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Set, Any
 import asyncio
 import aiofiles
 
-from storylet import Storylet, StoryletEffect, StoryletPrerequisites, GraphQuery, GraphMutation, TensionLevel
+from storylet import Storylet, StoryletEffect, StoryletPrerequisites, GraphQuery, GraphMutation, TensionLevel, UrgencyLevel
 
 # ---------------------------------------------------------------------
 # Vault persistence helpers (sync — called from async context via asyncio.to_thread)
@@ -30,6 +30,8 @@ def _storylet_to_yaml_dict(storylet: Storylet) -> dict:
         "name": storylet.name,
         "description": storylet.description,
         "tension_level": storylet.tension_level.value,
+        "urgency": storylet.urgency.value,
+        "deadline_turns": storylet.deadline_turns,
         "tags": list(storylet.tags),
         "max_occurrences": storylet.max_occurrences,
         "current_occurrences": storylet.current_occurrences,
@@ -46,6 +48,7 @@ def _storylet_to_yaml_dict(storylet: Storylet) -> dict:
                 "graph_mutations": [_mutation_to_dict(m) for m in e.graph_mutations],
                 "flag_changes": e.flag_changes,
                 "attribute_mods": e.attribute_mods,
+                "witness_events": e.witness_events,
             }
             for e in storylet.effects
         ],
@@ -91,12 +94,18 @@ def _dict_to_storylet(data: dict) -> Storylet:
             graph_mutations=[_restore_mutation(m) for m in edata.get("graph_mutations", [])],
             flag_changes=edata.get("flag_changes", {}),
             attribute_mods=edata.get("attribute_mods", {}),
+            witness_events=list(edata.get("witness_events", [])),
         )
 
     try:
         tension = TensionLevel(data.get("tension_level", "medium"))
     except ValueError:
         tension = TensionLevel.MEDIUM
+
+    try:
+        urgency = UrgencyLevel(data.get("urgency", "flexible"))
+    except ValueError:
+        urgency = UrgencyLevel.FLEXIBLE
 
     return Storylet(
         id=uuid.UUID(data["id"]) if data.get("id") else uuid.uuid4(),
@@ -108,6 +117,8 @@ def _dict_to_storylet(data: dict) -> Storylet:
         current_occurrences=int(data.get("current_occurrences", 0)),
         is_active=bool(data.get("is_active", True)),
         priority_override=int(data["priority_override"]) if data.get("priority_override") else None,
+        urgency=urgency,
+        deadline_turns=int(data["deadline_turns"]) if data.get("deadline_turns") is not None else None,
         prerequisites=StoryletPrerequisites(
             all_of=[_restore_query(q) for q in prerequisites_data.get("all_of", [])],
             any_of=[_restore_query(q) for q in prerequisites_data.get("any_of", [])],
@@ -223,6 +234,10 @@ class StoryletRegistry:
         for storylet in self._storylets.values():
             if not storylet.can_fire(kg, ctx):
                 continue
+            # Auto-prune expired deadline storylets
+            if storylet.deadline_turns is not None and storylet.deadline_turns <= 0:
+                storylet.is_active = False
+                continue
             if tension is not None and storylet.tension_level != tension:
                 continue
             if required_tags and not required_tags.intersection(storylet.tags):
@@ -232,6 +247,21 @@ class StoryletRegistry:
 
     def get_active_count(self) -> int:
         return sum(1 for s in self._storylets.values() if s.is_active)
+
+    def decrement_deadlines(self) -> int:
+        """
+        Decrement deadline_turns on all storylets that have a deadline.
+        Deactivates any storylet that reaches 0.
+        Returns count of deactivated storylets.
+        """
+        deactivated = 0
+        for storylet in self._storylets.values():
+            if storylet.deadline_turns is not None and storylet.deadline_turns > 0:
+                storylet.deadline_turns -= 1
+                if storylet.deadline_turns <= 0:
+                    storylet.is_active = False
+                    deactivated += 1
+        return deactivated
 
     # ------------------------------------------------------------------
     # Vault persistence (async — caller should use asyncio.to_thread or await)

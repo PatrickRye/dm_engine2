@@ -12,7 +12,7 @@ No LLM calls — pure Python deterministic data structure.
 
 import uuid
 from enum import Enum
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Tuple, Any
 from collections import defaultdict
 from pydantic import BaseModel, Field
 
@@ -81,7 +81,9 @@ class KnowledgeGraph(BaseModel):
     """
     In-memory directed labeled graph.
 
-    Stores nodes and edges with an adjacency index for O(1) edge lookups.
+    Stores nodes and edges with:
+    - adjacency index: O(1) outgoing edge UUID lookup by predicate
+    - edge_index: O(1) edge object lookup by (subject, predicate, object)
     Callers must call _rebuild_adjacency() after manually modifying .edges.
     """
     nodes: Dict[uuid.UUID, KnowledgeGraphNode] = Field(default_factory=dict)
@@ -91,6 +93,10 @@ class KnowledgeGraph(BaseModel):
         default_factory=dict, exclude=True
     )
     name_index: Dict[str, uuid.UUID] = Field(default_factory=dict, exclude=True)
+    # O(1) edge object lookup: (subj_uuid, pred, obj_uuid) -> KnowledgeGraphEdge
+    edge_index: Dict[Tuple[uuid.UUID, GraphPredicate, uuid.UUID], KnowledgeGraphEdge] = Field(
+        default_factory=dict, exclude=True
+    )
 
     def model_post_init(self, __context) -> None:
         self._rebuild_adjacency()
@@ -101,6 +107,7 @@ class KnowledgeGraph(BaseModel):
     def _rebuild_adjacency(self) -> None:
         self.adjacency.clear()
         self.name_index.clear()
+        self.edge_index.clear()
         for node in self.nodes.values():
             self.name_index[node.name.lower()] = node.node_uuid
         for edge in self.edges:
@@ -109,6 +116,7 @@ class KnowledgeGraph(BaseModel):
             if edge.predicate not in self.adjacency[edge.subject_uuid]:
                 self.adjacency[edge.subject_uuid][edge.predicate] = set()
             self.adjacency[edge.subject_uuid][edge.predicate].add(edge.object_uuid)
+            self.edge_index[(edge.subject_uuid, edge.predicate, edge.object_uuid)] = edge
 
     def _resolve_uuid(self, identifier: Optional[uuid.UUID | str], name: Optional[str]) -> Optional[uuid.UUID]:
         if identifier:
@@ -157,12 +165,14 @@ class KnowledgeGraph(BaseModel):
         if edge.predicate not in self.adjacency[edge.subject_uuid]:
             self.adjacency[edge.subject_uuid][edge.predicate] = set()
         self.adjacency[edge.subject_uuid][edge.predicate].add(edge.object_uuid)
+        self.edge_index[(edge.subject_uuid, edge.predicate, edge.object_uuid)] = edge
         self.edges.append(edge)
 
     def remove_edge(self, edge_uuid: uuid.UUID) -> None:
         edge = next((e for e in self.edges if e.edge_uuid == edge_uuid), None)
         if edge:
             self.edges.remove(edge)
+            self.edge_index.pop((edge.subject_uuid, edge.predicate, edge.object_uuid), None)
             if (
                 edge.subject_uuid in self.adjacency
                 and edge.predicate in self.adjacency[edge.subject_uuid]
@@ -231,6 +241,12 @@ class KnowledgeGraph(BaseModel):
             and predicate in self.adjacency[subject_uuid]
             and object_uuid in self.adjacency[subject_uuid][predicate]
         )
+
+    def get_edge(
+        self, subject_uuid: uuid.UUID, predicate: GraphPredicate, object_uuid: uuid.UUID
+    ) -> Optional[KnowledgeGraphEdge]:
+        """O(1) edge lookup using the edge index. Returns None if not found."""
+        return self.edge_index.get((subject_uuid, predicate, object_uuid))
 
     def node_exists_by_name(self, name: str, node_type: Optional[GraphNodeType] = None) -> bool:
         node = self.get_node_by_name(name)
@@ -314,17 +330,31 @@ class KnowledgeGraph(BaseModel):
         if not node:
             return {}
         neighbors: Dict[str, List[str]] = defaultdict(list)
-        for edge in self.edges:
-            if hide_secrets and edge.secret:
-                continue
-            if edge.subject_uuid == node_uuid:
-                target = self.get_node(edge.object_uuid)
+
+        # Outgoing edges: use adjacency index + get_edge for O(1) secret flag check
+        for pred, obj_uuids in self.adjacency.get(node_uuid, {}).items():
+            for obj_uuid in obj_uuids:
+                edge_obj = self.get_edge(node_uuid, pred, obj_uuid)
+                if edge_obj is None:
+                    continue
+                if hide_secrets and edge_obj.secret:
+                    continue
+                target = self.get_node(obj_uuid)
                 if target:
-                    neighbors[edge.predicate.value].append(target.name)
-            elif edge.object_uuid == node_uuid:
-                subject = self.get_node(edge.subject_uuid)
-                if subject:
-                    neighbors[f"reverse_{edge.predicate.value}"].append(subject.name)
+                    neighbors[pred.value].append(target.name)
+
+        # Incoming edges: scan adjacency entries for this node as object
+        for subj_uuid, pred_dict in self.adjacency.items():
+            for pred, obj_uuids in pred_dict.items():
+                if node_uuid in obj_uuids:
+                    edge_obj = self.get_edge(subj_uuid, pred, node_uuid)
+                    if edge_obj is None:
+                        continue
+                    if hide_secrets and edge_obj.secret:
+                        continue
+                    subject = self.get_node(subj_uuid)
+                    if subject:
+                        neighbors[f"reverse_{pred.value}"].append(subject.name)
 
         return {
             "node_uuid": str(node_uuid),
@@ -335,3 +365,4 @@ class KnowledgeGraph(BaseModel):
             "is_immutable": node.is_immutable,
             "neighbors": dict(neighbors),
         }
+

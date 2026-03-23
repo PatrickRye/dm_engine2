@@ -8,7 +8,7 @@ import aiofiles
 from langchain_core.tools import tool, InjectedToolArg
 from langchain_core.runnables import RunnableConfig
 from pydantic import Field
-from typing import Optional, Annotated, Union
+from typing import Optional, Annotated, Union, Dict
 import uuid
 
 # === DETERMINISTIC ENGINE INTEGRATION ===
@@ -38,7 +38,7 @@ from spatial_engine import spatial_service, LightSource, Wall, HAS_GIS
 from spell_system import SpellDefinition, SpellMechanics, SpellCompendium
 from item_system import WeaponItem, ArmorItem, WondrousItem, ItemCompendium
 
-from registry import get_all_entities, register_entity, get_entity
+from registry import get_all_entities, register_entity, get_entity, get_candidate_uuids_by_prefix
 
 
 _MAX_CACHED_VAULTS = 5  # Evict oldest vault when this many are in memory
@@ -50,6 +50,8 @@ class VaultCache:
         self.chunk_cache = {}  # vault_path -> category -> [ (filename, chunk) ]
         self.indexed_vaults = []  # ordered list; front = oldest, back = most-recently indexed
         self._index_mtimes: dict[str, float] = {}  # vault_path -> max mtime at last build
+        # Per-category directory mtimes — compared before doing expensive per-file walk
+        self._dir_mtimes: dict[str, dict[str, float]] = {}  # vault_path -> {cat: dir_mtime}
 
     def _evict_oldest(self):
         while len(self.indexed_vaults) >= _MAX_CACHED_VAULTS:
@@ -57,10 +59,43 @@ class VaultCache:
             self.bestiary_cache.pop(oldest, None)
             self.chunk_cache.pop(oldest, None)
             self._index_mtimes.pop(oldest, None)
+            self._dir_mtimes.pop(oldest, None)
 
     def _get_max_mtime(self, vault_path: str) -> float:
-        """Stat-only walk to find the newest mtime among all compendium .md files."""
+        """
+        Stat-only check to find whether any compendium file has changed.
+
+        Optimization: compares directory-level mtime first. Only walks individual
+        files when a directory's mtime has changed (indicating potential changes).
+        """
+        if vault_path not in self._dir_mtimes:
+            self._dir_mtimes[vault_path] = {}
+
         max_mtime = 0.0
+        any_dir_changed = False
+
+        for cat in ["bestiary", "rules", "modules"]:
+            for d in _get_config_dirs(vault_path, cat):
+                try:
+                    dir_mtime = os.path.getmtime(d)
+                except OSError:
+                    continue
+
+                prev_dir_mtime = self._dir_mtimes[vault_path].get(cat, 0.0)
+                if dir_mtime > prev_dir_mtime:
+                    # Directory changed — need per-file walk to find true max mtime
+                    any_dir_changed = True
+                if dir_mtime > max_mtime:
+                    max_mtime = dir_mtime
+                # Always update stored dir mtime (even if unchanged)
+                self._dir_mtimes[vault_path][cat] = dir_mtime
+
+        if not any_dir_changed:
+            # No directory changed — return cached max mtime without any file stats
+            return self._index_mtimes.get(vault_path, 0.0)
+
+        # At least one directory changed — walk files to find true max mtime
+        file_max = 0.0
         for cat in ["bestiary", "rules", "modules"]:
             for d in _get_config_dirs(vault_path, cat):
                 for root, _, files in os.walk(d):
@@ -68,11 +103,11 @@ class VaultCache:
                         if file.endswith(".md"):
                             try:
                                 mtime = os.path.getmtime(os.path.join(root, file))
-                                if mtime > max_mtime:
-                                    max_mtime = mtime
+                                if mtime > file_max:
+                                    file_max = mtime
                             except OSError:
                                 pass
-        return max_mtime
+        return file_max
 
     def build_index(self, vault_path: str, force: bool = False):
         if vault_path in self.indexed_vaults and not force:
@@ -145,16 +180,29 @@ async def _get_entity_by_name(name: str, vault_path: str) -> Optional[BaseGameEn
 
     name_lower = name.lower().strip()
 
-    # 1. Check Memory (Fast Path)
+    # 1. Check Memory (Fast Path — exact match)
     if vault_path in _NAME_INDEX and name_lower in _NAME_INDEX[vault_path]:
         return get_entity(_NAME_INDEX[vault_path][name_lower], vault_path)
 
+    # 2. Prefix-index scan — narrow to candidates sharing first 3 chars before O(n) check
+    candidate_uuids = get_candidate_uuids_by_prefix(name_lower, vault_path)
+    if candidate_uuids:
+        all_entities = get_all_entities(vault_path)
+        for uid in candidate_uuids:
+            entity = all_entities.get(uid)
+            if entity is None:
+                continue
+            ent_name_lower = entity.name.lower()
+            if name_lower in ent_name_lower or ent_name_lower in name_lower:
+                return entity
+
+    # 3. Substring scan (handles renamed entities whose old name is still in the index)
     for uid, entity in get_all_entities(vault_path).items():
         ent_name_lower = entity.name.lower()
         if name_lower in ent_name_lower or ent_name_lower in name_lower:
             return entity
 
-    # 2. Just-In-Time (JIT) Hydration (Lazy Load)
+    # 4. Just-In-Time (JIT) Hydration (Lazy Load)
     j_dir = get_journals_dir(vault_path)
     exact_path = os.path.join(j_dir, f"{name}.md")
     if os.path.exists(exact_path):
@@ -5768,6 +5816,101 @@ async def hydrate_delta(
 
 
 @tool
+async def get_scene_provenance(
+    pc_name: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Return all events and clues a player character has witnessed.
+
+    Use this tool to answer DM questions like "what does Aragorn know?" or
+    "which PCs witnessed the betrayal scene?" This helps the DM track scene
+    provenance and ensure the right information reaches the right players.
+
+    Args:
+        pc_name: The player character's name (e.g., "Aragorn")
+    """
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    from registry import get_knowledge_graph
+
+    kg = get_knowledge_graph(vault_path)
+
+    pc_uuid = kg.find_node_uuid(pc_name)
+    if not pc_uuid:
+        return f"SYSTEM ERROR: PC '{pc_name}' not found in KG."
+
+    node = kg.get_node(pc_uuid)
+    if not node:
+        return f"SYSTEM ERROR: PC node for '{pc_name}' not found."
+
+    witnessed = node.attributes.get("witnessed", set())
+    if isinstance(witnessed, list):
+        witnessed = set(witnessed)
+
+    if not witnessed:
+        return f"MECHANICAL TRUTH: [[{pc_name}]] has witnessed no events yet."
+
+    lines = [f"[[{pc_name}]] has witnessed the following events:"]
+    for event_id in sorted(witnessed):
+        lines.append(f"  - {event_id}")
+    return "\n".join(lines)
+
+
+@tool
+async def set_storylet_deadline(
+    storylet_name: str,
+    deadline_turns: int,
+    urgency: str = "flexible",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Set or modify a storylet's deadline and urgency tier.
+
+    Use this as a DM-facing tool to impose time pressure on storylets that
+    have become urgent during play. The LLM-DM will receive urgency signals
+    in the storylet injection prompt and add appropriate time-pressure language.
+
+    Args:
+        storylet_name: Name of the storylet to update
+        deadline_turns: Number of session turns remaining (set to 0 to expire immediately)
+        urgency: One of flexible, approaching, urgent, critical ( UrgencyLevel values)
+    """
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    from registry import get_storylet_registry
+    from storylet import UrgencyLevel
+
+    reg = get_storylet_registry(vault_path)
+    storylet = reg.get_by_name(storylet_name)
+    if not storylet:
+        return f"SYSTEM ERROR: Storylet '{storylet_name}' not found."
+
+    try:
+        urgency_level = UrgencyLevel(urgency.lower())
+    except ValueError:
+        return f"SYSTEM ERROR: Invalid urgency '{urgency}'. Must be one of: flexible, approaching, urgent, critical."
+
+    storylet.deadline_turns = max(0, deadline_turns)
+    storylet.urgency = urgency_level
+    if deadline_turns <= 0:
+        storylet.is_active = False
+
+    return (
+        f"MECHANICAL TRUTH: Storylet '{storylet_name}' updated.\n"
+        f"  urgency: {urgency_level.value}\n"
+        f"  deadline_turns: {storylet.deadline_turns}\n"
+        f"  is_active: {storylet.is_active}"
+    )
+
+
+@tool
 async def detect_missing_entities(
     narrative_text: str,
     *,
@@ -5883,6 +6026,318 @@ async def reveal_secret(
         f"MECHANICAL TRUTH: Secret-reveal mutation for [[{subject_name}]] --{predicate}--> [[{object_name}]]. "
         f"Mutation: {json.dumps(mutation_dict)}"
     )
+
+
+# ---------------------------------------------------------------------
+# In-memory store for pending backstory claims (Feature #10)
+# Keyed by vault_path; each value is a dict keyed by pc_name
+# ---------------------------------------------------------------------
+_PENDING_BACKSTORY_CLAIMS: Dict[str, Dict[str, list]] = {}
+
+
+def _get_pending_claims(vault_path: str) -> Dict[str, list]:
+    if vault_path not in _PENDING_BACKSTORY_CLAIMS:
+        _PENDING_BACKSTORY_CLAIMS[vault_path] = {}
+    return _PENDING_BACKSTORY_CLAIMS[vault_path]
+
+
+@tool
+async def propose_backstory_claim(
+    pc_name: str,
+    claim_text: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Submit a player-authored backstory claim for DM review.
+
+    Players use this to add personal history to their character. Claims are
+    validated against the Knowledge Graph and held in a pending queue until
+    the DM approves or rejects them.
+
+    Two-phase workflow:
+      1. Player calls propose_backstory_claim → claim is validated and queued
+      2. DM calls review_backstory_claims to see pending claims
+      3. DM calls approve_backstory_claim to commit approved claims to KG
+
+    Valid claims (LIKELY_VALID) can also be auto-committed if the DM enables
+    auto_approve_consistent_backstories in config.
+
+    Args:
+        pc_name: Name of the PC making the claim (e.g., "Aragorn")
+        claim_text: Freeform backstory claim text (e.g., "Aragorn once served King Aldric before joining the Silver Order")
+    """
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    from registry import get_knowledge_graph
+    from hard_guardrails import HardGuardrails
+
+    kg = get_knowledge_graph(vault_path)
+    guardrails = HardGuardrails(kg)
+
+    # Find the PC node
+    pc_node = kg.get_node_by_name(pc_name)
+    if not pc_node:
+        return f"SYSTEM ERROR: PC '{pc_name}' not found in Knowledge Graph."
+
+    # Validate the claim
+    validation = guardrails.validate_backstory_consistency(pc_node, claim_text)
+
+    pending = _get_pending_claims(vault_path)
+    if pc_name not in pending:
+        pending[pc_name] = []
+
+    claim_entry = {
+        "claim_text": claim_text,
+        "validation": validation,
+    }
+    pending[pc_name].append(claim_entry)
+
+    if not validation.claims:
+        return (
+            f"MECHANICAL TRUTH: No parseable claims found in '{claim_text}'. "
+            "Ensure your claim mentions relationships like 'served', 'was', 'ruled', 'possessed', etc."
+        )
+
+    lines = [f"MECHANICAL TRUTH: Backstory claim submitted for DM review. Claims detected: {len(validation.claims)}"]
+    for i, claim in enumerate(validation.claims):
+        lines.append(f"  [{i}] {claim}")
+    if validation.contradictions:
+        lines.append(f"  CONFLICTS ({len(validation.contradictions)}):")
+        for c in validation.contradictions:
+            lines.append(f"    - {c}")
+    if validation.new_entities:
+        lines.append(f"  NEW ENTITIES ({len(validation.new_entities)}):")
+        for e in validation.new_entities:
+            lines.append(f"    - {e}")
+    lines.append("  Status: PENDING DM APPROVAL")
+    return "\n".join(lines)
+
+
+@tool
+async def review_backstory_claims(
+    pc_name: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Review all pending backstory claims for a player character (DM-facing).
+
+    Returns all pending claims with their validation status:
+      - LIKELY_VALID: Consistent with existing KG facts — DM can approve as-is
+      - CONFLICT: Contradicts an existing KG edge — DM must resolve
+      - NEW_ENTITY: References an entity not yet in KG — DM can approve with creation
+
+    DM actions per claim:
+      - APPROVE: Commit the claim as a KG edge (with source='player_backstory')
+      - REJECT: Discard the claim
+      - MODIFY: Edit the claim text and re-validate
+
+    Args:
+        pc_name: Name of the PC whose claims to review
+    """
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    pending = _get_pending_claims(vault_path)
+    claims = pending.get(pc_name, [])
+
+    if not claims:
+        return f"MECHANICAL TRUTH: No pending backstory claims for '{pc_name}'."
+
+    lines = [f"MECHANICAL TRUTH: Pending backstory claims for '{pc_name}' ({len(claims)}):\n"]
+    for i, entry in enumerate(claims):
+        validation = entry["validation"]
+        lines.append(f"--- Claim [{i}] ---")
+        lines.append(f"  Text: {entry['claim_text']}")
+        for j, claim in enumerate(validation.claims):
+            lines.append(f"  Triple {j}: {claim}")
+        if validation.contradictions:
+            lines.append(f"  CONFLICTS:")
+            for c in validation.contradictions:
+                lines.append(f"    - {c}")
+        if validation.new_entities:
+            lines.append(f"  NEW ENTITIES (not in KG):")
+            for e in validation.new_entities:
+                lines.append(f"    - {e}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@tool
+async def approve_backstory_claim(
+    pc_name: str,
+    claim_index: int,
+    action: str = "approve",
+    modified_text: str = "",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Approve, reject, or modify a pending backstory claim (DM-facing).
+
+    APPROVE: Creates a KG edge with metadata:
+      - source: 'player_backstory'
+      - player_name: pc_name
+      - approved_by_dm: True
+      - original_claim: the claim text
+
+    REJECT: Removes the claim from the pending queue without effect.
+
+    MODIFY: Re-validates the modified_text against KG and replaces the claim.
+    Use this when a claim has a CONFLICT but the DM wants to rephrase it.
+
+    Args:
+        pc_name: Name of the PC
+        claim_index: Index from review_backstory_claims listing (0-based)
+        action: 'approve', 'reject', or 'modify'
+        modified_text: Required when action='modify' — the revised claim text
+    """
+    import json as _json
+
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    pending = _get_pending_claims(vault_path)
+    claims = pending.get(pc_name, [])
+
+    if not claims:
+        return f"SYSTEM ERROR: No pending claims for '{pc_name}'."
+    if claim_index < 0 or claim_index >= len(claims):
+        return f"SYSTEM ERROR: Invalid claim_index {claim_index}. Range: 0-{len(claims) - 1}."
+
+    entry = claims[claim_index]
+    original_text = entry["claim_text"]
+    validation = entry["validation"]
+
+    if action.lower() == "reject":
+        claims.pop(claim_index)
+        return f"MECHANICAL TRUTH: Claim rejected and removed from queue."
+
+    if action.lower() == "modify":
+        if not modified_text:
+            return "SYSTEM ERROR: modified_text required when action='modify'."
+        from registry import get_knowledge_graph
+        from hard_guardrails import HardGuardrails
+
+        kg = get_knowledge_graph(vault_path)
+        guardrails = HardGuardrails(kg)
+        pc_node = kg.get_node_by_name(pc_name)
+        if not pc_node:
+            return f"SYSTEM ERROR: PC '{pc_name}' not found in KG."
+
+        new_validation = guardrails.validate_backstory_consistency(pc_node, modified_text)
+        entry["claim_text"] = modified_text
+        entry["validation"] = new_validation
+        return (
+            f"MECHANICAL TRUTH: Claim modified and re-validated.\n"
+            f"  New text: {modified_text}\n"
+            f"  New claims: {new_validation.claims}\n"
+            f"  Conflicts: {new_validation.contradictions or 'None'}\n"
+            f"  New entities: {new_validation.new_entities or 'None'}"
+        )
+
+    if action.lower() == "approve":
+        # Commit each validated claim triple as a KG edge
+        from registry import get_knowledge_graph
+        from knowledge_graph import GraphPredicate
+        import uuid
+
+        kg = get_knowledge_graph(vault_path)
+        pc_node = kg.get_node_by_name(pc_name)
+        if not pc_node:
+            return f"SYSTEM ERROR: PC '{pc_name}' not found in KG."
+
+        # Map assertion verbs to GraphPredicates
+        verb_to_pred = {
+            "is": GraphPredicate.ALLIED_WITH,
+            "was": GraphPredicate.ALLIED_WITH,
+            "served": GraphPredicate.SERVES,
+            "ruled": GraphPredicate.ALLIED_WITH,
+            "led": GraphPredicate.ALLIED_WITH,
+            "possessed": GraphPredicate.POSSESSES,
+            "owned": GraphPredicate.POSSESSES,
+            "betrayed": GraphPredicate.HOSTILE_TOWARD,
+            "hated": GraphPredicate.HOSTILE_TOWARD,
+            "loved": GraphPredicate.ALLIED_WITH,
+            "feared": GraphPredicate.HOSTILE_TOWARD,
+            "allied with": GraphPredicate.ALLIED_WITH,
+            "joined": GraphPredicate.MEMBER_OF,
+            "member of": GraphPredicate.MEMBER_OF,
+            "led by": GraphPredicate.ALLIED_WITH,
+        }
+
+        results = []
+        for claim in validation.claims:
+            subj, verb, obj = claim.subject, claim.verb, claim.object
+
+            # Determine which node is the player and which is the target
+            if subj.lower() == pc_name.lower():
+                actor_node = pc_node
+                target_name = obj
+            elif obj.lower() == pc_name.lower():
+                actor_node = pc_node
+                target_name = subj
+            else:
+                # Neither matches PC name — use PC as the actor (player's claim about self)
+                actor_node = pc_node
+                target_name = obj
+
+            target_uuid = kg.find_node_uuid(target_name)
+
+            # Map verb to predicate
+            pred = verb_to_pred.get(verb.lower())
+            if pred is None:
+                # Fallback: treat as a generic relationship
+                pred = GraphPredicate.ALLIED_WITH
+
+            # Create edge attributes
+            edge_attrs = {
+                "source": "player_backstory",
+                "player_name": pc_name,
+                "approved_by_dm": True,
+                "original_claim": original_text,
+            }
+
+            # If target doesn't exist, try to create it as an NPC
+            if target_uuid is None and target_name:
+                target_uuid_obj = uuid.uuid4()
+                new_node = kg.add_node(
+                    node_uuid=target_uuid_obj,
+                    node_name=target_name,
+                    node_type="npc",
+                    attributes={"description": f"Created from player backstory claim by {pc_name}"},
+                )
+                target_uuid = new_node.uuid
+                edge_attrs["newly_created"] = True
+
+            if target_uuid:
+                kg.add_edge(
+                    subject_uuid=actor_node.uuid,
+                    predicate=pred,
+                    object_uuid=target_uuid,
+                    attributes=edge_attrs,
+                )
+                results.append(f"  + [[{pc_name}]] --{pred.value}--> [[{target_name}]]")
+            else:
+                results.append(f"  ! Could not resolve target: {target_name}")
+
+        # Remove approved claim from pending queue
+        claims.pop(claim_index)
+
+        if results:
+            return (
+                f"MECHANICAL TRUTH: Backstory claim APPROVED and committed to KG.\n"
+                + "\n".join(results)
+            )
+        else:
+            return "MECHANICAL TRUTH: Claim approved but no KG edges could be created."
+
+    return f"SYSTEM ERROR: Unknown action '{action}'. Use 'approve', 'reject', or 'modify'."
 
 
 @tool

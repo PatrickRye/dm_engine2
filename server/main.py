@@ -113,6 +113,11 @@ from tools import (
     propose_entity_creation,
     generate_side_quests_for_entity,
     reveal_secret,
+    get_scene_provenance,
+    set_storylet_deadline,
+    propose_backstory_claim,
+    review_backstory_claims,
+    approve_backstory_claim,
     _get_config_tone,
     _get_entity_by_name,
     _calculate_reach,
@@ -182,6 +187,11 @@ MASTER_TOOLS_LIST = [
     propose_entity_creation,
     generate_side_quests_for_entity,
     reveal_secret,
+    get_scene_provenance,
+    set_storylet_deadline,
+    propose_backstory_claim,
+    review_backstory_claims,
+    approve_backstory_claim,
 ]
 
 # 1. INITIALIZE THE APP FIRST
@@ -688,69 +698,65 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                 break
 
             # REQ-GEO-007, REQ-GEO-008: Moving through creatures
-            for other_entity in all_entities.values():
-                if other_entity.entity_uuid == entity.entity_uuid:
-                    continue
+            # Use rtree spatial index to narrow candidates before detailed checks
+            path_candidates = spatial_service.get_entities_on_path(
+                start[0], start[1], end[0], end[1],
+                vault_path=request.vault_path,
+                exclude_uuid=entity.entity_uuid,
+            )
+            for other_entity, overlap_len in path_candidates:
                 if not hasattr(other_entity, "hp") or getattr(other_entity.hp, "base_value", 0) <= 0:
                     continue
-                o_poly = box(
-                    other_entity.x - other_entity.size / 2,
-                    other_entity.y - other_entity.size / 2,
-                    other_entity.x + other_entity.size / 2,
-                    other_entity.y + other_entity.size / 2,
+                is_entity_pc = any(t in entity.tags for t in ["pc", "player", "party_npc"])
+                is_other_pc = any(t in other_entity.tags for t in ["pc", "player", "party_npc"])
+
+                is_other_incapacitated = any(
+                    c.name.lower() in ["incapacitated", "unconscious", "stunned", "paralyzed", "petrified", "dead"]
+                    for c in getattr(other_entity, "active_conditions", [])
+                )
+                is_other_tiny = (
+                    "tiny" in [t.lower() for t in getattr(other_entity, "tags", [])] or other_entity.size <= 2.5
                 )
 
-                if path_line.intersects(o_poly):
-                    is_entity_pc = any(t in entity.tags for t in ["pc", "player", "party_npc"])
-                    is_other_pc = any(t in other_entity.tags for t in ["pc", "player", "party_npc"])
-
-                    is_other_incapacitated = any(
-                        c.name.lower() in ["incapacitated", "unconscious", "stunned", "paralyzed", "petrified", "dead"]
-                        for c in getattr(other_entity, "active_conditions", [])
-                    )
-                    is_other_tiny = (
-                        "tiny" in [t.lower() for t in getattr(other_entity, "tags", [])] or other_entity.size <= 2.5
-                    )
-
-                    def size_cat(size: float, tags: list):
-                        tags_lower = [t.lower() for t in tags]
-                        if "tiny" in tags_lower:
-                            return 1
-                        if "small" in tags_lower:
-                            return 2
-                        if "large" in tags_lower:
-                            return 4
-                        if "huge" in tags_lower:
-                            return 5
-                        if "gargantuan" in tags_lower:
-                            return 6
-                        if size <= 2.5:
-                            return 1
-                        if size <= 5.0:
-                            return 3  # Medium
-                        if size <= 10.0:
-                            return 4  # Large
-                        if size <= 15.0:
-                            return 5  # Huge
+                def size_cat(size: float, tags: list):
+                    tags_lower = [t.lower() for t in tags]
+                    if "tiny" in tags_lower:
+                        return 1
+                    if "small" in tags_lower:
+                        return 2
+                    if "large" in tags_lower:
+                        return 4
+                    if "huge" in tags_lower:
+                        return 5
+                    if "gargantuan" in tags_lower:
                         return 6
+                    if size <= 2.5:
+                        return 1
+                    if size <= 5.0:
+                        return 3  # Medium
+                    if size <= 10.0:
+                        return 4  # Large
+                    if size <= 15.0:
+                        return 5  # Huge
+                    return 6
 
-                    cat_e = size_cat(entity.size, getattr(entity, "tags", []))
-                    cat_o = size_cat(other_entity.size, getattr(other_entity, "tags", []))
+                cat_e = size_cat(entity.size, getattr(entity, "tags", []))
+                cat_o = size_cat(other_entity.size, getattr(other_entity, "tags", []))
 
-                    # REQ-MOV-012: Tiny/Incapacitated allow passage. Otherwise check size diff.
-                    if (
-                        is_entity_pc != is_other_pc
-                        and abs(cat_e - cat_o) < 2
-                        and not is_other_incapacitated
-                        and not is_other_tiny
-                    ):
-                        is_valid = False
-                        invalid_reason = (
-                            f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
-                        )
-                        break
-                    else:
-                        segment_cost += segment_dist * (o_poly.intersection(path_line).length / path_line.length)
+                # REQ-MOV-012: Tiny/Incapacitated allow passage. Otherwise check size diff.
+                if (
+                    is_entity_pc != is_other_pc
+                    and abs(cat_e - cat_o) < 2
+                    and not is_other_incapacitated
+                    and not is_other_tiny
+                ):
+                    is_valid = False
+                    invalid_reason = (
+                        f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
+                    )
+                    break
+                else:
+                    segment_cost += segment_dist * (overlap_len / path_line.length) if path_line.length > 0 else 0
 
             if not is_valid and not request.force_execute:
                 break

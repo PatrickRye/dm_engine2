@@ -18,7 +18,7 @@ violating established world facts, thematic boundaries, or storylet contracts.
 
 import re
 import uuid
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, NamedTuple, Optional, Tuple
 
 from knowledge_graph import GraphPredicate
 from storylet import GraphMutation
@@ -44,6 +44,19 @@ class GuardrailResult:
         if self.allowed:
             return "GuardrailResult(allowed=True)"
         return f"GuardrailResult(allowed=False, reason='{self.reason}', revisions={self.required_revisions})"
+
+
+class BackstoryClaim(NamedTuple):
+    subject: str
+    verb: str
+    obj: str
+    status: str  # "LIKELY_VALID", "CONFLICT", or "NEW_ENTITY"
+
+
+class BackstoryValidationResult(NamedTuple):
+    claims: List[BackstoryClaim]
+    contradictions: List[str]
+    new_entities: List[str]
 
 
 class HardGuardrails:
@@ -547,6 +560,201 @@ class HardGuardrails:
             )
 
         return GuardrailResult(allowed=True)
+
+    # ------------------------------------------------------------------
+    # Feature #10: Player-authored backstory claim validation
+    # ------------------------------------------------------------------
+    # Assertion verbs for extracting backstory claims from freeform prose.
+    # Maps natural-language verbs to the GraphPredicate they imply.
+    # Used by validate_backstory_consistency to parse player claim text.
+    _ASSERTION_VERBS = {
+        "is": GraphPredicate.ALLIED_WITH,
+        "was": GraphPredicate.ALLIED_WITH,
+        "were": GraphPredicate.ALLIED_WITH,
+        "served": GraphPredicate.SERVES,
+        "serves": GraphPredicate.SERVES,
+        "ruled": GraphPredicate.ALLIED_WITH,
+        "rules": GraphPredicate.ALLIED_WITH,
+        "led": GraphPredicate.ALLIED_WITH,
+        "leads": GraphPredicate.ALLIED_WITH,
+        "possessed": GraphPredicate.POSSESSES,
+        "possesses": GraphPredicate.POSSESSES,
+        "owned": GraphPredicate.POSSESSES,
+        "owns": GraphPredicate.POSSESSES,
+        "betrayed": GraphPredicate.HOSTILE_TOWARD,
+        "betray": GraphPredicate.HOSTILE_TOWARD,
+        "hated": GraphPredicate.HOSTILE_TOWARD,
+        "hates": GraphPredicate.HOSTILE_TOWARD,
+        "loved": GraphPredicate.ALLIED_WITH,
+        "loves": GraphPredicate.ALLIED_WITH,
+        "feared": GraphPredicate.HOSTILE_TOWARD,
+        "fears": GraphPredicate.HOSTILE_TOWARD,
+        "allied with": GraphPredicate.ALLIED_WITH,
+        "allies with": GraphPredicate.ALLIED_WITH,
+        "joined": GraphPredicate.MEMBER_OF,
+        "joins": GraphPredicate.MEMBER_OF,
+        "member of": GraphPredicate.MEMBER_OF,
+        "led by": GraphPredicate.ALLIED_WITH,
+        "friend of": GraphPredicate.ALLIED_WITH,
+        "enemy of": GraphPredicate.HOSTILE_TOWARD,
+        "rival of": GraphPredicate.HOSTILE_TOWARD,
+    }
+
+    def _extract_backstory_triples(self, text: str) -> List[Tuple[str, str, str]]:
+        """
+        Extract (subject, verb, object) triples specifically from backstory claim text.
+
+        Works with [[Wikilinks]], KG-matching entity names, and bare subject/object
+        phrases that reference the PC or known KG entities.
+        """
+        triples = []
+
+        # Collect Wikilinks
+        wikilinks: List[Tuple[int, int, str]] = []
+        for m in re.finditer(r"\[\[([^\]]+)\]\]", text):
+            wikilinks.append((m.start(), m.end(), m.group(1).strip()))
+
+        # Collect KG-matching freeform entity names
+        kg_names: List[Tuple[int, int, str]] = []
+        for name in self._extract_entity_names_from_text(text):
+            node = self.kg.get_node_by_name(name)
+            if not node:
+                continue
+            for m in re.finditer(rf"\b{re.escape(name)}\b", text):
+                kg_names.append((m.start(), m.end(), name))
+
+        if not wikilinks and not kg_names:
+            return []
+
+        wikilink_names = {n for _, _, n in wikilinks}
+        all_entities: List[Tuple[int, int, str]] = list(wikilinks)
+        for t in kg_names:
+            if t[2] not in wikilink_names:
+                all_entities.append(t)
+
+        all_entities.sort(key=lambda x: x[0])
+
+        for verb_phrase in self._ASSERTION_VERBS:
+            for m in re.finditer(rf"\b{re.escape(verb_phrase)}\b", text, re.IGNORECASE):
+                verb_start, verb_end = m.start(), m.end()
+
+                # Find sentence bounds
+                sent_start = 0
+                for i in range(verb_start - 1, max(verb_start - 200, -1), -1):
+                    if text[i] in '.!?':
+                        sent_start = i + 1
+                        break
+                sent_end = len(text)
+                for i in range(verb_end, min(verb_end + 200, len(text))):
+                    if text[i] in '.!?':
+                        sent_end = i + 1
+                        break
+
+                in_sent = [(s, e, n) for s, e, n in all_entities if s >= sent_start and e <= sent_end]
+                before = [n for s, e, n in in_sent if e <= verb_start]
+                after = [n for s, e, n in in_sent if s >= verb_end]
+
+                if after:
+                    obj = after[0]
+                    subj = before[-1] if before else ""
+                    if subj:
+                        triples.append((subj, verb_phrase, obj))
+
+        return triples
+
+    def validate_backstory_consistency(
+        self, pc_node: Any, claim_text: str
+    ) -> BackstoryValidationResult:
+        """
+        Validate a player-authored backstory claim against the Knowledge Graph.
+
+        Returns BackstoryValidationResult with:
+          - claims: List[BackstoryClaim(subject, verb, object, status)]
+          - contradictions: List[str] — human-readable conflicts with existing KG
+          - new_entities: List[str] — entity names in claims not yet in KG
+
+        Status per claim:
+          - LIKELY_VALID: Consistent with existing KG
+          - CONFLICT: Contradicts an existing KG edge
+          - NEW_ENTITY: References an entity not in KG
+        """
+        triples = self._extract_backstory_triples(claim_text)
+        if not triples:
+            return BackstoryValidationResult(claims=[], contradictions=[], new_entities=[])
+
+        claims: List[BackstoryClaim] = []
+        contradictions: List[str] = []
+        new_entities: List[str] = []
+
+        for subj, verb, obj in triples:
+            if not subj or not obj:
+                continue
+
+            # Check if target entity exists in KG
+            target_node = self.kg.get_node_by_name(obj)
+            if target_node is None:
+                # Try case-insensitive
+                target_node = self.kg.get_node_by_name(obj.lower())
+                if target_node:
+                    obj = target_node.name  # Use canonical casing
+
+            if target_node is None:
+                new_entities.append(obj)
+                claims.append(BackstoryClaim(subject=subj, verb=verb, obj=obj, status="NEW_ENTITY"))
+                continue
+
+            # Check for conflicting edges
+            pred = self._ASSERTION_VERBS.get(verb.lower())
+            if pred is None:
+                pred = GraphPredicate.ALLIED_WITH
+
+            # Get PC's node UUID
+            pc_uuid = pc_node.uuid
+            target_uuid = target_node.uuid
+
+            # Check if an opposing edge already exists
+            conflicting = False
+            for edge in self.kg.edges:
+                if edge.subject_uuid != pc_uuid or edge.object_uuid != target_uuid:
+                    continue
+                if edge.predicate == pred:
+                    # Same relationship exists — check if it contradicts
+                    attrs = getattr(edge, "attributes", {}) or {}
+                    if attrs.get("source") == "player_backstory":
+                        # Already a player backstory claim — LIKELY_VALID (same claim resubmitted)
+                        conflicting = False
+                        break
+                    # Same predicate but not from player backstory — check if it's immutable
+                    # and conflicts with this claim
+                    conflicting = False  # Allow overlapping claims; DM resolves conflicts
+                elif edge.predicate in (
+                    GraphPredicate.HOSTILE_TOWARD,
+                    GraphPredicate.ALLIED_WITH,
+                    GraphPredicate.SERVES,
+                    GraphPredicate.MEMBER_OF,
+                ):
+                    # Check for direct contradiction: claiming ALLIED_WITH when HOSTILE_TOWARD exists
+                    opposing = (
+                        (pred == GraphPredicate.ALLIED_WITH and edge.predicate == GraphPredicate.HOSTILE_TOWARD)
+                        or (pred == GraphPredicate.HOSTILE_TOWARD and edge.predicate == GraphPredicate.ALLIED_WITH)
+                    )
+                    if opposing:
+                        contradictions.append(
+                            f"Claim '{subj} {verb} {obj}' conflicts with existing "
+                            f"'{edge.predicate.value}' relationship between {subj} and {obj}."
+                        )
+                        conflicting = True
+
+            if conflicting:
+                claims.append(BackstoryClaim(subject=subj, verb=verb, obj=obj, status="CONFLICT"))
+            else:
+                claims.append(BackstoryClaim(subject=subj, verb=verb, obj=obj, status="LIKELY_VALID"))
+
+        return BackstoryValidationResult(
+            claims=claims,
+            contradictions=contradictions,
+            new_entities=new_entities,
+        )
 
     # ------------------------------------------------------------------
     # Disposition / Faction Reputation consistency checks
