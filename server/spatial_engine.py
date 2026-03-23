@@ -906,7 +906,6 @@ class SpatialQueryService:
         return hit_entities, hit_walls, hit_terrains
 
     @locked
-    @locked
     def get_distance_and_cover(
         self, source_uuid: uuid.UUID, target_uuid: uuid.UUID, vault_path: str = "default"
     ) -> Tuple[float, str]:
