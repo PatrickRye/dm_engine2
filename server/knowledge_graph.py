@@ -10,9 +10,11 @@ Persistence: WORLD_GRAPH.md YAML frontmatter via vault_io.py
 No LLM calls — pure Python deterministic data structure.
 """
 
+import threading
+from concurrency import locked
 import uuid
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import ClassVar, Dict, List, Optional, Set, Tuple, Any
 from collections import defaultdict
 from pydantic import BaseModel, Field
 
@@ -98,12 +100,18 @@ class KnowledgeGraph(BaseModel):
         default_factory=dict, exclude=True
     )
 
+    # Thread-safety: RLock allows concurrent readers and serializes mutations.
+    # Every public method that reads or writes shared state is @locked.
+    _lock: ClassVar[threading.RLock] = threading.RLock()
+
+    @locked
     def model_post_init(self, __context) -> None:
         self._rebuild_adjacency()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    @locked
     def _rebuild_adjacency(self) -> None:
         self.adjacency.clear()
         self.name_index.clear()
@@ -128,11 +136,13 @@ class KnowledgeGraph(BaseModel):
     # ------------------------------------------------------------------
     # Node CRUD
     # ------------------------------------------------------------------
+    @locked
     def add_node(self, node: KnowledgeGraphNode) -> None:
         self.nodes[node.node_uuid] = node
         self.name_index[node.name.lower()] = node.node_uuid
         # No edges to rebuild yet; adjacency entries for this node will be added when edges are added
 
+    @locked
     def remove_node(self, node_uuid: uuid.UUID) -> None:
         node = self.nodes.pop(node_uuid, None)
         if node:
@@ -159,6 +169,7 @@ class KnowledgeGraph(BaseModel):
     # ------------------------------------------------------------------
     # Edge CRUD
     # ------------------------------------------------------------------
+    @locked
     def add_edge(self, edge: KnowledgeGraphEdge) -> None:
         if edge.subject_uuid not in self.adjacency:
             self.adjacency[edge.subject_uuid] = {}
@@ -168,6 +179,7 @@ class KnowledgeGraph(BaseModel):
         self.edge_index[(edge.subject_uuid, edge.predicate, edge.object_uuid)] = edge
         self.edges.append(edge)
 
+    @locked
     def remove_edge(self, edge_uuid: uuid.UUID) -> None:
         edge = next((e for e in self.edges if e.edge_uuid == edge_uuid), None)
         if edge:

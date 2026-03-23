@@ -11,10 +11,11 @@ Persistence format:
   server/Journals/STORYLETS/{storylet_name}.md  — one file per storylet, YAML frontmatter
 """
 
+import asyncio
 import os
+import threading
 import uuid
 from typing import Dict, List, Optional, Set, Any
-import asyncio
 import aiofiles
 
 from storylet import Storylet, StoryletEffect, StoryletPrerequisites, GraphQuery, GraphMutation, TensionLevel, UrgencyLevel
@@ -168,18 +169,24 @@ class StoryletRegistry:
         self._storylets: Dict[uuid.UUID, Storylet] = {}
         self._by_tag: Dict[str, Set[uuid.UUID]] = {}
         self._by_tension: Dict[TensionLevel, Set[uuid.UUID]] = {}
+        # Thread-safety: _sync_lock for register/unregister called from sync tools
+        # (via asyncio.to_thread). _async_lock for poll/load/save in async context.
+        self._sync_lock = threading.RLock()
+        self._async_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Core registry operations
     # ------------------------------------------------------------------
     def register(self, storylet: Storylet) -> None:
-        self._storylets[storylet.id] = storylet
-        self._reindex(storylet)
+        with self._sync_lock:
+            self._storylets[storylet.id] = storylet
+            self._reindex(storylet)
 
     def unregister(self, storylet_id: uuid.UUID) -> None:
-        storylet = self._storylets.pop(storylet_id, None)
-        if storylet:
-            self._deindex(storylet)
+        with self._sync_lock:
+            storylet = self._storylets.pop(storylet_id, None)
+            if storylet:
+                self._deindex(storylet)
 
     def get(self, storylet_id: uuid.UUID) -> Optional[Storylet]:
         return self._storylets.get(storylet_id)
@@ -214,7 +221,7 @@ class StoryletRegistry:
     # ------------------------------------------------------------------
     # Polling engine
     # ------------------------------------------------------------------
-    def poll(
+    async def poll(
         self,
         kg,  # KnowledgeGraph — type hints deferred to avoid circular import
         ctx: Dict[str, Any],
@@ -230,38 +237,40 @@ class StoryletRegistry:
             tension: If provided, only return storylets matching this tension level
             required_tags: If provided, only return storylets sharing at least one tag
         """
-        candidates: List[Storylet] = []
-        for storylet in self._storylets.values():
-            if not storylet.can_fire(kg, ctx):
-                continue
-            # Auto-prune expired deadline storylets
-            if storylet.deadline_turns is not None and storylet.deadline_turns <= 0:
-                storylet.is_active = False
-                continue
-            if tension is not None and storylet.tension_level != tension:
-                continue
-            if required_tags and not required_tags.intersection(storylet.tags):
-                continue
-            candidates.append(storylet)
-        return candidates
+        async with self._async_lock:
+            candidates: List[Storylet] = []
+            for storylet in self._storylets.values():
+                if not storylet.can_fire(kg, ctx):
+                    continue
+                # Auto-prune expired deadline storylets
+                if storylet.deadline_turns is not None and storylet.deadline_turns <= 0:
+                    storylet.is_active = False
+                    continue
+                if tension is not None and storylet.tension_level != tension:
+                    continue
+                if required_tags and not required_tags.intersection(storylet.tags):
+                    continue
+                candidates.append(storylet)
+            return candidates
 
     def get_active_count(self) -> int:
         return sum(1 for s in self._storylets.values() if s.is_active)
 
-    def decrement_deadlines(self) -> int:
+    async def decrement_deadlines(self) -> int:
         """
         Decrement deadline_turns on all storylets that have a deadline.
         Deactivates any storylet that reaches 0.
         Returns count of deactivated storylets.
         """
-        deactivated = 0
-        for storylet in self._storylets.values():
-            if storylet.deadline_turns is not None and storylet.deadline_turns > 0:
-                storylet.deadline_turns -= 1
-                if storylet.deadline_turns <= 0:
-                    storylet.is_active = False
-                    deactivated += 1
-        return deactivated
+        async with self._async_lock:
+            deactivated = 0
+            for storylet in self._storylets.values():
+                if storylet.deadline_turns is not None and storylet.deadline_turns > 0:
+                    storylet.deadline_turns -= 1
+                    if storylet.deadline_turns <= 0:
+                        storylet.is_active = False
+                        deactivated += 1
+            return deactivated
 
     # ------------------------------------------------------------------
     # Vault persistence (async — caller should use asyncio.to_thread or await)

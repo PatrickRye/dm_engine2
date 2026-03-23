@@ -154,7 +154,8 @@ class TestKnowledgeGraph:
 # Phase 1: Storylet Schema Tests
 # =============================================================================
 class TestStorylet:
-    def test_storylet_can_fire_prerequisites_met(self, sample_kg, storylet_registry):
+    @pytest.mark.asyncio
+    async def test_storylet_can_fire_prerequisites_met(self, sample_kg, storylet_registry):
         q = GraphQuery(query_type="node_exists", node_name="Goblin King", node_type="npc")
         s = Storylet(
             name="Test",
@@ -162,11 +163,12 @@ class TestStorylet:
             content="The Goblin King attacks!",
         )
         storylet_registry.register(s)
-        candidates = storylet_registry.poll(sample_kg, {})
+        candidates = await storylet_registry.poll(sample_kg, {})
         assert len(candidates) == 1
         assert candidates[0].name == "Test"
 
-    def test_storylet_cannot_fire_prerequisites_not_met(self, sample_kg, storylet_registry):
+    @pytest.mark.asyncio
+    async def test_storylet_cannot_fire_prerequisites_not_met(self, sample_kg, storylet_registry):
         q = GraphQuery(query_type="node_exists", node_name="NonExistent", node_type="npc")
         s = Storylet(
             name="Test",
@@ -174,10 +176,11 @@ class TestStorylet:
             content="...",
         )
         storylet_registry.register(s)
-        candidates = storylet_registry.poll(sample_kg, {})
+        candidates = await storylet_registry.poll(sample_kg, {})
         assert len(candidates) == 0
 
-    def test_storylet_any_of_logic(self, sample_kg, storylet_registry):
+    @pytest.mark.asyncio
+    async def test_storylet_any_of_logic(self, sample_kg, storylet_registry):
         q1 = GraphQuery(query_type="node_exists", node_name="NonExistent1")
         q2 = GraphQuery(query_type="node_exists", node_name="Goblin King")
         s = Storylet(
@@ -186,10 +189,11 @@ class TestStorylet:
             content="...",
         )
         storylet_registry.register(s)
-        candidates = storylet_registry.poll(sample_kg, {})
+        candidates = await storylet_registry.poll(sample_kg, {})
         assert len(candidates) == 1  # q2 is true
 
-    def test_storylet_none_of_logic(self, sample_kg, storylet_registry):
+    @pytest.mark.asyncio
+    async def test_storylet_none_of_logic(self, sample_kg, storylet_registry):
         # No Goblin King = true (he's not Nonexistent)
         q = GraphQuery(query_type="node_exists", node_name="NonExistent")
         s = Storylet(
@@ -198,7 +202,7 @@ class TestStorylet:
             content="...",
         )
         storylet_registry.register(s)
-        candidates = storylet_registry.poll(sample_kg, {})
+        candidates = await storylet_registry.poll(sample_kg, {})
         assert len(candidates) == 1  # Nonexistent entity doesn't exist, so none_of passes
 
     def test_storylet_max_occurrences(self, sample_kg, storylet_registry):
@@ -253,7 +257,8 @@ class TestDramaManager:
         dm.arc.advance_turn(TensionLevel.HIGH)
         assert dm.arc.target_tension == TensionLevel.LOW  # De-escalated
 
-    def test_drama_manager_selects_by_tension(self, sample_kg, storylet_registry):
+    @pytest.mark.asyncio
+    async def test_drama_manager_selects_by_tension(self, sample_kg, storylet_registry):
         high_storylet = Storylet(
             name="Combat",
             tension_level=TensionLevel.HIGH,
@@ -272,7 +277,7 @@ class TestDramaManager:
         dm = DramaManager(storylet_registry, sample_kg)
         dm.arc.target_tension = TensionLevel.HIGH
 
-        selected = dm.select_next({})
+        selected = await dm.select_next({})
         assert selected.name == "Combat"
 
     def test_drama_manager_inject_storylet(self, sample_kg, storylet_registry):
@@ -346,25 +351,27 @@ class TestHardGuardrails:
 # Phase 3: Storylet Registry Polling Tests
 # =============================================================================
 class TestStoryletRegistry:
-    def test_storylet_registry_poll_filters_tension(self, sample_kg, storylet_registry):
+    @pytest.mark.asyncio
+    async def test_storylet_registry_poll_filters_tension(self, sample_kg, storylet_registry):
         storylet_registry.register(
             Storylet(name="High", tension_level=TensionLevel.HIGH, prerequisites=StoryletPrerequisites(all_of=[]))
         )
         storylet_registry.register(
             Storylet(name="Low", tension_level=TensionLevel.LOW, prerequisites=StoryletPrerequisites(all_of=[]))
         )
-        candidates = storylet_registry.poll(sample_kg, {}, tension=TensionLevel.HIGH)
+        candidates = await storylet_registry.poll(sample_kg, {}, tension=TensionLevel.HIGH)
         assert len(candidates) == 1
         assert candidates[0].name == "High"
 
-    def test_storylet_registry_poll_filters_tags(self, sample_kg, storylet_registry):
+    @pytest.mark.asyncio
+    async def test_storylet_registry_poll_filters_tags(self, sample_kg, storylet_registry):
         storylet_registry.register(
             Storylet(name="Combat", tension_level=TensionLevel.HIGH, tags={"combat", "dungeon"}, prerequisites=StoryletPrerequisites(all_of=[]))
         )
         storylet_registry.register(
             Storylet(name="Social", tension_level=TensionLevel.LOW, tags={"social", "urban"}, prerequisites=StoryletPrerequisites(all_of=[]))
         )
-        candidates = storylet_registry.poll(sample_kg, {}, required_tags={"combat"})
+        candidates = await storylet_registry.poll(sample_kg, {}, required_tags={"combat"})
         assert len(candidates) == 1
         assert candidates[0].name == "Combat"
 

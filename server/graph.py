@@ -835,7 +835,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         dm.arc.advance_turn(outcome_tension)
 
         # Decrement storylet deadlines each session turn
-        deactivated = dm.registry.decrement_deadlines()
+        deactivated = await dm.registry.decrement_deadlines()
         if deactivated > 0:
             await write_audit_log(
                 vault_path,
@@ -851,7 +851,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         }
 
         # Select next storylet
-        selected = dm.select_next(ctx)
+        selected = await dm.select_next(ctx)
 
         if selected:
             # Apply storylet effects

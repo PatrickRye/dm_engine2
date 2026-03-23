@@ -14,7 +14,7 @@ Architecture under test:
 
 import pytest
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
 
 from drama_manager import DramaManager, TensionArc
 from storylet import Storylet, StoryletPrerequisites, TensionLevel
@@ -232,7 +232,8 @@ class TestSelectNextWithRelationships:
             )
         )
 
-    def test_select_next_prefers_hostile_storylet(self):
+    @pytest.mark.asyncio
+    async def test_select_next_prefers_hostile_storylet(self):
         """Between equal-priority storylets, the hostile NPC storylet wins."""
         # Storylet A: neutral (weight=0), Storylet B: hostile (weight=2)
         # B should be selected even with same priority
@@ -250,16 +251,17 @@ class TestSelectNextWithRelationships:
         # Build a minimal registry that returns both
         storylets = [neutral, hostile]
         mock_registry = MagicMock(spec=StoryletRegistry)
-        mock_registry.poll.return_value = storylets
+        mock_registry.poll = AsyncMock(return_value=storylets)
 
         dm = DramaManager(mock_registry, self.kg)
         dm.arc = TensionArc(target_tension=TensionLevel.MEDIUM)
 
-        selected = dm.select_next({"active_character": "The Party"})
+        selected = await dm.select_next({"active_character": "The Party"})
         # Hostile has higher weight → selected
         assert selected.name == "Goblin Showdown"
 
-    def test_select_next_tiebreak_on_priority(self):
+    @pytest.mark.asyncio
+    async def test_select_next_tiebreak_on_priority(self):
         """Higher priority_override wins regardless of relationship."""
         high_priority = Storylet(
             name="Critical Story Beat",
@@ -275,11 +277,11 @@ class TestSelectNextWithRelationships:
         )
 
         mock_registry = MagicMock(spec=StoryletRegistry)
-        mock_registry.poll.return_value = [high_priority, low_priority]
+        mock_registry.poll = AsyncMock(return_value=[high_priority, low_priority])
 
         dm = DramaManager(mock_registry, self.kg)
         dm.arc = TensionArc(target_tension=TensionLevel.MEDIUM)
 
-        selected = dm.select_next({"active_character": "The Party"})
+        selected = await dm.select_next({"active_character": "The Party"})
         # Priority wins over relationship weight
         assert selected.name == "Critical Story Beat"

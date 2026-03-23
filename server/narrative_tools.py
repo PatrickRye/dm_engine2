@@ -2,6 +2,7 @@
 """
 narrative_tools - Story, graph mutations, and backstory tools
 """
+import asyncio
 import os
 import re
 import threading
@@ -180,16 +181,11 @@ async def create_storylet(  # noqa: C901
     registry = get_storylet_registry(vault_path)
     registry.register(storylet)
 
-    # Persist to vault
-    import asyncio
+    # Persist to vault — await directly since we're in an async tool
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.create_task(registry.save_to_vault(vault_path))
-        else:
-            loop.run_until_complete(registry.save_to_vault(vault_path))
-    except RuntimeError:
-        pass  # No event loop available
+        await registry.save_to_vault(vault_path)
+    except Exception:
+        pass  # Best-effort persistence; failures logged by save_to_vault
 
     return (
         f"MECHANICAL TRUTH: Created storylet '{name}' (id={storylet.id}, tension={tension_level}). "
@@ -229,7 +225,7 @@ async def list_active_storylets(
         except ValueError:
             return f"SYSTEM ERROR: Invalid tension_filter '{tension_filter}'. Must be 'low', 'medium', or 'high'."
 
-    candidates = registry.poll(kg, ctx, tension=tension)
+    candidates = await registry.poll(kg, ctx, tension=tension)
 
     if not candidates:
         return "No storylets currently have their prerequisites met."
@@ -364,27 +360,19 @@ async def sync_knowledge_graph(
         from vault_io import sync_knowledge_graph_to_vault
         kg = get_knowledge_graph(vault_path)
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(sync_knowledge_graph_to_vault(vault_path, kg))
-            else:
-                result = loop.run_until_complete(sync_knowledge_graph_to_vault(vault_path, kg))
+            await sync_knowledge_graph_to_vault(vault_path, kg)
         except Exception as e:
             return f"SYSTEM ERROR: Failed to sync KG to vault: {e}"
-        return result
+        return "MECHANICAL TRUTH: Knowledge graph synced to vault."
 
     elif direction == "from_vault":
         from vault_io import sync_knowledge_graph_from_vault
         kg = get_knowledge_graph(vault_path)
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(sync_knowledge_graph_from_vault(vault_path, kg))
-            else:
-                result = loop.run_until_complete(sync_knowledge_graph_from_vault(vault_path, kg))
+            await sync_knowledge_graph_from_vault(vault_path, kg)
         except Exception as e:
             return f"SYSTEM ERROR: Failed to sync KG from vault: {e}"
-        return result
+        return "MECHANICAL TRUTH: Knowledge graph synced from vault."
 
     return "SYSTEM ERROR: direction must be 'to_vault' or 'from_vault'."
 

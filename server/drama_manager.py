@@ -185,7 +185,7 @@ class DramaManager:
             return 0.5
         return 0.0
 
-    def select_next(self, ctx: Dict[str, Any]) -> Optional[Storylet]:
+    async def select_next(self, ctx: Dict[str, Any]) -> Optional[Storylet]:
         """
         Select the optimal storylet given current tension arc and available candidates.
 
@@ -198,7 +198,7 @@ class DramaManager:
 
         Returns None if no storylets are available.
         """
-        candidates = self.registry.poll(self.kg, ctx)
+        candidates = await self.registry.poll(self.kg, ctx)
         if not candidates:
             return None
 
