@@ -4,6 +4,7 @@ narrative_tools - Story, graph mutations, and backstory tools
 """
 import os
 import re
+import threading
 import yaml
 import random
 import math
@@ -1116,12 +1117,14 @@ async def reveal_secret(
 # Keyed by vault_path; each value is a dict keyed by pc_name
 # ---------------------------------------------------------------------
 _PENDING_BACKSTORY_CLAIMS: Dict[str, Dict[str, list]] = {}
+_PENDING_CLAIMS_LOCK = threading.RLock()
 
 
 def _get_pending_claims(vault_path: str) -> Dict[str, list]:
-    if vault_path not in _PENDING_BACKSTORY_CLAIMS:
-        _PENDING_BACKSTORY_CLAIMS[vault_path] = {}
-    return _PENDING_BACKSTORY_CLAIMS[vault_path]
+    with _PENDING_CLAIMS_LOCK:
+        if vault_path not in _PENDING_BACKSTORY_CLAIMS:
+            _PENDING_BACKSTORY_CLAIMS[vault_path] = {}
+        return _PENDING_BACKSTORY_CLAIMS[vault_path]
 
 
 

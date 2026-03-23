@@ -19,7 +19,7 @@ from dnd_rules_engine import (
     parse_duration_to_seconds,
 )
 from spatial_engine import spatial_service, HAS_GIS, TrapDefinition, TerrainZone
-from registry import get_entity, get_all_entities
+from registry import get_entity, get_all_entities, register_entity
 from spell_system import SpellMechanics
 from pydantic import ValidationError
 
@@ -1710,6 +1710,8 @@ def trap_movement_handler(event: GameEvent):
             strength_mod=ModifiableValue(base_value=0),
             dexterity_mod=ModifiableValue(base_value=0),
         )
+        # Explicit registration (BaseGameEntity no longer auto-registers)
+        register_entity(trap_source, event.vault_path)
 
         mechanics = {
             "requires_attack_roll": trap.requires_attack_roll,
@@ -2269,6 +2271,8 @@ def start_of_turn_handler(event: GameEvent):
                     strength_mod=ModifiableValue(base_value=0),
                     dexterity_mod=ModifiableValue(base_value=0),
                 )
+                # Explicit registration (BaseGameEntity no longer auto-registers)
+                register_entity(trap_source, event.vault_path)
 
                 mechanics = {
                     "requires_attack_roll": trap.requires_attack_roll,

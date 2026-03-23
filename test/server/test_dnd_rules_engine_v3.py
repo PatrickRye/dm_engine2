@@ -10,7 +10,7 @@ from dnd_rules_engine import (
     ConditionalDamageWeapon,
     DamageCondition,
 )
-from registry import clear_registry
+from registry import clear_registry, register_entity
 
 
 class TestDnDRulesEngineV3(unittest.TestCase):
@@ -28,14 +28,17 @@ class TestDnDRulesEngineV3(unittest.TestCase):
             strength_mod=ModifiableValue(base_value=3),
             dexterity_mod=ModifiableValue(base_value=1),
         )
+        register_entity(attacker)
 
         longsword = MeleeWeapon(name="Steel Longsword", damage_dice="1d8", damage_type="slashing")
+        register_entity(longsword)
         sun_blade = ConditionalDamageWeapon(
             weapon=longsword,
             name="Sun Blade",
             magic_bonus=2,
             conditions=[DamageCondition(required_tag="undead", extra_damage_dice="1d8", damage_type="radiant")],
         )
+        register_entity(sun_blade)
         attacker.equipped_weapon_uuid = sun_blade.entity_uuid
 
         target = Creature(
@@ -46,6 +49,7 @@ class TestDnDRulesEngineV3(unittest.TestCase):
             dexterity_mod=ModifiableValue(base_value=0),
             tags=["undead"],
         )
+        register_entity(target)
 
         with patch("random.randint", side_effect=[18, 1, 6, 5]):
             event = GameEvent(event_type="MeleeAttack", source_uuid=attacker.entity_uuid, target_uuid=target.entity_uuid)
@@ -62,14 +66,17 @@ class TestDnDRulesEngineV3(unittest.TestCase):
             strength_mod=ModifiableValue(base_value=3),
             dexterity_mod=ModifiableValue(base_value=1),
         )
+        register_entity(attacker)
 
         longsword = MeleeWeapon(name="Steel Longsword", damage_dice="1d8", damage_type="slashing")
+        register_entity(longsword)
         sun_blade = ConditionalDamageWeapon(
             weapon=longsword,
             name="Sun Blade",
             magic_bonus=2,
             conditions=[DamageCondition(required_tag="undead", extra_damage_dice="1d8", damage_type="radiant")],
         )
+        register_entity(sun_blade)
         attacker.equipped_weapon_uuid = sun_blade.entity_uuid
 
         target = Creature(
@@ -80,6 +87,7 @@ class TestDnDRulesEngineV3(unittest.TestCase):
             dexterity_mod=ModifiableValue(base_value=0),
             tags=["undead"],
         )
+        register_entity(target)
 
         # Crit, attack roll, 6 base, 5 cond, 6 crit base, 5 crit cond
         with patch("random.randint", side_effect=[20, 1, 6, 5, 6, 5]):

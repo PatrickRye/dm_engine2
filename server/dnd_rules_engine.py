@@ -35,8 +35,7 @@ class BaseGameEntity(BaseModel):
     height: float = 5.0  # Defaults to size unless specifically set (e.g. Medium creature = 5x5x5)
 
     def model_post_init(self, __context: Any) -> None:
-        """Automatically registers the object upon creation."""
-        register_entity(self, getattr(self, "vault_path", "default"))
+        """No-op. Registration is now explicit — call `register_entity(self, vault_path)` after construction."""
 
     @classmethod
     def get(cls, uid: uuid.UUID) -> Optional["BaseGameEntity"]:
@@ -196,12 +195,6 @@ class ConditionalDamageWeapon(MagicWeaponDecorator):
     conditions: List[DamageCondition]
     _subscribed = False
 
-    def __init__(self, *, weapon: Weapon, **data):
-        super().__init__(weapon=weapon, **data)
-        if not ConditionalDamageWeapon._subscribed:
-            EventBus.subscribe("MeleeAttack", self.handle_attack, priority=50)
-            ConditionalDamageWeapon._subscribed = True
-
     def handle_attack(self, event: "GameEvent"):
         # This handler should run before the main resolve_attack_handler
         if event.status != EventStatus.PRE_EVENT:
@@ -221,6 +214,23 @@ class ConditionalDamageWeapon(MagicWeaponDecorator):
                     f"[Engine] BONUS: {self.name} will deal extra {condition.extra_damage_dice} "
                     f"{condition.damage_type} damage to the {condition.required_tag}!"
                 )
+
+
+# Module-level lock to avoid Pydantic PrivateAttr deepcopy issues.
+# _subscribed is a class variable so it's shared across all instances.
+_CDW_LOCK = threading.RLock()
+
+
+def __cdw_init(self, *, weapon: Weapon, **data):
+    super(ConditionalDamageWeapon, self).__init__(weapon=weapon, **data)
+    with _CDW_LOCK:
+        if not ConditionalDamageWeapon._subscribed:
+            EventBus.subscribe("MeleeAttack", self.handle_attack, priority=50)
+            ConditionalDamageWeapon._subscribed = True
+
+
+# Patch after class definition to avoid Pydantic deepcopy on _CDW_LOCK
+ConditionalDamageWeapon.__init__ = __cdw_init
 
 
 class ActiveCondition(BaseModel):

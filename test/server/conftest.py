@@ -7,6 +7,31 @@ from event_handlers import register_core_handlers
 import itertools
 from contextlib import contextmanager
 from system_logger import logger
+from registry import register_entity
+
+
+@pytest.fixture(autouse=True)
+def auto_register_entities():
+    """
+    Auto-registers all BaseGameEntity subclasses (Creature, MeleeWeapon, RangedWeapon, etc.)
+    created during tests, since auto-registration was removed from model_post_init.
+    This preserves test ergonomics without re-introducing implicit global state.
+
+    Patching only BaseGameEntity.__init__ (the root of the inheritance chain) ensures
+    registration fires exactly once per object regardless of how many subclass __init__s
+    call super().__init__().
+    """
+    from dnd_rules_engine import BaseGameEntity
+
+    original = BaseGameEntity.__init__
+
+    def _auto_reg_init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        register_entity(self, getattr(self, "vault_path", "default"))
+
+    BaseGameEntity.__init__ = _auto_reg_init
+    yield
+    BaseGameEntity.__init__ = original
 
 
 @pytest.fixture

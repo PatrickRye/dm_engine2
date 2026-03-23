@@ -12,6 +12,7 @@ from dnd_rules_engine import (
     NumericalModifier,
     ModifierPriority,
 )
+from registry import register_entity
 from spatial_engine import spatial_service, Wall, TerrainZone
 from tools import (
     manage_light_sources,
@@ -60,7 +61,9 @@ def test_system_barovian_church_ranged_combat(mock_dice):
         speed=30,
         movement_remaining=30,
     )
+    register_entity(ranger)
     bow = RangedWeapon(name="Shortbow", damage_dice="1d6", damage_type="piercing", normal_range=80, long_range=320)
+    register_entity(bow)
     ranger.equipped_weapon_uuid = bow.entity_uuid
 
     vampire = Creature(
@@ -74,6 +77,7 @@ def test_system_barovian_church_ranged_combat(mock_dice):
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(vampire)
 
     spatial_service.sync_entity(ranger)
     spatial_service.sync_entity(vampire)
@@ -123,7 +127,9 @@ def test_system_sentinel_feat_interaction(mock_dice):
         strength_mod=ModifiableValue(base_value=4),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(fighter)
     sword = MeleeWeapon(name="Longsword", damage_dice="1d8", damage_type="slashing")
+    register_entity(sword)
     fighter.equipped_weapon_uuid = sword.entity_uuid
 
     goblin = Creature(
@@ -137,6 +143,7 @@ def test_system_sentinel_feat_interaction(mock_dice):
         dexterity_mod=ModifiableValue(base_value=0),
         movement_remaining=30,
     )
+    register_entity(goblin)
 
     spatial_service.sync_entity(fighter)
     spatial_service.sync_entity(goblin)
@@ -558,6 +565,7 @@ async def test_system_grapple_contest_success_and_fail(mock_dice):
         strength_mod=ModifiableValue(base_value=4),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(attacker)
     target = Creature(
         name="Bard",
         x=5,
@@ -569,6 +577,7 @@ async def test_system_grapple_contest_success_and_fail(mock_dice):
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=2),
     )
+    register_entity(target)
 
     spatial_service.sync_entity(attacker)
     spatial_service.sync_entity(target)
@@ -669,6 +678,7 @@ async def test_system_throw_breaks_grapple_and_knocks_prone(mock_dice):
         strength_mod=ModifiableValue(base_value=4),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(attacker)
     target = Creature(
         name="Bard",
         x=5,
@@ -680,6 +690,7 @@ async def test_system_throw_breaks_grapple_and_knocks_prone(mock_dice):
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=2),
     )
+    register_entity(target)
 
     spatial_service.sync_entity(attacker)
     spatial_service.sync_entity(target)

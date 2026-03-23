@@ -81,7 +81,7 @@ def _load_modifiable_value(yaml_data: dict, field_name: str, fallback_base_value
 
 from compendium_manager import CompendiumManager
 from spatial_engine import spatial_service
-from registry import clear_registry, get_all_entities
+from registry import clear_registry, get_all_entities, register_entity
 from item_system import ItemCompendium, WeaponItem
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
@@ -271,6 +271,9 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
             mounted_on_uuid=uuid.UUID(yaml_data["mounted_on_uuid"]) if yaml_data.get("mounted_on_uuid") else None,
         )
 
+        # Explicit registration (BaseGameEntity no longer auto-registers)
+        register_entity(entity, vault_path)
+
         # Bridge: Initialize and Equip the Object-Oriented Weapon
         equipment = yaml_data.get("equipment", {})
         main_hand = equipment.get("main_hand", "Unarmed")
@@ -279,6 +282,9 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
         dmg_type = "bludgeoning" if "Unarmed" in main_hand else "slashing"
 
         weapon = MeleeWeapon(name=main_hand, damage_dice=dmg_dice, damage_type=dmg_type, vault_path=vault_path)
+
+        # Explicit registration (BaseGameEntity no longer auto-registers)
+        register_entity(weapon, vault_path)
 
         weapon_item = await ItemCompendium.load_item(vault_path, main_hand)
         if weapon_item and isinstance(weapon_item, WeaponItem):

@@ -10,7 +10,7 @@ from dnd_rules_engine import (
     ConditionalDamageWeapon,
     DamageCondition,
 )
-from registry import clear_registry
+from registry import clear_registry, register_entity
 
 
 class TestDnDRulesEngine(unittest.TestCase):
@@ -26,6 +26,7 @@ class TestDnDRulesEngine(unittest.TestCase):
 
         # 1. Create Weapons
         longsword = MeleeWeapon(name="Steel Longsword", damage_dice="1d8", damage_type="slashing")
+        register_entity(longsword)
 
         sun_blade = ConditionalDamageWeapon(
             weapon=longsword,
@@ -33,6 +34,7 @@ class TestDnDRulesEngine(unittest.TestCase):
             magic_bonus=2,
             conditions=[DamageCondition(required_tag="undead", extra_damage_dice="1d8", damage_type="radiant")],
         )
+        register_entity(sun_blade)
 
         # 2. Create Creatures
         fighter = Creature(
@@ -43,6 +45,7 @@ class TestDnDRulesEngine(unittest.TestCase):
             dexterity_mod=ModifiableValue(base_value=1),
             equipped_weapon_uuid=sun_blade.entity_uuid,
         )
+        register_entity(fighter)
 
         wizard = Creature(
             name="Lyra the Wizard",
@@ -52,6 +55,7 @@ class TestDnDRulesEngine(unittest.TestCase):
             dexterity_mod=ModifiableValue(base_value=2),
             tags=["can_cast_shield"],
         )
+        register_entity(wizard)
 
         zombie = Creature(
             name="Mindless Zombie",
@@ -62,6 +66,7 @@ class TestDnDRulesEngine(unittest.TestCase):
             tags=["undead"],
             vulnerabilities=["slashing"],
         )
+        register_entity(zombie)
 
         # 3. Trigger an Event
         print("\n--- Paladin attacks Zombie with Sun Blade ---")
@@ -113,7 +118,9 @@ class TestDnDRulesEngine(unittest.TestCase):
             dexterity_mod=ModifiableValue(base_value=1),
             tags=["blindsight_60"],
         )
+        register_entity(attacker)
         weapon = MeleeWeapon(name="Sword", damage_dice="1d8", damage_type="slashing")
+        register_entity(weapon)
         attacker.equipped_weapon_uuid = weapon.entity_uuid
 
         target = Creature(
@@ -124,6 +131,7 @@ class TestDnDRulesEngine(unittest.TestCase):
             dexterity_mod=ModifiableValue(base_value=0),
             tags=["blindsight_60"],
         )
+        register_entity(target)
 
         with patch("random.randint", side_effect=[2, 18, 5]):  # roll1, roll2, damage
             event = GameEvent(

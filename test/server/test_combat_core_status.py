@@ -28,6 +28,7 @@ async def test_req_cor_005_opposed_tests_ties_go_to_defender(mock_obsidian_vault
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(attacker, vault_path)
     defender = Creature(
         name="Defender",
         vault_path=vault_path,
@@ -36,6 +37,7 @@ async def test_req_cor_005_opposed_tests_ties_go_to_defender(mock_obsidian_vault
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(defender, vault_path)
 
     # Patch randint so both roll a 10. Attacker = 10, Defender = 10. Tie!
     with patch("random.randint", side_effect=[10, 10, 10, 10]):
@@ -65,6 +67,7 @@ async def test_req_cor_006_rounding_down(mock_obsidian_vault):
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(target, vault_path)
     target.resistances.append("fire")
 
     # 25 fire damage, halved to 12
@@ -145,6 +148,7 @@ async def test_req_spc_002_grappling_initiation(mock_obsidian_vault):
         strength_mod=ModifiableValue(base_value=5),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(attacker, vault_path)
     defender = Creature(
         name="Victim",
         vault_path=vault_path,
@@ -153,6 +157,7 @@ async def test_req_spc_002_grappling_initiation(mock_obsidian_vault):
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(defender, vault_path)
     defender.movement_remaining = 30
 
     with patch("random.randint", side_effect=[1, 1]):  # Defender rolls low
@@ -181,6 +186,7 @@ async def test_req_cnd_003_deafened_condition_penalties(mock_obsidian_vault):
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(listener, vault_path)
     listener.active_conditions.append(ActiveCondition(name="Deafened"))
 
     with patch("random.randint", return_value=15):
@@ -209,6 +215,7 @@ async def test_req_dth_007_death_saving_throws_base(mock_obsidian_vault):
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    register_entity(target, vault_path)
 
     # Taking damage at 0 HP causes 1 failure
     res = await modify_health.ainvoke({"target_name": "DyingTarget", "hp_change": -5, "reason": "Bleed"}, config=config)

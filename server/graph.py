@@ -11,6 +11,7 @@ Storylet Orchestration integration:
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -33,10 +34,12 @@ _GRAG_CACHE_TTL_SECONDS = 60.0
 _GRAG_CACHE_MAX_SIZE = 32
 # { (vault_path, active_character): (timestamp, result_str) }
 _grag_cache: Dict[Tuple[str, str], Tuple[float, str]] = {}
+_grag_cache_lock = threading.RLock()
 
 # KG immutable constraints are vault-wide (don't depend on active_character)
 # { vault_path: (timestamp, constraints_str, kg_id) }  — kg_id ensures different KG instances don't collide
 _kg_constraints_cache: Dict[str, Tuple[float, str, int]] = {}
+_kg_constraints_cache_lock = threading.RLock()
 _KG_CONSTRAINTS_TTL_SECONDS = 120.0  # Longer TTL — KG changes are rare
 
 
@@ -118,23 +121,24 @@ def _get_grag_context(kg, vault_path: str = None, active_character: str = None, 
     # Opt E: TTL + LRU cache with max size
     if vault_path and active_character:
         cache_key = (vault_path, active_character)
-        now = time.monotonic()
-        if cache_key in _grag_cache:
-            ts, cached = _grag_cache[cache_key]
-            if now - ts < _GRAG_CACHE_TTL_SECONDS:
-                # LRU: promote to fresh entry on hit
-                _grag_cache[cache_key] = (now, cached)
-                return cached
+        with _grag_cache_lock:
+            now = time.monotonic()
+            if cache_key in _grag_cache:
+                ts, cached = _grag_cache[cache_key]
+                if now - ts < _GRAG_CACHE_TTL_SECONDS:
+                    # LRU: promote to fresh entry on hit
+                    _grag_cache[cache_key] = (now, cached)
+                    return cached
 
-        # Evict oldest entry if at capacity
-        if len(_grag_cache) >= _GRAG_CACHE_MAX_SIZE:
-            oldest_key = min(_grag_cache, key=lambda k: _grag_cache[k][0])
-            del _grag_cache[oldest_key]
+            # Evict oldest entry if at capacity
+            if len(_grag_cache) >= _GRAG_CACHE_MAX_SIZE:
+                oldest_key = min(_grag_cache, key=lambda k: _grag_cache[k][0])
+                del _grag_cache[oldest_key]
 
-        # Compute and cache
-        result = _compute_grag_context(kg, vault_path, active_character, max_hops)
-        _grag_cache[cache_key] = (now, result)
-        return result
+            # Compute and cache
+            result = _compute_grag_context(kg, vault_path, active_character, max_hops)
+            _grag_cache[cache_key] = (now, result)
+            return result
 
     return _compute_grag_context(kg, vault_path, active_character, max_hops)
 
@@ -261,15 +265,19 @@ def _invalidate_grag_cache(vault_path: str = None) -> None:
     narrator_node invocation re-fetches fresh KG context instead of
     returning stale cached data.
     """
-    if vault_path:
-        # Invalidate only entries for this vault
-        keys_to_delete = [k for k in _grag_cache if k[0] == vault_path]
-        for k in keys_to_delete:
-            del _grag_cache[k]
-        _kg_constraints_cache.pop(vault_path, None)
-    else:
-        _grag_cache.clear()
-        _kg_constraints_cache.clear()
+    with _grag_cache_lock:
+        if vault_path:
+            # Invalidate only entries for this vault
+            keys_to_delete = [k for k in _grag_cache if k[0] == vault_path]
+            for k in keys_to_delete:
+                del _grag_cache[k]
+        else:
+            _grag_cache.clear()
+    with _kg_constraints_cache_lock:
+        if vault_path:
+            _kg_constraints_cache.pop(vault_path, None)
+        else:
+            _kg_constraints_cache.clear()
 
 
 def _build_kg_constraints_prompt(kg, vault_path: str = "default") -> str:
@@ -285,10 +293,11 @@ def _build_kg_constraints_prompt(kg, vault_path: str = "default") -> str:
     # Check cache — include kg id so different KG instances don't collide
     now = time.monotonic()
     kg_id = id(kg)
-    if vault_path in _kg_constraints_cache:
-        ts, cached, cached_kg_id = _kg_constraints_cache[vault_path]
-        if kg_id == cached_kg_id and now - ts < _KG_CONSTRAINTS_TTL_SECONDS:
-            return cached
+    with _kg_constraints_cache_lock:
+        if vault_path in _kg_constraints_cache:
+            ts, cached, cached_kg_id = _kg_constraints_cache[vault_path]
+            if kg_id == cached_kg_id and now - ts < _KG_CONSTRAINTS_TTL_SECONDS:
+                return cached
 
     if not kg or not kg.nodes:
         return ""
@@ -325,7 +334,8 @@ def _build_kg_constraints_prompt(kg, vault_path: str = "default") -> str:
 
     lines.append("(These facts are immutable. Do not describe them as changed, destroyed, or transferred.)\n")
     result = "\n".join(lines)
-    _kg_constraints_cache[vault_path] = (now, result, kg_id)
+    with _kg_constraints_cache_lock:
+        _kg_constraints_cache[vault_path] = (now, result, kg_id)
     return result
 
 # Names of tools that require Hard Guardrail validation before committing mutations.
@@ -860,9 +870,8 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                 result = {
                     "active_storylet_id": None,
                     "tension_arc": dm.arc.to_dict(),
+                    "pending_mutations": [],
                 }
-                if stale_cleared:
-                    result["pending_mutations"] = []
                 return result
 
             await write_audit_log(

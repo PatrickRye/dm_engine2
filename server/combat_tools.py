@@ -1385,6 +1385,8 @@ async def trigger_environmental_hazard(
         strength_mod=ModifiableValue(base_value=0),
         dexterity_mod=ModifiableValue(base_value=0),
     )
+    # Explicit registration (BaseGameEntity no longer auto-registers)
+    register_entity(trap_source, vault_path)
 
     cond_list = [{"condition": condition_applied, "duration": "1 minute"}] if condition_applied else []
     mechanics = {
