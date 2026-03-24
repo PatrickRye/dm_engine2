@@ -341,6 +341,8 @@ async def attune_item(  # noqa: C901
                         stat_obj.remove_modifier(m.mod_uuid)
 
                     if action.lower() == "attune":
+                        # REQ-LOT-005: Attuning during a short rest blocks HP recovery from hit dice
+                        engine_creature.attuned_this_short_rest = True
                         priority = ModifierPriority.OVERRIDE if mod.value >= 10 else ModifierPriority.ADDITIVE
                         stat_obj.add_modifier(
                             NumericalModifier(priority=priority, value=mod.value, source_name=item.name, duration_seconds=-1)

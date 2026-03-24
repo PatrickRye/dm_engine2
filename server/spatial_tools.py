@@ -611,9 +611,68 @@ async def manage_skill_challenge(
     return "SYSTEM ERROR: Invalid action. Use 'start', 'update', or 'end'."
 
 
+# Standard D&D 5e creature space (footprint) by size category
+# Tiny: 2.5ft (1/4 of a 5-ft grid square)
+# Small/Medium: 5ft (1 square)
+# Large: 10ft (2×2 squares)
+# Huge: 15ft (3×3 squares)
+# Gargantuan: 20ft (4×4 squares)
+_SIZE_TO_SPACE = {
+    (0, 3.0): (2.5, 2.5),   # Tiny: 2.5 × 2.5 ft
+    (3.0, 6.0): (5.0, 5.0),  # Small/Medium: 5 × 5 ft
+    (6.0, 11.0): (10.0, 10.0),  # Large: 10 × 10 ft
+    (11.0, 16.0): (15.0, 15.0),  # Huge: 15 × 15 ft
+    (16.0, float("inf")): (20.0, 20.0),  # Gargantuan: 20 × 20 ft
+}
+
+
+@tool
+async def get_entity_space(
+    entity_name: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    REQ-GEO-001/002/003/004/005: Returns the D&D space (footprint) occupied by a creature
+    based on its size category, per PHB Ch. 9.
+
+    Returns width × depth in feet, and the number of 5-ft squares occupied.
+
+    Size → Space:
+      Tiny         (≤3ft) : 2.5 × 2.5 ft   (¼ square)
+      Small/Medium (3–6ft) : 5 × 5 ft        (1 square)
+      Large        (6–11ft): 10 × 10 ft      (2×2 squares)
+      Huge        (11–16ft): 15 × 15 ft     (3×3 squares)
+      Gargantuan   (16ft+) : 20 × 20 ft      (4×4 squares)
+    """
+    vault_path = config["configurable"].get("thread_id")
+    entity = await _get_entity_by_name(entity_name, vault_path)
+    if not entity:
+        return f"SYSTEM ERROR: Entity '{entity_name}' not found."
+
+    size = getattr(entity, "size", 5.0)
+    footprint = None
+    squares = 0
+    for (low, high), dims in _SIZE_TO_SPACE.items():
+        if low < size <= high:
+            footprint = dims
+            break
+
+    if footprint is None:
+        footprint = (5.0, 5.0)  # fallback
+
+    width, depth = footprint
+    squares = math.ceil(width / 5.0) * math.ceil(depth / 5.0)
+
+    return (
+        f"{entity.name} (size={size}ft): "
+        f"Space = {width} × {depth} ft ({squares} five-foot square{'s' if squares > 1 else ''})."
+    )
+
 
 __all__ = [
     "place_entity",
     "move_entity",
     "manage_skill_challenge",
+    "get_entity_space",
 ]

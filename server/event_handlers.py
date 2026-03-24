@@ -1177,11 +1177,39 @@ def handle_rest_event(event: GameEvent):
 
     rest_type = event.payload.get("rest_type", "short")
     target_uuids = event.payload.get("target_uuids", [])
+    rest_start_day = event.payload.get("rest_start_day", 0)
+    rest_start_hour = event.payload.get("rest_start_hour", 0)
 
     for uid in target_uuids:
         target = get_entity(uid)
         if not isinstance(target, Creature):
             continue
+
+        # REQ-RST-002: Interrupted rest → no benefits, just clear the in-progress flag
+        if getattr(target, "rest_interrupted", False):
+            print(f"[Engine] {target.name}'s rest was interrupted — no benefits granted.")
+            target.rest_in_progress = False
+            target.rest_type = ""
+            target.rest_interrupted = False
+            continue
+
+        # REQ-RST-003: Long rest frequency — cannot benefit from more than one in 24 hours
+        if rest_type == "long":
+            last_day = getattr(target, "last_long_rest_day", 0)
+            last_hour = getattr(target, "last_long_rest_hour", 0)
+            if last_day > 0:  # 0 = no prior long rest recorded
+                hours_since = (rest_start_day - last_day) * 24 + (rest_start_hour - last_hour)
+                if hours_since < 24:
+                    print(
+                        f"[Engine] {target.name} cannot benefit from another Long Rest yet "
+                        f"({hours_since}h since last rest — must wait 24h). Skipping benefits."
+                    )
+                    target.rest_in_progress = False
+                    target.rest_type = ""
+                    continue
+            # Record this as the last completed long rest
+            target.last_long_rest_day = rest_start_day
+            target.last_long_rest_hour = rest_start_hour
 
         if rest_type == "long":
             target.hp.base_value = target.max_hp
@@ -1207,9 +1235,17 @@ def handle_rest_event(event: GameEvent):
                         maximum = int(match.group(2))
                         target.resources[res_name] = f"{maximum}/{maximum}"
 
-            # REQ-RST-001: Spend Hit Dice to regain HP during a Short Rest
             dice_to_spend = event.payload.get("hit_dice_to_spend", 0)
-            if dice_to_spend > 0:
+            # REQ-LOT-005: If this short rest was used for attunement, HP recovery via hit dice is blocked
+            if getattr(target, "attuned_this_short_rest", False):
+                print(
+                    f"[Engine] {target.name} used this Short Rest for attunement — "
+                    f"HP recovery via Hit Dice is blocked (REQ-LOT-005)."
+                )
+                target.attuned_this_short_rest = False
+                # Skip HP recovery via hit dice
+            else:
+                # REQ-RST-001: Spend Hit Dice to regain HP during a Short Rest
                 # Find the Hit Dice resource (key contains "hit dice", case-insensitive)
                 hd_key = next((k for k in target.resources if "hit dice" in k.lower()), None)
                 if hd_key:
@@ -1237,6 +1273,10 @@ def handle_rest_event(event: GameEvent):
                             )
 
             print(f"[Engine] {target.name} finished a Short Rest. [SR] resources restored.")
+
+        # Clear rest-in-progress flags on successful completion
+        target.rest_in_progress = False
+        target.rest_type = ""
 
 
 def handle_advance_time_event(event: GameEvent):  # noqa: C901

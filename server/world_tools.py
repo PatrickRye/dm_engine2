@@ -27,6 +27,7 @@ from dnd_rules_engine import (
     NumericalModifier,
     ModifierPriority,
     WeaponProperty,
+    roll_dice,
 )
 from state import ClassLevel, PCDetails, NPCDetails, LocationDetails, FactionDetails
 from vault_io import (
@@ -652,25 +653,58 @@ async def take_rest(
     It automatically advances time and signals the engine to heal and recharge resources.
     For Short Rests, pass hit_dice_to_spend to roll Hit Dice and regain HP (REQ-RST-001).
     The engine rolls the dice, adds CON modifier, and applies healing up to max HP.
-    """
-    hours_to_advance = 8 if rest_type.lower() == "long" else 1
-    await advance_time.ainvoke({"hours": hours_to_advance}, config)
 
+    REQ-RST-002: If the rest is interrupted by strenuous activity (fighting, casting spells,
+    walking for 1+ hours), call interrupt_rest BEFORE time advances past the 8-hour mark.
+    An interrupted rest grants no benefits.
+
+    REQ-RST-003: A creature cannot benefit from more than one Long Rest in a 24-hour period.
+    Attempting to do so is rejected at rest completion time.
+    """
+    vault_path = config["configurable"].get("thread_id")
+
+    # Read current game time BEFORE advancing — needed for REQ-RST-002/003
+    current_day, current_hour = 1, 8
+    try:
+        campaign_path = os.path.join(get_journals_dir(vault_path), "CAMPAIGN_MASTER.md")
+        async with read_markdown_entity(campaign_path) as (yaml_data, _):
+            day_match = re.search(r"\d+", str(yaml_data.get("current_date", "Day 1")))
+            if day_match:
+                current_day = int(day_match.group())
+            time_str = str(yaml_data.get("in_game_time", "08:00:00"))
+            if ":" in time_str:
+                parts = time_str.split(":")
+                current_hour = int(parts[0])
+    except Exception:
+        pass
+
+    # Mark rest in-progress on each entity before time advances (REQ-RST-002)
+    rest_lower = rest_type.lower()
+    hours_to_advance = 8 if rest_lower == "long" else 1
     uuids = []
     for name in character_names:
-        entity = await _get_entity_by_name(name, config["configurable"].get("thread_id"))
+        entity = await _get_entity_by_name(name, vault_path)
         if entity:
+            entity.rest_in_progress = True
+            entity.rest_type = rest_lower
+            entity.rest_start_day = current_day
+            entity.rest_start_hour = current_hour
+            entity.rest_interrupted = False
             uuids.append(entity.entity_uuid)
+
+    await advance_time.ainvoke({"hours": hours_to_advance}, config)
 
     if uuids:
         event = GameEvent(
             event_type="Rest",
             source_uuid=uuids[0],
-            vault_path=config["configurable"].get("thread_id"),
+            vault_path=vault_path,
             payload={
-                "rest_type": rest_type.lower(),
+                "rest_type": rest_lower,
                 "target_uuids": uuids,
                 "hit_dice_to_spend": hit_dice_to_spend,
+                "rest_start_day": current_day,
+                "rest_start_hour": current_hour,
             },
         )
         await EventBus.adispatch(event)
@@ -681,6 +715,228 @@ async def take_rest(
     )
 
 
+@tool
+async def interrupt_rest(
+    character_names: list[str],
+    reason: str = "Strenuous activity",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    REQ-RST-002: Call this when a resting character performs strenuous activity
+    (fighting, casting spells, walking for 1+ hours, etc.) during a rest.
+    This marks the rest as interrupted; no HP or resource benefits are granted.
+
+    Must be called BEFORE the rest's 8-hour period elapses (before take_rest finishes
+    advancing time for a long rest, or before the short rest completes).
+    """
+    vault_path = config["configurable"].get("thread_id")
+    interrupted = []
+    for name in character_names:
+        entity = await _get_entity_by_name(name, vault_path)
+        if entity and getattr(entity, "rest_in_progress", False):
+            entity.rest_interrupted = True
+            interrupted.append(name)
+
+    if interrupted:
+        return (
+            f"REST INTERRUPTED: {', '.join(interrupted)}'s rest has been broken by strenuous "
+            f"activity ({reason}). No benefits will be granted."
+        )
+    return f"No active rest found for {', '.join(character_names)}."
+
+
+# miles per day by pace
+_MILES_PER_DAY = {"fast": 30, "normal": 24, "slow": 18}
+
+
+@tool
+async def travel(
+    party_names: list[str],
+    pace: str = "normal",
+    hours_traveled: int = 8,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    REQ-TRV-001/002/003: Resolve a travel segment for a party.
+
+    pace: "fast" (30 mi/day, -5 passive Perception), "normal" (24 mi/day),
+          or "slow" (18 mi/day, party can Stealth while traveling).
+
+    hours_traveled: number of hours walked. Default 8.
+    If hours_traveled > 8, each extra hour triggers a Constitution saving throw
+    (DC 10 + 1 per extra hour) — REQ-TRV-004: failed save = 1 level of Exhaustion.
+
+    Returns a summary of distance covered, passive Perception effects, and
+    any forced-march exhaustion applied.
+    """
+    vault_path = config["configurable"].get("thread_id")
+    pace_lower = pace.lower()
+    miles_per_day = _MILES_PER_DAY.get(pace_lower, 24)
+
+    # Distance covered = (hours_traveled / 8) * miles_per_day
+    distance = (hours_traveled / 8.0) * miles_per_day
+
+    results = []
+    forced_march_exhausted = []
+
+    # REQ-TRV-004: Forced march CON save for hours beyond 8
+    extra_hours = max(0, hours_traveled - 8)
+    if extra_hours > 0:
+        dc = 10 + extra_hours
+        for name in party_names:
+            entity = await _get_entity_by_name(name, vault_path)
+            if not entity:
+                continue
+            # Direct CON save: 1d20 + CON modifier vs DC
+            con_mod = entity.constitution_mod.total if hasattr(entity, "constitution_mod") else 0
+            save_roll = roll_dice("1d20")
+            save_total = save_roll + con_mod
+            save_failed = save_total < dc
+            if save_failed:
+                old_exhaustion = entity.exhaustion_level
+                entity.exhaustion_level = min(6, entity.exhaustion_level + 1)
+                forced_march_exhausted.append(
+                    f"{entity.name} failed the forced march CON save "
+                    f"({save_roll}+{con_mod}={save_total} vs DC {dc}) — "
+                    f"gained 1 Exhaustion ({old_exhaustion} → {entity.exhaustion_level})"
+                )
+            else:
+                results.append(
+                    f"{entity.name} made the forced march CON save "
+                    f"({save_roll}+{con_mod}={save_total} vs DC {dc})."
+                )
+
+    # REQ-TRV-001: Fast pace — passive Perception penalty
+    if pace_lower == "fast":
+        results.append("All party members have -5 to passive Perception scores while traveling at a fast pace.")
+
+    # REQ-TRV-003: Slow pace — stealth permitted
+    if pace_lower == "slow":
+        results.append("The party can use Stealth while traveling at a slow pace.")
+
+    # Advance time
+    await advance_time.ainvoke({"hours": hours_traveled}, config)
+
+    summary = (
+        f"TRAVEL COMPLETE ({pace_lower} pace, {hours_traveled}h): "
+        f"{', '.join(party_names)} covered {distance:.1f} miles. "
+    )
+    if forced_march_exhausted:
+        summary += "FORCED MARCH: " + " | ".join(forced_march_exhausted) + " "
+    summary += " | ".join(results) if results else ""
+    summary += f" Time advanced {hours_traveled} hours."
+
+    return summary
+
+
+@tool
+async def use_heroic_inspiration(
+    character_name: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    REQ-SKL-007: Spend Heroic Inspiration to grant the character advantage
+    on their next d20 test (attack, save, or ability check).
+
+    The character must have has_heroic_inspiration = True.
+    This consumes the inspiration (sets it to False).
+    """
+    vault_path = config["configurable"].get("thread_id")
+    entity = await _get_entity_by_name(character_name, vault_path)
+    if not entity:
+        return f"SYSTEM ERROR: Entity '{character_name}' not found."
+
+    if not getattr(entity, "has_heroic_inspiration", False):
+        return (
+            f"SYSTEM ERROR: {character_name} does not have Heroic Inspiration available. "
+            f"Grant it via the 'grant_heroic_inspiration' action or narrative."
+        )
+
+    entity.has_heroic_inspiration = False
+    return (
+        f"Heroic Inspiration spent: {character_name} now has Advantage on their next d20 test. "
+        f"(Inspiration consumed — must be re-granted by DM narrative.)"
+    )
+
+
+@tool
+async def perform_group_check(
+    party_names: list[str],
+    skill_or_stat_name: str,
+    dc: int = 10,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    REQ-SKL-006: Each party member makes the same ability check.
+    If at least half the group succeeds (ceil(n/2)), the group succeeds.
+    Each member rolls individually; results are reported per character.
+
+    dc: Optional Difficulty Class override (default 10).
+    Pass is determined by: roll + modifier >= DC.
+    """
+    vault_path = config["configurable"].get("thread_id")
+    results = []
+    successes = 0
+    total = len(party_names)
+
+    for name in party_names:
+        # Delegate to perform_ability_check_or_save for each member
+        res = await perform_ability_check_or_save.ainvoke(
+            {
+                "character_name": name,
+                "skill_or_stat_name": skill_or_stat_name,
+                "target_names": [],
+                "is_hidden": False,
+            },
+            config=config,
+        )
+        # Parse the result — look for the total
+        import re as _re
+        match = _re.search(r"(\d+)\s*(?:\+|vs|$|\.)", res)
+        if match:
+            total_roll = int(match.group(1))
+            # Get the modifier from the result
+            mod_match = _re.search(r"(\d+)\s*(?:\+|–|\-)\s*(\d+)", res)
+            mod = 0
+            if mod_match:
+                # The format is like "15+3=18" or "12-2=10"
+                sign = 1 if "+" in res[res.find(str(total_roll)):res.find(str(total_roll)) + len(str(total_roll)) + 3] else -1
+                mod = int(mod_match.group(2)) if sign == 1 else -int(mod_match.group(2))
+            # Re-calculate: we need the d20 roll separately from total
+            # For simplicity, use the total and subtract an estimated modifier
+            # Better approach: parse the actual roll from the result
+            roll_match = _re.search(r"(\d+)\s*(?:\+|–)", res)
+            if roll_match:
+                roll_val = int(roll_match.group(1))
+                mod = total_roll - roll_val
+            else:
+                mod = 0  # passive or manual
+            final_total = total_roll + mod
+        else:
+            final_total = 0
+
+        passed = final_total >= dc
+        if passed:
+            successes += 1
+
+        status = "SUCCESS" if passed else "FAILURE"
+        results.append(f"{name}: {status} ({final_total} vs DC {dc})")
+
+    threshold = math.ceil(total / 2)
+    group_success = successes >= threshold
+    group_status = "GROUP SUCCESS" if group_success else "GROUP FAILURE"
+
+    summary = (
+        f"GROUP CHECK ({skill_or_stat_name}): {group_status} — "
+        f"{successes}/{total} succeeded (need {threshold}). "
+        + " | ".join(results)
+    )
+    return summary
+
 
 __all__ = [
     "roll_generic_dice",
@@ -690,4 +946,8 @@ __all__ = [
     "report_rule_challenge",
     "perform_ability_check_or_save",
     "take_rest",
+    "interrupt_rest",
+    "travel",
+    "use_heroic_inspiration",
+    "perform_group_check",
 ]

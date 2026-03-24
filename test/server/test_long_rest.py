@@ -148,3 +148,210 @@ def test_req_rst_004_long_rest_minimum_one_hit_die_recovered(setup):
 
     # max(1, 1//2) = max(1, 0) = 1. New total = min(1, 0+1) = 1.
     assert entity.resources["Hit Dice (d8)"] == "1/1"
+
+
+# ============================================================
+# REQ-RST-002: Long Rest Interruption
+# ============================================================
+
+def test_req_rst_002_interrupted_long_rest_grants_no_benefits(setup):
+    """
+    REQ-RST-002: An interrupted long rest (1+ hours of strenuous activity)
+    grants no HP or resource benefits.
+    """
+    vp = setup
+    entity = Creature(
+        name="Fighter",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=20),
+        max_hp=50,
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        resources={"Spell Slots (1st)": "0/4"},
+    )
+    entity.hp.base_value = 15  # damaged
+    register_entity(entity)
+
+    # Mark rest in progress
+    entity.rest_in_progress = True
+    entity.rest_type = "long"
+    entity.rest_start_day = 1
+    entity.rest_start_hour = 8
+    entity.rest_interrupted = True  # DM called interrupt_rest
+
+    _dispatch_long_rest(entity, vp)
+
+    # HP unchanged (was 15, still 15 — no healing)
+    assert entity.hp.base_value == 15
+    # Spell slots unchanged
+    assert entity.resources["Spell Slots (1st)"] == "0/4"
+    # Rest flags cleared
+    assert entity.rest_in_progress is False
+    assert entity.rest_type == ""
+
+
+def test_req_rst_002_interrupted_short_rest_grants_no_benefits(setup):
+    """
+    REQ-RST-002: An interrupted short rest grants no HP or resource benefits.
+    """
+    vp = setup
+    entity = Creature(
+        name="Warlock",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=10),
+        max_hp=30,
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+        resources={
+            "Pact Magic Slots (1st) [SR]": "0/2",
+            "Hit Dice (d8)": "1/5",
+        },
+    )
+    entity.hp.base_value = 5
+    register_entity(entity)
+
+    entity.rest_in_progress = True
+    entity.rest_type = "short"
+    entity.rest_start_day = 1
+    entity.rest_start_hour = 8
+    entity.rest_interrupted = True
+
+    event = GameEvent(
+        event_type="Rest",
+        source_uuid=entity.entity_uuid,
+        vault_path=vp,
+        payload={
+            "rest_type": "short",
+            "target_uuids": [entity.entity_uuid],
+            "hit_dice_to_spend": 1,
+            "rest_start_day": 1,
+            "rest_start_hour": 8,
+        },
+    )
+    EventBus.dispatch(event)
+
+    # No HP healed
+    assert entity.hp.base_value == 5
+    # No resource restored
+    assert entity.resources["Pact Magic Slots (1st) [SR]"] == "0/2"
+    # No hit dice spent
+    assert entity.resources["Hit Dice (d8)"] == "1/5"
+    # Flags cleared
+    assert entity.rest_in_progress is False
+
+
+# ============================================================
+# REQ-RST-003: Long Rest Frequency (24 hours)
+# ============================================================
+
+def _dispatch_long_rest_with_time(entity, vault_path, rest_start_day, rest_start_hour):
+    """Helper that dispatches a long rest with explicit start time."""
+    event = GameEvent(
+        event_type="Rest",
+        source_uuid=entity.entity_uuid,
+        vault_path=vault_path,
+        payload={
+            "rest_type": "long",
+            "target_uuids": [entity.entity_uuid],
+            "hit_dice_to_spend": 0,
+            "rest_start_day": rest_start_day,
+            "rest_start_hour": rest_start_hour,
+        },
+    )
+    EventBus.dispatch(event)
+
+
+def test_req_rst_003_second_long_rest_within_24_hours_rejected(setup):
+    """
+    REQ-RST-003: Cannot benefit from more than one Long Rest in a 24-hour period.
+    Second long rest within 24 hours grants no benefits.
+    """
+    vp = setup
+    entity = Creature(
+        name="Rogue",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=10),
+        max_hp=40,
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    entity.hp.base_value = 15
+    register_entity(entity)
+
+    # First long rest: day 1, hour 8
+    entity.last_long_rest_day = 1
+    entity.last_long_rest_hour = 8
+
+    # Second long rest attempted: day 1, hour 20 (12 hours later — within 24h)
+    entity.hp.base_value = 20  # fresh damage
+    _dispatch_long_rest_with_time(entity, vp, rest_start_day=1, rest_start_hour=20)
+
+    # No HP restored — rejected due to 24h frequency
+    assert entity.hp.base_value == 20
+    # Flags cleared
+    assert entity.rest_in_progress is False
+    assert entity.rest_type == ""
+
+
+def test_req_rst_003_exactly_24_hours_between_long_rests_allowed(setup):
+    """
+    REQ-RST-003: Exactly 24 hours between long rests is permitted (hours_since >= 24).
+    """
+    vp = setup
+    entity = Creature(
+        name="Cleric",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=10),
+        max_hp=50,
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    entity.hp.base_value = 20
+    register_entity(entity)
+
+    # First long rest: day 1, hour 8
+    entity.last_long_rest_day = 1
+    entity.last_long_rest_hour = 8
+
+    # Second long rest: day 2, hour 8 (exactly 24 hours later)
+    entity.hp.base_value = 25
+    _dispatch_long_rest_with_time(entity, vp, rest_start_day=2, rest_start_hour=8)
+
+    # HP fully restored
+    assert entity.hp.base_value == 50
+
+
+def test_req_rst_003_more_than_24_hours_between_long_rests_allowed(setup):
+    """
+    REQ-RST-003: More than 24 hours between long rests is permitted.
+    """
+    vp = setup
+    entity = Creature(
+        name="Paladin",
+        vault_path=vp,
+        hp=ModifiableValue(base_value=10),
+        max_hp=60,
+        ac=ModifiableValue(base_value=10),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=0),
+    )
+    entity.hp.base_value = 30
+    register_entity(entity)
+
+    # First long rest: day 1, hour 8
+    entity.last_long_rest_day = 1
+    entity.last_long_rest_hour = 8
+
+    # Second long rest: day 3, hour 9 (more than 24h)
+    entity.hp.base_value = 40
+    _dispatch_long_rest_with_time(entity, vp, rest_start_day=3, rest_start_hour=9)
+
+    # HP fully restored
+    assert entity.hp.base_value == 60
+    # 24h tracking updated
+    assert entity.last_long_rest_day == 3
+    assert entity.last_long_rest_hour == 9

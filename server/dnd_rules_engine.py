@@ -293,6 +293,21 @@ class Creature(BaseGameEntity):
     summoned_by_uuid: Optional[uuid.UUID] = None
     summon_spell: str = ""
     mounted_on_uuid: Optional[uuid.UUID] = None
+    # REQ-RST-002/003: Rest tracking
+    rest_in_progress: bool = False  # True during an in-progress rest (set at rest start, cleared at rest completion)
+    rest_type: str = ""  # "short" or "long" — set at rest start
+    rest_start_day: int = 0  # Campaign day when rest began
+    rest_start_hour: int = 0  # Hour (0–23) when rest began
+    rest_interrupted: bool = False  # REQ-RST-002: True if DM interrupted the rest via interrupt_rest
+    last_long_rest_day: int = 0  # REQ-RST-003: Campaign day of the most recently completed long rest
+    last_long_rest_hour: int = 0  # REQ-RST-003: Hour (0–23) of the most recently completed long rest
+    # REQ-SKL-007: Heroic Inspiration — grants one reroll of any d20 test
+    has_heroic_inspiration: bool = False
+    # REQ-SKL-004: Tool proficiencies (stored as tag strings, e.g. "Thieves' Tools", "Smith's Tools")
+    tool_proficiencies: List[str] = Field(default_factory=list)
+    # REQ-LOT-005: Attunement tracking — True when entity is currently attuned to an item
+    # during a short rest (blocks HP recovery from hit dice per REQ-LOT-005)
+    attuned_this_short_rest: bool = False
     _load_snapshot: int = PrivateAttr(default=0)
 
     def _compute_snapshot(self) -> int:
