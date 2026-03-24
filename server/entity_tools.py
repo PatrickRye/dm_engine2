@@ -35,6 +35,7 @@ from vault_io import (
     upsert_journal_section,
     read_markdown_entity,
     edit_markdown_entity,
+    _remap_subclass_name,
 )
 from compendium_manager import CompendiumManager, CompendiumEntry, MechanicEffect
 from spatial_engine import spatial_service, LightSource, Wall, HAS_GIS
@@ -458,7 +459,9 @@ async def level_up_character(
                 creature.apply_features(class_def, new_level)
 
             if class_to_level_up.subclass_name:
-                subclass_def = await CompendiumManager.get_subclass_definition(vault_path, class_to_level_up.subclass_name)
+                # REQ-ENT-004: Remap legacy 2014 subclass names to 2024 equivalents
+                remapped_name = _remap_subclass_name(class_to_level_up.subclass_name)
+                subclass_def = await CompendiumManager.get_subclass_definition(vault_path, remapped_name)
                 if subclass_def:
                     creature.apply_subclass_features(subclass_def, new_level)
 

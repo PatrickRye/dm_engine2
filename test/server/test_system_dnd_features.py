@@ -1128,6 +1128,70 @@ async def test_system_trigger_environmental_hazard(mock_dice, mock_roll_dice):
 # ==========================================
 # SCENARIO I: TRAPS & HAZARDS AUTOMATION
 # ==========================================
+# REQ-TOL-001: Lockpicking formula
+@pytest.mark.asyncio
+async def test_req_tol_001_lockpick_formula(mock_dice):
+    """
+    REQ-TOL-001: Lockpicking uses Dex_Mod + PB.
+    Roll = Dex_Mod + (PB × Max(Sleight_Of_Hand_Prof, Thieves_Tools_Prof))
+    For a level 1 rogue with +5 Dex and no extra modifier:
+      PB = ceil(1/4)+1 = 2, so total_mod = 5+2 = 7
+      Roll 13 + 7 = 20 vs DC 20 → Success
+    """
+    rogue = Creature(
+        name="Rogue",
+        x=0, y=0,
+        hp=ModifiableValue(base_value=30),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=5),
+    )
+    spatial_service.sync_entity(rogue)
+    config = {"configurable": {"thread_id": "default"}}
+
+    wall = Wall(label="Door", start=(10, 0), end=(10, 0), is_locked=True, interact_dc=20)
+    spatial_service.add_wall(wall)
+
+    # Roll 13 (natural) + 7 (mod) = 20 vs DC 20 → success
+    with mock_dice(13):
+        res = await interact_with_object.ainvoke(
+            {"character_name": "Rogue", "target_label": "Door", "interaction_type": "lockpick"}, config=config
+        )
+
+    assert "SUCCESS" in res
+    assert "Rolled 13 + 7 = 20 vs DC 20" in res
+
+
+@pytest.mark.asyncio
+async def test_req_tol_001_lockpick_fails_low_roll(mock_dice):
+    """
+    REQ-TOL-001: Roll too low fails even with high Dex.
+    Roll 5 + 7 = 12 vs DC 20 → Failure
+    """
+    rogue = Creature(
+        name="Rogue",
+        x=0, y=0,
+        hp=ModifiableValue(base_value=30),
+        ac=ModifiableValue(base_value=15),
+        strength_mod=ModifiableValue(base_value=0),
+        dexterity_mod=ModifiableValue(base_value=5),
+    )
+    spatial_service.sync_entity(rogue)
+    config = {"configurable": {"thread_id": "default"}}
+
+    wall = Wall(label="Strongbox", start=(20, 0), end=(20, 0), is_locked=True, interact_dc=20)
+    spatial_service.add_wall(wall)
+
+    with mock_dice(5):
+        res = await interact_with_object.ainvoke(
+            {"character_name": "Rogue", "target_label": "Strongbox", "interaction_type": "lockpick"}, config=config
+        )
+
+    assert "FAILURE" in res
+    assert "5 + 7 = 12 vs DC 20" in res
+
+
+# ==========================================
 @pytest.mark.asyncio
 async def test_system_trap_interaction_fail(mock_dice):
     """

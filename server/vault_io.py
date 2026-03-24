@@ -59,6 +59,121 @@ def _deserialize_modifiers(data: list[dict]) -> list[NumericalModifier]:
     return result
 
 
+# REQ-ENT-004: 2014 → 2024 subclass name remapping for backward compatibility.
+# Maps legacy subclass names (as stored in older vault YAML) to their 2024 PHB names.
+_SUBCLASS_2014_TO_2024: dict[str, str] = {
+    # Barbarian
+    "Path of the Totem Warrior": "Path of the Wild Heart",
+    # Bard
+    "College of Lore": "College of Eloquence",
+    "College of Valor": "College of Martial",
+    # Cleric
+    "Life Domain": "Life",
+    "Light Domain": "Light",
+    "Nature Domain": "Nature",
+    "Tempest Domain": "Tempest",
+    "Trickery Domain": "Trickery",
+    "War Domain": "War",
+    "Arcana Domain": "Arcana",
+    "Death Domain": "Death",
+    # Druid
+    "Circle of the Moon": "Moon Druid",
+    "Circle of the Land": "Land Druid",
+    "Circle of the Shepherd": "Shepherd Druid",
+    "Circle of the Dreams": "Dreams Druid",
+    "Circle of the Spores": "Spores Druid",
+    "Circle of the Stars": "Stars Druid",
+    "Circle of the Wildfire": "Wildfire Druid",
+    # Fighter
+    "Champion": "Champion",
+    "Battle Master": "Battle Master",
+    "Eldritch Knight": "Eldritch Knight",
+    "Arcane Archer": "Arcane Archer",
+    "Cavalier": "Cavalier",
+    "Samurai": "Samurai",
+    "Rune Knight": "Rune Knight",
+    "Psi Warrior": "Psi Warrior",
+    # Monk
+    "Way of the Four Elements": "Way of the Elements",
+    "Way of the Open Hand": "Way of the Open Palm",
+    "Way of Shadow": "Way of Shadow",
+    "Way of the Drunken Master": "Way of the Drunken Master",
+    "Way of the Kensei": "Way of the Kensei",
+    "Way of the Sun Soul": "Way of the Sun Soul",
+    "Way of the Ascendant Dragon": "Way of the Ascendant Dragon",
+    "Way of Mercy": "Way of Mercy",
+    "Way of the Long Death": "Way of the Long Death",
+    "Way of the Noble Abdicator": "Way of the Noble Abdicator",
+    # Paladin
+    "Oath of Devotion": "Devotion",
+    "Oath of the Ancients": "Ancients",
+    "Oath of Vengeance": "Vengeance",
+    "Oath of Conquest": "Conquest",
+    "Oath of Redemption": "Redemption",
+    "Oath of the Watchers": "Watchers",
+    "Oath of the Open Sea": "Open Sea",
+    "Oathbreaker": "Oathbreaker",
+    # Ranger
+    "Hunter": "Hunter",
+    "Beast Master": "Beast Master",
+    "Gloom Stalker": "Gloom Stalker",
+    "Horizon Walker": "Horizon Walker",
+    "Monster Slayer": "Monster Slayer",
+    "Fey Wanderer": "Fey Wanderer",
+    "Swarmkeeper": "Swarmkeeper",
+    "Drakewarden": "Drakewarden",
+    # Rogue
+    "Thief": "Thief",
+    "Assassin": "Assassin",
+    "Arcane Trickster": "Arcane Trickster",
+    "Inquisitive": "Inquisitive",
+    "Mastermind": "Mastermind",
+    "Phantom": "Phantom",
+    "Scout": "Scout",
+    "Soulknife": "Soulknife",
+    "Swashbuckler": "Swashbuckler",
+    "Revenant": "Revenant",
+    # Sorcerer
+    "Draconic Bloodline": "Draconic",
+    "Wild Magic Bloodline": "Wild Magic",
+    "Storm Sorcery": "Storm Sorcerer",
+    "Shadow Magic": "Shadow Magic",
+    "Aberrant Mind": "Aberrant Mind",
+    "Clockwork Soul": "Clockwork Soul",
+    "Divine Soul": "Divine Soul",
+    # Warlock
+    "Archfey Patron": "Archfey",
+    "Fiend Patron": "Fiend",
+    "Great Old One Patron": "Great Old One",
+    "Hexblade": "Hexblade",
+    "Undead Patron": "Undead",
+    "Genie Patron": "Genie",
+    "Fathomless Patron": "Fathomless",
+    "Hexblade Patron": "Hexblade",  # variant
+    # Wizard
+    "School of Abjuration": "Abjuration",
+    "School of Conjuration": "Conjuration",
+    "School of Divination": "Divination",
+    "School of Enchantment": "Enchantment",
+    "School of Evocation": "Evocation",
+    "School of Illusion": "Illusion",
+    "School of Necromancy": "Necromancy",
+    "School of Transmutation": "Transmutation",
+    "School of Bladesinging": "Bladesinging",
+    "Order of Scribes": "Scribes",
+    "War Magic": "War Magic",
+}
+
+
+def _remap_subclass_name(subclass_name: str) -> str:
+    """REQ-ENT-004: Remap a legacy 2014 subclass name to its 2024 equivalent.
+
+    If the name is already a 2024 name (or unknown), returns it unchanged.
+    This enables backward compatibility with vault YAML saved under 2014 naming.
+    """
+    return _SUBCLASS_2014_TO_2024.get(subclass_name, subclass_name)
+
+
 def _load_modifiable_value(yaml_data: dict, field_name: str, fallback_base_value: int) -> ModifiableValue:
     """
     Construct a ModifiableValue from YAML, restoring both base_value and any active modifiers.
@@ -274,6 +389,20 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
         # Explicit registration (BaseGameEntity no longer auto-registers)
         register_entity(entity, vault_path)
 
+        # REQ-ENT-004: Load classes from vault YAML with 2014→2024 subclass remapping
+        raw_classes = yaml_data.get("classes", [])
+        if raw_classes:
+            from state import ClassLevel  # local import to avoid circular
+            entity.classes = [
+                ClassLevel(
+                    class_name=c.get("class_name", ""),
+                    level=int(c.get("level", 0)),
+                    # Remap legacy 2014 subclass names to 2024 equivalents
+                    subclass_name=_remap_subclass_name(c["subclass_name"]) if c.get("subclass_name") else None,
+                )
+                for c in raw_classes
+            ]
+
         # Bridge: Initialize and Equip the Object-Oriented Weapon
         equipment = yaml_data.get("equipment", {})
         main_hand = equipment.get("main_hand", "Unarmed")
@@ -470,6 +599,8 @@ async def sync_engine_to_vault(vault_path: str):
                     yaml_data["icon_url"] = entity.icon_url
                 if entity.resources:
                     yaml_data["resources"] = entity.resources
+                if entity.classes:
+                    yaml_data["classes"] = [c.model_dump() for c in entity.classes]
                 if entity.active_conditions:
                     yaml_data["active_conditions"] = [c.model_dump(exclude={"condition_id"}) for c in entity.active_conditions]
                 elif "active_conditions" in yaml_data:

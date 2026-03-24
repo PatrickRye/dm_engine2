@@ -938,6 +938,378 @@ async def perform_group_check(
     return summary
 
 
+# REQ-SOC-001/002/003/004: NPC Influence Action (attitude-based social interaction DC)
+_ATTITUDE_BASE_DC = {
+    "hostile": 14,
+    "indifferent": 10,
+    "friendly": 8,
+    "helpful": 0,  # Friendly (Eager to Help)
+}
+
+_RISK_DC_MODIFIER = {
+    "negligible": 0,
+    "minor": 0,
+    "low": 5,
+    "moderate": 10,
+    "high": 15,
+    "severe": 20,
+}
+
+
+async def perform_social_interaction(
+    character_name: str,
+    target_npc_name: str,
+    request_description: str,
+    npc_attitude: str,  # "Hostile", "Indifferent", "Friendly", or "Friendly (Eager to Help)"
+    approach: str = "persuasion",  # persuasion | deception | intimidation
+    request_risk: str = "minor",  # negligible | minor | low | moderate | high | severe
+    request_cost: str = "none",  # none | minor | moderate | significant
+    manual_roll_total: int = None,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    REQ-SOC-001/002/003/004: Resolve an Influence action against an NPC using the 2024 DMG
+    attitude-based DC system.
+
+    Steps:
+    1. Determine the NPC's starting attitude (Hostile / Indifferent / Friendly / Friendly (Eager to Help))
+    2. Apply attitude modifiers: Hostile NPCs auto-reject risky requests (REQ-SOC-002);
+       Indifferent NPCs auto-reject moderate+ risk requests (REQ-SOC-003).
+    3. Calculate DC = Attitude_Base_DC + Risk_Modifier  [REQ-SOC-001]
+    4. Roll d20 + CHA modifier vs DC. Report SUCCESS or FAILURE.
+
+    Parameters:
+      - character_name: The PC attempting to influence the NPC.
+      - target_npc_name: The NPC being influenced.
+      - request_description: What the PC is asking the NPC to do.
+      - npc_attitude: One of "Hostile", "Indifferent", "Friendly", or "Friendly (Eager to Help)".
+      - approach: "persuasion" (default), "deception", or "intimidation".
+      - request_risk: Risk to the NPC — "negligible" | "minor" | "low" | "moderate" | "high" | "severe".
+      - request_cost: Personal cost to the NPC — "none" | "minor" | "moderate" | "significant".
+      - manual_roll_total: Optional override for the d20 roll (for play-by-post or pre-rolled dice).
+
+    Attitude Base DCs (2024 DMG):
+      Hostile (DC 14) → Indifferent (DC 10) → Friendly (DC 8) → Friendly/Eager (DC 0)
+
+    Risk Modifiers:
+      Negligible/Minor = +0  |  Low = +5  |  Moderate = +10  |  High = +15  |  Severe = +20
+    """
+    vault_path = config["configurable"].get("thread_id")
+
+    # Normalize attitude key
+    attitude_key = npc_attitude.strip().lower()
+    if "helpful" in attitude_key or "eager" in attitude_key:
+        attitude_key = "helpful"
+    elif attitude_key not in _ATTITUDE_BASE_DC:
+        return (
+            f"SYSTEM ERROR: Unknown NPC attitude '{npc_attitude}'. "
+            "Valid values: Hostile, Indifferent, Friendly, Friendly (Eager to Help)."
+        )
+
+    risk_key = request_risk.strip().lower()
+    if risk_key not in _RISK_DC_MODIFIER:
+        return (
+            f"SYSTEM ERROR: Unknown risk level '{request_risk}'. "
+            "Valid values: negligible, minor, low, moderate, high, severe."
+        )
+
+    base_dc = _ATTITUDE_BASE_DC[attitude_key]
+    risk_mod = _RISK_DC_MODIFIER[risk_key]
+
+    # REQ-SOC-002: Hostile NPC — auto-reject (no roll) if request has risk
+    if attitude_key == "hostile" and risk_key not in ("negligible", "minor"):
+        return (
+            f"MECHANICAL TRUTH: Influence attempt on {target_npc_name} — AUTO-FAILURE (REQ-SOC-002). "
+            f"{target_npc_name} is Hostile and won't take risks. "
+            f"Request: {request_description}"
+        )
+
+    # REQ-SOC-003: Indifferent NPC — auto-reject moderate+ risk requests
+    if attitude_key == "indifferent" and risk_key in ("moderate", "high", "severe"):
+        return (
+            f"MECHANICAL TRUTH: Influence attempt on {target_npc_name} — AUTO-FAILURE (REQ-SOC-003). "
+            f"{target_npc_name} is Indifferent and won't accept requests involving significant personal cost. "
+            f"Request: {request_description}"
+        )
+
+    # REQ-SOC-004: Friendly (Eager to Help) — minor/negligible requests auto-succeed
+    if attitude_key == "helpful" and risk_key in ("negligible", "minor"):
+        return (
+            f"MECHANICAL TRUTH: Influence attempt on {target_npc_name} — AUTO-SUCCESS (REQ-SOC-004). "
+            f"{target_npc_name} is Friendly (Eager to Help) and readily accepts '{request_description}'. "
+            f"DC would have been {base_dc + risk_mod}; no roll needed."
+        )
+
+    # Calculate DC for rolling cases
+    final_dc = base_dc + risk_mod
+
+    # Get CHA modifier for the influencer
+    influencer = await _get_entity_by_name(character_name, vault_path)
+    if influencer and hasattr(influencer, "charisma_mod"):
+        cha_mod = influencer.charisma_mod.total
+    elif influencer and hasattr(influencer, "charisma"):
+        cha_mod = influencer.charisma
+    else:
+        # Fallback: read from vault
+        try:
+            fpath = os.path.join(get_journals_dir(vault_path), f"{character_name}.md")
+            async with read_markdown_entity(fpath) as (yaml_data, _):
+                cha_score = int(yaml_data.get("charisma", yaml_data.get("cha", 10)))
+                cha_mod = math.floor((cha_score - 10) / 2)
+        except Exception:
+            cha_mod = 0
+
+    # Roll or use manual override
+    if manual_roll_total is not None:
+        d20 = manual_roll_total
+        roll_str = f"manual({manual_roll_total})"
+    else:
+        d20 = roll_dice("1d20")
+        roll_str = str(d20)
+
+    total = d20 + cha_mod
+    passed = total >= final_dc
+    outcome = "SUCCESS" if passed else "FAILURE"
+
+    approach_label = approach.capitalize()
+
+    return (
+        f"MECHANICAL TRUTH: {character_name} used {approach_label} on {target_npc_name} ({npc_attitude}) "
+        f"requesting: '{request_description}'.\n"
+        f"DC {final_dc} (Attitude={attitude_key.capitalize()} DC{base_dc}, Risk={risk_key.capitalize()} +{risk_mod}). "
+        f"Roll: {roll_str} + {cha_mod} CHA = **{total}** vs DC {final_dc} → **{outcome}**."
+    )
+
+
+# === REQ-ECO-001: Currency Normalization ===
+from rules_engine import (
+    CP, SP, EP, GP, PP,
+    gold_to_cp, silver_to_cp, electrum_to_cp, pp_to_cp,
+    cp_to_gold, cp_to_silver,
+    parse_coin_string as _parse_coin_string,
+    format_cp as _format_cp,
+    cr_to_xp, xp_to_cr,
+    calc_encounter_xp, evaluate_encounter as _evaluate_encounter,
+    calc_party_xp_budget, get_char_xp_threshold,
+    distribute_xp, get_daily_xp_budget,
+    max_push_drag_lift, max_carrying_capacity, carrying_status, carrying_speed_penalty,
+)
+
+
+@tool
+async def convert_currency(
+    amount: int,
+    from_unit: str,
+    to_unit: str = "cp",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-ECO-001: Convert between D&D currency units.
+
+    Converts `amount` of `from_unit` to the equivalent value in `to_unit`.
+    Units: cp, sp, ep, gp, pp (case-insensitive).
+
+    Returns a human-readable result like '50 gp = 5000 cp'.
+    """
+    from_unit = from_unit.lower()
+    to_unit = to_unit.lower()
+    unit_map = {"cp": CP, "sp": SP, "ep": EP, "gp": GP, "pp": PP}
+
+    if from_unit not in unit_map:
+        return f"SYSTEM ERROR: Unknown from_unit '{from_unit}'. Use: cp, sp, ep, gp, pp."
+    if to_unit not in unit_map:
+        return f"SYSTEM ERROR: Unknown to_unit '{to_unit}'. Use: cp, sp, ep, gp, pp."
+
+    # Convert to CP first (the engine's internal representation)
+    cp_value = amount * unit_map[from_unit]
+    # Then convert to target unit
+    converted = cp_value // unit_map[to_unit]
+
+    return f"Currency Conversion: {amount} {from_unit} = {cp_value} cp = {converted} {to_unit}."
+
+
+@tool
+async def parse_and_format_coins(
+    coin_string: str,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-ECO-001: Parse a coin string into total CP and human-readable breakdown.
+
+    Supports formats like '5 gp', '12gp', '100 cp', or comma-separated
+    '5 gp, 12 sp, 100 cp'. Case-insensitive. Returns both total CP
+    and a nicely formatted breakdown.
+    """
+    total_cp = _parse_coin_string(coin_string)
+    breakdown = _format_cp(total_cp)
+    return f"Coin String '{coin_string}' → Total: {total_cp} cp. Breakdown: {breakdown}."
+
+
+# === REQ-BUI-001-010: Encounter Building ===
+@tool
+async def evaluate_encounter_difficulty(
+    monster_crs: Annotated[list[float], Field(description="List of monster Challenge Ratings (CRs) in the encounter.")],
+    party_levels: Annotated[list[int], Field(description="List of player character levels in the party.")],
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-BUI-001/002/003/004/006/010: Evaluate encounter difficulty for a party.
+
+    Compares total monster XP against party XP budgets for each difficulty tier.
+    Returns the difficulty rating (Trivial/Easy/Medium/Hard/Deadly) and a
+    detailed breakdown including budgets per tier, total XP, and any
+    lethality warnings (REQ-BUI-006).
+
+    monster_crs example: [2, 3, 1] for three monsters of CR 2, 3, and 1.
+    party_levels example: [5, 5, 4, 4] for a four-member party.
+    """
+    result = _evaluate_encounter(monster_crs, party_levels)
+
+    lines = [
+        f"Encounter Evaluation (REQ-BUI-002/004):",
+        f"  Monster CRs: {monster_crs}",
+        f"  Total XP: {result['total_xp']}",
+        f"  Difficulty: **{result['difficulty']}**",
+        "",
+        f"  Party XP Budgets (REQ-BUI-003):",
+        f"    Easy:    {result['budgets']['easy']} XP",
+        f"    Medium:  {result['budgets']['medium']} XP",
+        f"    Hard:   {result['budgets']['hard']} XP",
+        f"    Deadly: {result['budgets']['deadly']} XP",
+    ]
+
+    if result["warnings"]:
+        lines.append("")
+        lines.append("  WARNINGS:")
+        for w in result["warnings"]:
+            lines.append(f"    ⚠ {w}")
+
+    return "\n".join(lines)
+
+
+@tool
+async def build_encounter(
+    target_difficulty: Annotated[str, Field(description="Desired difficulty: trivial, easy, medium, hard, or deadly.")],
+    party_levels: Annotated[list[int], Field(description="List of player character levels.")],
+    monster_pool: Annotated[list[dict] | None, Field(default=None, description="Optional list of available monsters as dicts with 'name' and 'cr' keys. If not provided, only XP math is returned.")],
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-BUI-003/004: Given a target difficulty and party levels, return the XP budget.
+
+    This tool calculates the XP budget for the requested difficulty and
+    optionally suggests monster composition if a monster_pool is provided.
+
+    Note: Actual monster selection from a pool requires the DM to choose
+    appropriate CRs from the available monsters.
+    """
+    diff = target_difficulty.lower()
+    if diff not in ("trivial", "easy", "medium", "hard", "deadly"):
+        return f"SYSTEM ERROR: Unknown difficulty '{target_difficulty}'. Use: trivial, easy, medium, hard, deadly."
+
+    budget = calc_party_xp_budget(party_levels, diff)
+    daily_budget = get_daily_xp_budget(party_levels)
+
+    lines = [
+        f"Encounter Planning (REQ-BUI-003/004):",
+        f"  Target Difficulty: {target_difficulty.capitalize()}",
+        f"  Party Levels: {party_levels} (avg {sum(party_levels)/len(party_levels):.1f})",
+        f"  XP Budget: {budget}",
+        f"  Daily XP Budget (REQ-BUI-005): {daily_budget}",
+    ]
+
+    if monster_pool:
+        total_xp = 0
+        selected = []
+        remaining = list(monster_pool)
+        while remaining:
+            best = None
+            best_cr = 0
+            for m in remaining:
+                cr = float(m["cr"])
+                if total_xp + cr_to_xp(cr) <= budget:
+                    if cr > best_cr:
+                        best_cr = cr
+                    best = m
+            if best is None:
+                break
+            selected.append(best)
+            remaining.remove(best)
+            total_xp += cr_to_xp(float(best["cr"]))
+
+        lines.append(f"  Suggested monsters (XP total: {total_xp}):")
+        for m in selected:
+            lines.append(f"    - {m['name']} (CR {m['cr']}, XP {cr_to_xp(float(m['cr']))})")
+        if remaining and selected:
+            lines.append(f"  Note: {len(remaining)} monster(s) in pool could not be added without exceeding budget.")
+
+    return "\n".join(lines)
+
+
+@tool
+async def distribute_encounter_xp(
+    total_encounter_xp: Annotated[int, Field(description="Total XP from the defeated encounter.")],
+    num_party_members: Annotated[int, Field(description="Number of surviving, participating party members.")],
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-BUI-010: Divide XP equally among surviving party members.
+
+    Returns the XP award per character. Remainder CP is discarded (floor division).
+    """
+    if num_party_members <= 0:
+        return "SYSTEM ERROR: num_party_members must be a positive integer."
+
+    awards = distribute_xp(total_encounter_xp, num_party_members)
+    return (
+        f"XP Distribution (REQ-BUI-010): "
+        f"{total_encounter_xp} XP ÷ {num_party_members} members = "
+        f"{awards[0]} XP each. Total distributed: {awards[0] * num_party_members} XP "
+        f"({total_encounter_xp - awards[0] * num_party_members} XP discarded as remainder)."
+    )
+
+
+# === REQ-INV-002: Carrying Capacity ===
+@tool
+async def calculate_carrying_capacity(
+    strength_score: Annotated[int, Field(description="The entity's Strength score.")],
+    current_load_lbs: Annotated[int, Field(description="Current weight carried in pounds.", default=0)],
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-INV-002: Calculate carrying capacity and speed penalty.
+
+    - Max carrying (no penalty): Strength × 15 lbs
+    - Encumbered (speed -20 ft): between Strength×15 and Strength×30 lbs
+    - Heavily encumbered (speed -40 ft, can't run): between Strength×30 and Strength×60 lbs
+    - Over push/drag/lift max (Strength×60): can't move
+
+    Returns a detailed status report.
+    """
+    max_carry = max_carrying_capacity(strength_score)
+    max_push = max_push_drag_lift(strength_score)
+    status = carrying_status(current_load_lbs, strength_score)
+    penalty = carrying_speed_penalty(status)
+
+    lines = [
+        f"Carrying Capacity (REQ-INV-002):",
+        f"  Strength Score: {strength_score}",
+        f"  Max Carry (no penalty): {max_carry} lbs (Str×15)",
+        f"  Max Push/Drag/Lift: {max_push} lbs (Str×30)",
+        f"  Current Load: {current_load_lbs} lbs",
+        f"  Status: **{status.replace('_', ' ').capitalize()}**",
+    ]
+
+    if penalty > 0:
+        lines.append(f"  Speed Penalty: -{penalty} ft")
+
+    if current_load_lbs > max_push:
+        lines.append(f"  ⚠ OVER PUSH/DRAG/LIFT MAX — Entity is completely immobilized!")
+
+    return "\n".join(lines)
+
+
 __all__ = [
     "roll_generic_dice",
     "search_vault_by_tag",
@@ -950,4 +1322,11 @@ __all__ = [
     "travel",
     "use_heroic_inspiration",
     "perform_group_check",
+    "perform_social_interaction",
+    "convert_currency",
+    "parse_and_format_coins",
+    "evaluate_encounter_difficulty",
+    "build_encounter",
+    "distribute_encounter_xp",
+    "calculate_carrying_capacity",
 ]
