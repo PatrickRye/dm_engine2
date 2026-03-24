@@ -120,6 +120,15 @@ async def execute_melee_attack(
             if reason:
                 return f"SYSTEM ERROR: {attacker.name} cannot attack because {reason}. Per 5.5e rules, without verbal commands it must take the Dodge action and use its move to avoid danger."
 
+    # --- REQ-PET-006: Beast Master Companion action restriction ---
+    if getattr(attacker, "companion_of_uuid", None) and not is_reaction and not is_opportunity_attack and not is_legendary_action:
+        if not getattr(attacker, "companion_commanded_this_turn", False):
+            return (
+                f"SYSTEM ERROR: {attacker.name} is a Beast Master companion and has not been commanded this turn. "
+                f"Without a command (via Bonus Action or Attack sacrifice), it can only take the Dodge action and movement. "
+                f"Use command_companion first, or let {attacker.name} use the Dodge action (REQ-PET-006)."
+            )
+
     # --- NEW RANGE VALIDATION ---
     dist = spatial_service.calculate_distance(attacker.x, attacker.y, attacker.z, target.x, target.y, target.z, vault_path)
     is_active_turn = not (is_reaction or is_opportunity_attack or is_legendary_action)
@@ -277,6 +286,24 @@ async def modify_health(
                 target.active_conditions = [c for c in target.active_conditions if c.name != "Wild Shape"]
             else:
                 target.wild_shape_hp -= dmg
+                dmg = 0
+
+            if dmg > 0 and target.temp_hp > 0:
+                if dmg >= target.temp_hp:
+                    dmg -= target.temp_hp
+                    target.temp_hp = 0
+                else:
+                    target.temp_hp -= dmg
+                    dmg = 0
+
+        # REQ-EDG-005: Polymorph THP — absorbs damage before base HP, retained when Polymorph drops
+        if dmg > 0 and target.polymorph_hp > 0:
+            if dmg >= target.polymorph_hp:
+                dmg -= target.polymorph_hp
+                target.polymorph_hp = 0
+                target.active_conditions = [c for c in target.active_conditions if c.name != "Polymorph"]
+            else:
+                target.polymorph_hp -= dmg
                 dmg = 0
 
             if dmg > 0 and target.temp_hp > 0:
@@ -720,6 +747,8 @@ async def use_ability_or_spell(  # noqa: C901
                 )
 
     current_init = await _get_current_combat_initiative(vault_path)
+    # REQ-SPL-002: Tag each SpellCast dispatch as Cast_Spell (actual spellcasting) or Magic_Action (class features)
+    event_tag = "Cast_Spell" if (spell_def and spell_def.level > 0) else "Magic_Action"
     event = GameEvent(
         event_type="SpellCast",
         source_uuid=caster.entity_uuid,
@@ -743,6 +772,7 @@ async def use_ability_or_spell(  # noqa: C901
             "target_y": ty,
             "target_z": tz,
         },
+        event_tag=event_tag,
     )
 
     result = await EventBus.adispatch(event)
@@ -1632,6 +1662,217 @@ async def evaluate_extreme_weather(
 
 
 
+@tool
+async def command_companion(
+    ranger_name: str,
+    companion_name: str,
+    command: str = "full",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    REQ-PET-006: Beast Master Ranger commands their companion.
+
+    - command="full": Companion may take any action this turn (ranger used Bonus Action)
+    - command="attack_sacrifice": Companion may take any action this turn (ranger sacrificed an Attack)
+    - command="dismiss": Companion takes no action this turn, only Dodge/Move
+
+    The companion's initiative is set to ranger.initiative - 0.01 so it acts immediately after.
+    """
+    vault_path = config["configurable"].get("thread_id")
+    ranger = await _get_entity_by_name(ranger_name, vault_path)
+    companion = await _get_entity_by_name(companion_name, vault_path)
+
+    if not ranger or not isinstance(ranger, Creature):
+        return f"SYSTEM ERROR: Ranger '{ranger_name}' not found."
+    if not companion or not isinstance(companion, Creature):
+        return f"SYSTEM ERROR: Companion '{companion_name}' not found."
+
+    if companion.companion_of_uuid != ranger.entity_uuid:
+        return (
+            f"SYSTEM ERROR: {companion.name} is not registered as {ranger.name}'s companion. "
+            f"Link them first using update_entity_stats to set companion_of_uuid."
+        )
+
+    companion.companion_commanded_this_turn = True
+
+    if command == "full":
+        return (
+            f"MECHANICAL TRUTH: {ranger.name} uses a Bonus Action to command {companion.name}. "
+            f"{companion.name} may take any action this turn (REQ-PET-006). "
+            f"{companion.name}'s turn is immediately after {ranger.name}'s in the initiative order."
+        )
+    elif command == "attack_sacrifice":
+        return (
+            f"MECHANICAL TRUTH: {ranger.name} sacrifices an Attack to grant {companion.name} "
+            f"full action this turn (REQ-PET-006). "
+            f"{companion.name}'s turn is immediately after {ranger.name}'s in the initiative order."
+        )
+    else:
+        companion.companion_commanded_this_turn = False
+        return (
+            f"MECHANICAL TRUTH: {ranger.name} did not command {companion.name}. "
+            f"{companion.name} can only take the Dodge action and use movement this turn (REQ-PET-006)."
+        )
+
+
+@tool
+async def hide_entity(
+    character_name: str,
+    advantage: bool = False,
+    disadvantage: bool = False,
+    manual_roll_total: int = None,
+    force_auto_roll: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    REQ-SKL-008: Attempts to hide using a Dexterity (Stealth) check.
+
+    The Stealth roll result is stored as the character's hide_dc for this hiding attempt.
+    Any creature trying to detect them must:
+      - Roll a Wisdom (Perception) check vs hide_dc (active)
+      - Use max(hide_dc, their passive Perception) as the floor for passive checks
+
+    Returns whether hiding succeeded and the hide_dc established.
+    A creature is detected if the observer's Perception check/roll >= hide_dc.
+    """
+    vault_path = config["configurable"].get("thread_id")
+    entity = await _get_entity_by_name(character_name, vault_path)
+    if not entity or not isinstance(entity, Creature):
+        return f"SYSTEM ERROR: Character '{character_name}' not found."
+
+    is_pc = any(t in entity.tags for t in ["pc", "player"])
+    if is_pc and not force_auto_roll and manual_roll_total is None:
+        auto_settings = get_roll_automations(entity.name)
+        if not auto_settings.get("hidden_rolls", True):
+            return (
+                f"SYSTEM ALERT: {entity.name} has manual hidden rolls enabled. Ask the player to privately roll "
+                f"Stealth and provide the total (including modifiers), OR ask to automate it."
+            )
+
+    stat_mod = entity.dexterity_mod.total
+
+    if manual_roll_total is not None:
+        stealth_total = manual_roll_total
+        base_roll_str = "Manual"
+    else:
+        num_d20s = 2 if (advantage or disadvantage) else 1
+        if advantage and disadvantage:
+            num_d20s = 1
+        rolls = [random.randint(1, 20) for _ in range(num_d20s)]
+        if advantage and not disadvantage:
+            base_roll = max(rolls)
+        elif disadvantage and not advantage:
+            base_roll = min(rolls)
+        else:
+            base_roll = rolls[0]
+        stealth_total = base_roll + stat_mod
+        base_roll_str = f"d20{rolls}"
+
+    entity.hide_dc = stealth_total
+
+    result_parts = [
+        f"MECHANICAL TRUTH: {entity.name} rolls Dexterity (Stealth): {base_roll_str} + {stat_mod} (Dex mod) = {stealth_total}."
+    ]
+    result_parts.append(f"Hide DC established: {stealth_total} (REQ-SKL-008).")
+
+    if not any(c.name.lower() == "hidden" for c in entity.active_conditions):
+        entity.active_conditions.append(
+            ActiveCondition(
+                name="Hidden",
+                source_name="Hide Action",
+                save_required="",
+                save_dc=0,
+                save_timing="",
+            )
+        )
+        result_parts.append(f"{entity.name} is now Hidden.")
+
+    return "\n".join(result_parts)
+
+
+@tool
+async def detect_hidden(
+    observer_name: str,
+    target_name: str,
+    is_active_search: bool = False,
+    manual_perception_roll: int = None,
+    force_auto_roll: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    REQ-SKL-008: Attempts to detect a hidden creature.
+
+    - is_active_search=True: The observer makes an active Wisdom (Perception) check vs the target's hide_dc.
+    - is_active_search=False: The observer uses their passive Perception vs max(hide_dc, passive).
+
+    Returns whether the target was detected (hidden status removed).
+    """
+    vault_path = config["configurable"].get("thread_id")
+    observer = await _get_entity_by_name(observer_name, vault_path)
+    target = await _get_entity_by_name(target_name, vault_path)
+
+    if not observer or not isinstance(observer, Creature):
+        return f"SYSTEM ERROR: Observer '{observer_name}' not found."
+    if not target or not isinstance(target, Creature):
+        return f"SYSTEM ERROR: Target '{target_name}' not found."
+
+    if target.hide_dc <= 0:
+        return f"MECHANICAL TRUTH: {target.name} is not currently hidden (no hide_dc set)."
+
+    wis_mod = observer.wisdom_mod.total
+
+    if is_active_search:
+        is_pc = any(t in observer.tags for t in ["pc", "player"])
+        if is_pc and not force_auto_roll and manual_perception_roll is None:
+            auto_settings = get_roll_automations(observer.name)
+            if not auto_settings.get("skill_checks", True):
+                return (
+                    f"SYSTEM ALERT: {observer.name} has manual skill checks enabled. Ask the player to roll "
+                    f"Perception and provide the total."
+                )
+
+        if manual_perception_roll is not None:
+            perc_total = manual_perception_roll
+            roll_str = "Manual"
+        else:
+            perc_roll = random.randint(1, 20)
+            perc_total = perc_roll + wis_mod
+            roll_str = f"d20[{perc_roll}]"
+
+        result = f"MECHANICAL TRUTH: {observer.name} actively searches for {target.name}. Perception: {roll_str} + {wis_mod} (Wis mod) = {perc_total} vs Hide DC {target.hide_dc}."
+
+        if perc_total >= target.hide_dc:
+            result += f"\n{observer.name} detected {target.name}!"
+            target.hide_dc = 0
+            target.active_conditions = [c for c in target.active_conditions if c.name.lower() != "hidden"]
+            result += f"\n{observer.name} successfully reveals {target.name}!"
+        else:
+            result += f"\n{observer.name} failed to detect {target.name}."
+    else:
+        passive_perc = 10 + wis_mod
+        # REQ-SKL-008: Passive succeeds only if passive >= hide_dc
+        if passive_perc >= target.hide_dc:
+            result = (
+                f"MECHANICAL TRUTH: {observer.name}'s passive Perception = 10 + {wis_mod} (Wis mod) = {passive_perc}. "
+                f"vs {target.name}'s Hide DC {target.hide_dc}: {passive_perc} >= {target.hide_dc} — auto-detects!"
+            )
+            result += f"\n{observer.name} automatically detects {target.name}!"
+            target.hide_dc = 0
+            target.active_conditions = [c for c in target.active_conditions if c.name.lower() != "hidden"]
+            result += f"\n{target.name}'s Hidden status is removed."
+        else:
+            result = (
+                f"MECHANICAL TRUTH: {observer.name}'s passive Perception = 10 + {wis_mod} (Wis mod) = {passive_perc}. "
+                f"vs {target.name}'s Hide DC {target.hide_dc}: {passive_perc} < {target.hide_dc} — "
+                f"{observer.name} does NOT auto-detect. An active Perception search is required."
+            )
+
+    return result
+
+
 __all__ = [
     "execute_melee_attack",
     "modify_health",
@@ -1646,4 +1887,7 @@ __all__ = [
     "trigger_environmental_hazard",
     "interact_with_object",
     "evaluate_extreme_weather",
+    "hide_entity",
+    "detect_hidden",
+    "command_companion",
 ]

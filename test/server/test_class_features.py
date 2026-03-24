@@ -508,6 +508,71 @@ def test_req_cls_015_normal_form_can_cast():
 
 
 # ============================================================
+# REQ-SPL-002: Magic Action vs Cast Spell distinction
+# ============================================================
+
+def test_req_spl_002_magic_action_not_blocked_by_wild_shape():
+    """
+    REQ-SPL-002: Features triggering on 'Cast a Spell' do NOT trigger on a
+    generic 'Magic Action'. A Wild Shaped druid can still use class features
+    tagged Magic_Action (e.g. Wild Shape itself, Dragonborn Breath) without
+    being blocked by the Wild Shape spell-block handler.
+    """
+    druid = Creature(
+        name="WildDruid",
+        hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=12),
+        strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0),
+        wild_shape_hp=10,
+    )
+    register_entity(druid)
+
+    # Magic_Action event (e.g. using Wild Shape to transform again, or Dragonborn Breath)
+    magic_action_event = GameEvent(
+        event_type="SpellCast",
+        source_uuid=druid.entity_uuid,
+        event_tag="Magic_Action",  # REQ-SPL-002: not an actual spell cast
+        payload={
+            "ability_name": "Wild Shape",
+            "mechanics": {},
+            "target_uuids": [],
+        },
+    )
+    result = EventBus.dispatch(magic_action_event)
+
+    # Magic_Action should NOT be cancelled by the Wild Shape spell-block handler
+    assert result.status != EventStatus.CANCELLED
+
+
+def test_req_spl_002_cast_spell_still_blocked_by_wild_shape():
+    """
+    REQ-SPL-002: A Wild Shaped druid casting an actual spell (Cast_Spell) IS
+    still blocked — Magic_Action and Cast_Spell are distinct.
+    """
+    druid = Creature(
+        name="WildDruid",
+        hp=ModifiableValue(base_value=20), ac=ModifiableValue(base_value=12),
+        strength_mod=ModifiableValue(base_value=0), dexterity_mod=ModifiableValue(base_value=0),
+        wild_shape_hp=10,
+    )
+    register_entity(druid)
+
+    spell_event = GameEvent(
+        event_type="SpellCast",
+        source_uuid=druid.entity_uuid,
+        event_tag="Cast_Spell",  # REQ-SPL-002: actual spellcasting
+        payload={
+            "ability_name": "Fireball",
+            "mechanics": {"damage_dice": "8d6", "damage_type": "fire"},
+            "target_uuids": [],
+        },
+    )
+    result = EventBus.dispatch(spell_event)
+
+    assert result.status == EventStatus.CANCELLED
+    assert any("Wild Shaped" in r for r in result.payload.get("results", []))
+
+
+# ============================================================
 # REQ-CLS-016: Fighter Second Wind (healing_dice branch)
 # ============================================================
 

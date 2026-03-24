@@ -906,10 +906,105 @@ class SpatialQueryService:
         return hit_entities, hit_walls, hit_terrains
 
     @locked
+    def get_cover_between_points(
+        self,
+        from_x: float,
+        from_y: float,
+        from_z: float,
+        to_x: float,
+        to_y: float,
+        to_z: float,
+        from_entity_uuid: uuid.UUID = None,
+        to_entity_uuid: uuid.UUID = None,
+        vault_path: str = "default",
+    ) -> str:
+        """Determines cover between two arbitrary 3D points.
+
+        REQ-GEO-013: Counts blocked rays from all 4 corners of source to all 4 corners of target.
+        Returns: "None", "Half", "Three-Quarters", "Total"
+        """
+        if not HAS_GIS:
+            return "None"
+
+        self.get_map_data(vault_path)
+
+        # Compute bounding box corners for entities, or treat points as 0-size entities
+        source_corners = [(from_x, from_y)]
+        target_corners = [(to_x, to_y)]
+
+        if from_entity_uuid:
+            src = self._entities.get(vault_path, {}).get(from_entity_uuid)
+            if src:
+                src_poly = self._get_entity_bbox(src)
+                source_corners = list(src_poly.exterior.coords)[:-1]
+
+        if to_entity_uuid:
+            tgt = self._entities.get(vault_path, {}).get(to_entity_uuid)
+            if tgt:
+                tgt_poly = self._get_entity_bbox(tgt)
+                target_corners = list(tgt_poly.exterior.coords)[:-1]
+
+        s_z = from_z + 5.0  # Default height
+        t_z = to_z + 2.5    # Default target height center
+
+        if from_entity_uuid:
+            src = self._entities.get(vault_path, {}).get(from_entity_uuid)
+            if src:
+                s_z = src.z + getattr(src, "height", 5.0)
+
+        if to_entity_uuid:
+            tgt = self._entities.get(vault_path, {}).get(to_entity_uuid)
+            if tgt:
+                t_z = tgt.z + (getattr(tgt, "height", 5.0) / 2.0)
+
+        total_blocked = 0
+        for s_corner in source_corners:
+            for t_corner in target_corners:
+                line = LineString([s_corner, t_corner])
+                blocked = False
+                wall_candidates = list(self.wall_idx[vault_path].intersection(line.bounds))
+                for cid in wall_candidates:
+                    wall = self._wall_map[vault_path][cid]
+                    if not wall.is_solid:
+                        continue
+                    inter = line.intersection(wall.line)
+                    if inter.is_empty:
+                        continue
+                    if line.length > 0:
+                        frac_dist = math.hypot(inter.x - s_corner[0], inter.y - s_corner[1])
+                        fraction = frac_dist / line.length
+                    else:
+                        fraction = 0.0
+
+                    ray_z = s_z + fraction * (t_z - s_z)
+                    if wall.z <= ray_z <= wall.z + wall.height:
+                        blocked = True
+                        break
+                if blocked:
+                    total_blocked += 1
+
+        if total_blocked == 0:
+            return "None"
+        elif total_blocked <= 2:
+            return "Half"
+        elif total_blocked == 3:
+            return "Three-Quarters"
+        else:
+            return "Total"
+
+    @locked
     def get_distance_and_cover(
         self, source_uuid: uuid.UUID, target_uuid: uuid.UUID, vault_path: str = "default"
     ) -> Tuple[float, str]:
-        """Calculates distance and determines cover (None, Half, Three-Quarters, Total)."""
+        """Calculates distance and determines cover (None, Half, Three-Quarters, Total).
+
+        REQ-GEO-013: Casts rays from ALL 4 corners of the attacker's space to ALL 4 corners
+        of the target's space (16 rays total). Counts how many rays are blocked by walls.
+        - 0 blocked → None
+        - 1-2 blocked → Half
+        - 3 blocked → Three-Quarters
+        - 4 blocked → Total
+        """
         if not HAS_GIS:
             return 0.0, "None"
 
@@ -937,9 +1032,10 @@ class SpatialQueryService:
         s_z = source.z + getattr(source, "height", 5.0)
         t_z = target.z + (getattr(target, "height", 5.0) / 2.0)
 
-        best_visible_corners = 0
+        # REQ-GEO-013: Cast rays from ALL 4 source corners to ALL 4 target corners
+        # Count total blocked rays across all 16 combinations
+        total_blocked = 0
         for s_corner in source_corners:
-            visible_corners = 0
             for t_corner in target_corners:
                 line = LineString([s_corner, t_corner])
                 blocked = False
@@ -948,12 +1044,10 @@ class SpatialQueryService:
                     wall = self._wall_map[vault_path][cid]
                     if not wall.is_solid:
                         continue
-                    # Use intersection() directly — avoids the redundant intersects() pre-check
                     inter = line.intersection(wall.line)
                     if inter.is_empty:
                         continue
                     if line.length > 0:
-                        # math.hypot avoids allocating a Shapely Point just for distance
                         frac_dist = math.hypot(inter.x - s_corner[0], inter.y - s_corner[1])
                         fraction = frac_dist / line.length
                     else:
@@ -963,19 +1057,15 @@ class SpatialQueryService:
                     if wall.z <= ray_z <= wall.z + wall.height:
                         blocked = True
                         break
-                if not blocked:
-                    visible_corners += 1
+                if blocked:
+                    total_blocked += 1
 
-            if visible_corners > best_visible_corners:
-                best_visible_corners = visible_corners
-            if best_visible_corners == 4:
-                break
-
-        if best_visible_corners == 4:
+        # REQ-GEO-013: Map blocked ray count to cover level
+        if total_blocked == 0:
             cover = "None"
-        elif best_visible_corners >= 2:
+        elif total_blocked <= 2:
             cover = "Half"
-        elif best_visible_corners == 1:
+        elif total_blocked == 3:
             cover = "Three-Quarters"
         else:
             cover = "Total"

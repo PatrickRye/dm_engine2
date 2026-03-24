@@ -286,6 +286,9 @@ class Creature(BaseGameEntity):
     movement_remaining: int = 30
     wild_shape_hp: int = 0
     wild_shape_max_hp: int = 0
+    # REQ-EDG-005: Polymorph THP persistence — retained when Polymorph drops, until depleted or Rest
+    polymorph_hp: int = 0
+    polymorph_max_hp: int = 0
     death_saves_successes: int = 0
     death_saves_failures: int = 0
     exhaustion_level: int = 0
@@ -308,6 +311,13 @@ class Creature(BaseGameEntity):
     # REQ-LOT-005: Attunement tracking — True when entity is currently attuned to an item
     # during a short rest (blocks HP recovery from hit dice per REQ-LOT-005)
     attuned_this_short_rest: bool = False
+    # REQ-SKL-008: Hide DC — set to the stealth roll when a creature hides.
+    # Acts as the DC for opposed Perception checks and the floor for passive Perception.
+    hide_dc: int = 0
+    # REQ-PET-006: Beast Master Companion — UUID of the ranger this companion belongs to
+    companion_of_uuid: Optional[uuid.UUID] = None
+    # REQ-PET-006: Beast Master Companion — True if currently commanded by ranger this turn
+    companion_commanded_this_turn: bool = False
     _load_snapshot: int = PrivateAttr(default=0)
 
     def _compute_snapshot(self) -> int:
@@ -376,6 +386,8 @@ class GameEvent(BaseModel):
     vault_path: str = "default"
     status: EventStatus = EventStatus.PENDING
     payload: Dict[str, Any] = Field(default_factory=dict)
+    # REQ-SPL-002: Distinguishes Cast_Spell (actual spellcasting) from Magic_Action (other magical uses)
+    event_tag: Optional[str] = None  # "Cast_Spell" or "Magic_Action"
 
 
 class EventBus:

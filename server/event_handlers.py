@@ -56,6 +56,9 @@ def wild_shape_spellblock_handler(event: GameEvent):
     """REQ-CLS-015: Blocks spell casting while Wild Shaped — fires during PRE_EVENT so cancellation propagates."""
     if event.status != EventStatus.PRE_EVENT:
         return
+    # REQ-SPL-002: Magic_Action uses (e.g. Wild Shape itself, Dragonborn Breath) do NOT count as casting
+    if event.event_tag == "Magic_Action":
+        return
     caster: Creature = get_entity(event.source_uuid)
     if caster and caster.wild_shape_hp > 0:
         print(f"[Engine] {caster.name} is Wild Shaped and cannot cast new spells. (REQ-CLS-015)")
@@ -185,6 +188,12 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
     for t_uuid in target_uuids:
         target: Creature = get_entity(t_uuid)
         if not target:
+            continue
+
+        # REQ-EDG-008: Creature type query — spell only affects targets with the required tag
+        req_type = getattr(mechanics, "target_creature_type_required", None)
+        if req_type and req_type not in target.tags:
+            results.append(f"[Engine] {target.name} lacks the '{req_type}' creature type. Spell has no effect. (REQ-EDG-008)")
             continue
 
         # REQ-SPL-006: Target Invalidation (e.g. Target died between cast and resolution)
@@ -335,6 +344,13 @@ def resolve_spell_cast_handler(event: GameEvent):  # noqa: C901
                     )
                 )
                 results.append(f"[{target.name}] is now {cond_name}!")
+
+                # REQ-EDG-005: Polymorph THP — grant a THP buffer when Polymorph is applied
+                sets_thp = getattr(cond_data, "sets_polymorph_thp", 0)
+                if sets_thp > 0:
+                    target.polymorph_hp = sets_thp
+                    target.polymorph_max_hp = sets_thp
+                    results.append(f"[Engine] {target.name} gained {sets_thp} Polymorph THP (REQ-EDG-005).")
 
             for mod_data in mechanics.modifiers:
                 target_stat = mod_data.stat
@@ -1091,6 +1107,18 @@ def apply_damage_handler(event: GameEvent):
             else:
                 results.append(f"[Engine] {target.name}'s Wild Shape absorbed the damage!")
                 target.wild_shape_hp -= damage
+                damage = 0
+
+        # REQ-EDG-005: Polymorph THP — absorbs damage before base creature HP; retained when Polymorph drops
+        if damage > 0 and target.polymorph_hp > 0:
+            if damage >= target.polymorph_hp:
+                results.append(f"[Engine] {target.name}'s Polymorph THP absorbed some damage, but they revert to normal form!")
+                damage -= target.polymorph_hp
+                target.polymorph_hp = 0
+                target.active_conditions = [c for c in target.active_conditions if c.name != "Polymorph"]
+            else:
+                results.append(f"[Engine] {target.name}'s Polymorph THP absorbed the damage!")
+                target.polymorph_hp -= damage
                 damage = 0
 
         # REQ-CLS-001: Rage maintenance — taking damage counts as a valid rage-sustaining action

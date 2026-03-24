@@ -13,6 +13,8 @@ class AppliedCondition(BaseModel):
     start_of_turn_thp: int = 0
     end_of_turn_damage_dice: str = ""
     end_of_turn_damage_type: str = ""
+    # REQ-EDG-005: When this condition is applied, set the target's polymorph_hp to this value
+    sets_polymorph_thp: int = 0
 
 
 class StatModifier(BaseModel):
@@ -42,6 +44,8 @@ class SpellMechanics(BaseModel):
     conditions_applied: List[AppliedCondition] = Field(default_factory=list)
     modifiers: List[StatModifier] = Field(default_factory=list)
     terrain_effect: Optional[TerrainEffectDefinition] = None
+    # REQ-EDG-008: Creature type query — spell only affects targets with this tag
+    target_creature_type_required: Optional[str] = None
 
 
 class SpellDefinition(BaseModel):

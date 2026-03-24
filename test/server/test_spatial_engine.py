@@ -65,11 +65,11 @@ class TestSpatialEngine(unittest.TestCase):
         dist, cover = spatial_service.get_distance_and_cover(archer.entity_uuid, goblin.entity_uuid)
         self.assertEqual(cover, "Total")
 
-        # Move wall so it only blocks the bottom half of the Goblin's bounding box
-        spatial_service.map_data.walls[0] = Wall(start=(10.0, 0.0), end=(10.0, 10.0))
+        # Move wall so it blocks exactly 3 rays — x=4, y=[-2, 0] gives 3 blocked rays = Three-Quarters (REQ-GEO-013)
+        spatial_service.map_data.walls[0] = Wall(start=(4.0, -2.0), end=(4.0, 0.0))
         spatial_service.invalidate_cache()
         dist, cover = spatial_service.get_distance_and_cover(archer.entity_uuid, goblin.entity_uuid)
-        self.assertIn(cover, ["Half", "Three-Quarters"])
+        self.assertEqual(cover, "Three-Quarters")
 
     def test_aoe_fireball(self):
         # Setup two goblins
@@ -176,25 +176,32 @@ class TestSpatialEngine(unittest.TestCase):
         self.assertEqual(len(spatial_service.map_data.active_walls), 0)
 
     def test_rounding_corners_line_of_sight(self):
-        """Test that entities can peer around a corner if their bounding box extends past the wall."""
+        """Test that entities can peer around a corner if their bounding box extends past the wall.
+
+        REQ-GEO-013: Cover is determined by blocked rays from all 4 attacker corners to all 4 target corners.
+        """
         p1 = self.create_combatant("P1", 0.0, 0.0)  # Bounding box covers y: -2.5 to 2.5
         p2 = self.create_combatant("P2", 10.0, 0.0)
 
-        # Wall goes from (5,0) exactly at the center-line, extending north to (5,10)
-        # The direct center-to-center path from (0,0) to (10,0) hits the corner exactly at (5,0).
-        # However, P1's southern corners (-2.5, -2.5) and (2.5, -2.5) have a clear unbroken line to P2.
-        corner_wall = Wall(start=(5.0, 0.0), end=(5.0, 10.0), is_solid=True, is_visible=True)
+        # Wall at x=3, y=[0, 2]: blocks exactly 3 rays = Three-Quarters, LoS still True (REQ-GEO-013)
+        corner_wall = Wall(start=(3.0, 0.0), end=(3.0, 2.0), is_solid=True, is_visible=True)
         spatial_service.add_wall(corner_wall)
 
-        # P1 can see P2 by looking "around" the bottom of the corner
+        # P1 can see P2 by looking "around" the wall's edge
         self.assertTrue(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
 
-        # If we extend the wall south to cover P1's entire bounding box, LoS is finally broken.
+        # Three-Quarters cover: exactly 3 of 16 rays blocked (REQ-GEO-013)
+        _, cover = spatial_service.get_distance_and_cover(p1.entity_uuid, p2.entity_uuid)
+        self.assertEqual(cover, "Three-Quarters")
+
+        # If we extend the wall to block all 16 rays, LoS is broken and cover is Total (REQ-GEO-013)
         spatial_service.remove_wall(corner_wall.wall_id)
-        extended_wall = Wall(start=(5.0, -5.0), end=(5.0, 10.0), is_solid=True, is_visible=True)
+        extended_wall = Wall(start=(3.0, -5.0), end=(3.0, 3.0), is_solid=True, is_visible=True)
         spatial_service.add_wall(extended_wall)
 
         self.assertFalse(spatial_service.has_line_of_sight(p1.entity_uuid, p2.entity_uuid))
+        _, cover2 = spatial_service.get_distance_and_cover(p1.entity_uuid, p2.entity_uuid)
+        self.assertEqual(cover2, "Total")
 
     def test_breaking_walls(self):
         """Test physically breaking an obstacle removes it from the spatial map."""

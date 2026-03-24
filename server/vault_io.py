@@ -377,6 +377,8 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
             movement_remaining=int(yaml_data.get("movement_remaining", yaml_data.get("speed", 30))),
             wild_shape_hp=int(yaml_data.get("wild_shape_hp", 0)),
             wild_shape_max_hp=int(yaml_data.get("wild_shape_max_hp", 0)),
+            polymorph_hp=int(yaml_data.get("polymorph_hp", 0)),
+            polymorph_max_hp=int(yaml_data.get("polymorph_max_hp", 0)),
             death_saves_successes=int(yaml_data.get("death_saves_successes", 0)),
             death_saves_failures=int(yaml_data.get("death_saves_failures", 0)),
             exhaustion_level=int(yaml_data.get("exhaustion_level", 0)),
@@ -613,6 +615,8 @@ async def sync_engine_to_vault(vault_path: str):
             yaml_data["movement_remaining"] = entity.movement_remaining
             yaml_data["wild_shape_hp"] = entity.wild_shape_hp
             yaml_data["wild_shape_max_hp"] = entity.wild_shape_max_hp
+            yaml_data["polymorph_hp"] = entity.polymorph_hp
+            yaml_data["polymorph_max_hp"] = entity.polymorph_max_hp
             yaml_data["death_saves_successes"] = entity.death_saves_successes
             yaml_data["death_saves_failures"] = entity.death_saves_failures
             yaml_data["exhaustion_level"] = entity.exhaustion_level

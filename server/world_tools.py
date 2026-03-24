@@ -1310,6 +1310,329 @@ async def calculate_carrying_capacity(
     return "\n".join(lines)
 
 
+# === REQ-ECO-002/003/004: Economy Tools ===
+from rules_engine import gold_to_cp as _gold_to_cp, cp_to_gold as _cp_to_gold
+
+# Lifestyle expense table (GP per day)
+_LIFESTYLE_EXPENSES = {
+    "squalid": 1,      # 1 gp/day
+    "poor": 2,         # 2 gp/day
+    "modest": 10,      # 10 gp/day
+    "comfortable": 20, # 20 gp/day
+    "wealthy": 40,     # 40 gp/day
+    "aristocratic": 100, # 100 gp/day
+}
+
+
+@tool
+async def sell_item(
+    item_name: str,
+    item_type: str,
+    base_cost_cp: int,
+    is_damaged: bool = False,
+    is_trade_good: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-ECO-002/003: Calculate the sale price of an item.
+
+    - Mundane equipment (weapons, armor, adventuring gear): undamaged sells for 50% of base cost.
+    - Trade goods (wheat, gold bars, livestock): always sell for 100% of base cost.
+    - Damaged items: 50% of base cost (same formula, no bonus).
+
+    Use `is_trade_good=True` for trade goods to bypass the 50% rule.
+    Returns the sale price in CP and a human-readable breakdown.
+    """
+    if base_cost_cp < 0:
+        return f"SYSTEM ERROR: base_cost_cp cannot be negative."
+
+    if is_trade_good:
+        # REQ-ECO-003: Trade goods sell at 100%
+        sale_price = base_cost_cp
+        formula = "100% (trade goods)"
+    elif is_damaged:
+        # Damaged items still sell at 50%
+        sale_price = base_cost_cp // 2
+        formula = "50% (damaged)"
+    else:
+        # REQ-ECO-002: Undamaged mundane equipment sells at 50%
+        sale_price = base_cost_cp // 2
+        formula = "50% (undamaged mundane)"
+
+    gp_sale = sale_price // 100
+    cp_remainder = sale_price % 100
+    gp_base = base_cost_cp // 100
+    cp_base = base_cost_cp % 100
+
+    return (
+        f"Sale Price (REQ-ECO-002/003): '{item_name}' ({item_type}).\n"
+        f"  Base cost: {gp_base} gp {cp_base} cp.\n"
+        f"  Condition: {'Damaged' if is_damaged else 'Undamaged'}{' (Trade Good)' if is_trade_good else ''}.\n"
+        f"  Formula: {formula}.\n"
+        f"  Sale price: **{gp_sale} gp {cp_remainder} cp** ({sale_price} cp).\n"
+        f"  (If you want to actually remove the item from inventory, do so manually.)"
+    )
+
+
+@tool
+async def deduct_lifestyle_expense(
+    character_name: str,
+    lifestyle: str,
+    days: int = 1,
+    wallet_cp: int = 0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-ECO-004: Deduct lifestyle expenses from a character's wallet.
+
+    Lifestyle tiers (2024 PHB Ch. 6), cost in GP per day:
+      Squalid=1, Poor=2, Modest=10, Comfortable=20, Wealthy=40, Aristocratic=100.
+
+    The expense is deducted from the wallet_cp value provided.
+    Returns the remaining wallet CP after deduction.
+    """
+    lifestyle_key = lifestyle.lower().strip()
+    if lifestyle_key not in _LIFESTYLE_EXPENSES:
+        valid = ", ".join(_LIFESTYLE_EXPENSES.keys())
+        return f"SYSTEM ERROR: Unknown lifestyle '{lifestyle}'. Valid: {valid}."
+
+    if days <= 0:
+        return f"SYSTEM ERROR: days must be a positive integer."
+
+    daily_cost_gp = _LIFESTYLE_EXPENSES[lifestyle_key]
+    total_cost_gp = daily_cost_gp * days
+    total_cost_cp = total_cost_gp * 100
+
+    if wallet_cp < total_cost_cp:
+        remaining = 0
+        shortfall_cp = total_cost_cp - wallet_cp
+        shortfall_gp = shortfall_cp // 100
+        return (
+            f"Lifestyle Expense (REQ-ECO-004): {character_name} lives a **{lifestyle_key}** lifestyle "
+            f"for {days} day(s).\n"
+            f"  Cost: {total_cost_gp} gp ({total_cost_cp} cp).\n"
+            f"  Wallet: {wallet_cp // 100} gp {wallet_cp % 100} cp.\n"
+            f"  ⚠ INSUFFICIENT FUNDS! Cannot afford the lifestyle.\n"
+            f"  Shortfall: {shortfall_gp} gp {shortfall_cp % 100} cp.\n"
+            f"  Remaining wallet: {remaining // 100} gp {remaining % 100} cp."
+        )
+
+    remaining_cp = wallet_cp - total_cost_cp
+    return (
+        f"Lifestyle Expense (REQ-ECO-004): {character_name} lives a **{lifestyle_key}** lifestyle "
+        f"for {days} day(s).\n"
+        f"  Cost: {total_cost_gp} gp ({total_cost_cp} cp).\n"
+        f"  Wallet before: {wallet_cp // 100} gp {wallet_cp % 100} cp.\n"
+        f"  Remaining wallet: **{remaining_cp // 100} gp {remaining_cp % 100} cp** ({remaining_cp} cp)."
+    )
+
+
+# === REQ-CRF-001/002/003/004/005: Crafting Tools ===
+_CRAFTER_FEAT_NAME = "crafter"
+_HERBALISM_KIT_NAME = "herbalism kit"
+_ARCANA_PROFICIENCY = "arcana"
+
+# Crafting progress per 8-hour day (GP of progress)
+_DAILY_CRAFT_PROGRESS = 50
+
+
+@tool
+async def check_craft_prerequisites(
+    item_name: str,
+    item_base_cost_cp: int,
+    required_tool: str,
+    character_has_tool_proficiency: bool,
+    character_wallet_cp: int,
+    has_crafter_feat: bool = False,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-CRF-001: Check if a character can begin crafting an item.
+
+    Prerequisites: proficiency with the required Artisan's Tools + materials cost (50% of item base cost).
+    If the character has the Crafter feat (2024), the material cost is reduced by 20%.
+
+    Returns a detailed breakdown of whether crafting can begin.
+    """
+    if item_base_cost_cp < 0:
+        return f"SYSTEM ERROR: item_base_cost_cp cannot be negative."
+
+    material_cost_cp = item_base_cost_cp // 2  # Raw materials = 50% of base cost
+
+    if has_crafter_feat:
+        # REQ-CRF-003: Crafter feat gives 20% discount on non-magical item materials
+        material_cost_cp = int(material_cost_cp * 0.8)
+
+    has_materials = character_wallet_cp >= material_cost_cp
+
+    lines = [
+        f"Crafting Prerequisites (REQ-CRF-001/003): '{item_name}'",
+        f"  Base item cost: {item_base_cost_cp // 100} gp {item_base_cost_cp % 100} cp.",
+        f"  Required tool: {required_tool}.",
+        f"  Tool proficiency: {'Yes' if character_has_tool_proficiency else 'No ✗'}.",
+        f"  Material cost (50% of base, -20% Crafter feat): {material_cost_cp // 100} gp {material_cost_cp % 100} cp.",
+        f"  Character wallet: {character_wallet_cp // 100} gp {character_wallet_cp % 100} cp.",
+        f"  Materials available: {'Yes' if has_materials else 'No ✗'}.",
+    ]
+
+    if not character_has_tool_proficiency:
+        lines.append(f"  Result: ❌ CANNOT CRAFT — lacks proficiency with {required_tool}.")
+    elif not has_materials:
+        lines.append(f"  Result: ❌ CANNOT CRAFT — insufficient funds for materials.")
+        shortfall = material_cost_cp - character_wallet_cp
+        lines.append(f"  Shortfall: {shortfall // 100} gp {shortfall % 100} cp.")
+    else:
+        lines.append(f"  Result: ✅ CAN BEGIN CRAFTING.")
+        if has_crafter_feat:
+            lines.append(f"  Note: Crafter feat reduces material cost by 20%.")
+
+    return "\n".join(lines)
+
+
+@tool
+async def calculate_crafting_time(
+    item_name: str,
+    item_base_cost_cp: int,
+    num_crafters: int = 1,
+    has_crafter_feat: bool = False,
+    is_herbalism_kit_potion: bool = False,
+    potion_rarity: str = "common",
+    spell_level: int = 0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-CRF-002/003/004/005: Calculate crafting time for an item.
+
+    Mundane items: progress = 50 GP per 8-hour day × number of proficient crafters.
+    If Crafter feat: time × 0.8 (20% faster).
+
+    Potion of Healing (REQ-CRF-004): fixed time per rarity:
+      Common=1 day, Uncommon=3 days, Rare=7 days, Very Rare=21 days, Legendary=63 days.
+      Requires Herbalism Kit proficiency.
+
+    Spell Scrolls (REQ-CRF-005): time scales with spell level.
+    """
+    rarity_days = {
+        "common": 1, "uncommon": 3, "rare": 7,
+        "very rare": 21, "legendary": 63,
+    }
+
+    if is_herbalism_kit_potion:
+        rarity_key = potion_rarity.lower()
+        if rarity_key not in rarity_days:
+            return f"SYSTEM ERROR: Unknown potion rarity '{potion_rarity}'. Valid: {', '.join(rarity_days.keys())}."
+        days = rarity_days[rarity_key]
+        if has_crafter_feat:
+            days = max(1, int(days * 0.8))
+        return (
+            f"Crafting Time (REQ-CRF-004): {potion_rarity.capitalize()} Potion of Healing.\n"
+            f"  Requires: Herbalism Kit proficiency.\n"
+            f"  Crafting time: {days} day(s).\n"
+            f"  (Per 2024 DMG, potions require 1 day per rarity tier with Herbalism Kit.)"
+        )
+
+    if spell_level > 0:
+        # REQ-CRF-005: Spell scrolls — time = 50 GP ÷ (8 gp/day at 1st level) × spell level multiplier
+        # Base: 50 gp/day at level 1 → 1 day per 50 gp of scroll base cost
+        # Higher levels take proportionally longer
+        scroll_base_cp = item_base_cost_cp
+        daily_gp_progress = _DAILY_CRAFT_PROGRESS
+        if has_crafter_feat:
+            daily_gp_progress = int(daily_gp_progress * 1.25)  # 20% faster means 25% more gp progress
+
+        days = (scroll_base_cp / 100) / daily_gp_progress
+        import math
+        days = math.ceil(days)
+        if has_crafter_feat:
+            days = max(1, int(days * 0.8))
+
+        return (
+            f"Crafting Time (REQ-CRF-005): Spell Scroll (Level {spell_level}).\n"
+            f"  Scroll base cost: {scroll_base_cp // 100} gp {scroll_base_cp % 100} cp.\n"
+            f"  Crafters: {num_crafters}.\n"
+            f"  Progress per crafter: {daily_gp_progress} gp/day.\n"
+            f"  Crafting time: ~{days} day(s) of 8-hour work.\n"
+            f"  (REQ-CRF-005: Time scales exponentially with spell level.)"
+        )
+
+    # REQ-CRF-002: Mundane items — 50 GP per crafter per 8-hour day
+    item_gp = item_base_cost_cp / 100
+    daily_progress_per_crafter = _DAILY_CRAFT_PROGRESS
+    if has_crafter_feat:
+        daily_progress_per_crafter = int(daily_progress_per_crafter * 1.25)  # 20% faster crafting = 25% more gp progress
+
+    total_daily_progress = daily_progress_per_crafter * num_crafters
+    import math
+    days = math.ceil(item_gp / total_daily_progress)
+
+    if has_crafter_feat:
+        days = max(1, int(days * 0.8))
+
+    return (
+        f"Crafting Time (REQ-CRF-002/003): '{item_name}'.\n"
+        f"  Item base cost: {item_gp:.0f} gp.\n"
+        f"  Progress per day: {total_daily_progress} gp (50 gp x {num_crafters} crafter(s) x {'1.25 (Crafter feat)' if has_crafter_feat else '1'}).\n"
+        f"  Crafting time: **{days}** 8-hour workday(s).\n"
+        f"  Total gp crafted per day: {total_daily_progress} gp."
+    )
+
+
+@tool
+async def record_crafting_progress(
+    item_name: str,
+    item_base_cost_cp: int,
+    days_worked: int,
+    num_crafters: int = 1,
+    has_crafter_feat: bool = False,
+    prior_progress_cp: int = 0,
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """REQ-CRF-002: Record crafting progress for downtime crafting.
+
+    Each 8-hour workday of crafting produces 50 GP worth of progress per proficient crafter.
+    Crafter feat: 20% faster (effectively 50 × 1.25 = 62.5 gp progress per day).
+
+    When cumulative progress >= item_base_cost_cp, the item is complete.
+
+    Returns the new progress total and whether the item is finished.
+    """
+    if days_worked <= 0:
+        return f"SYSTEM ERROR: days_worked must be a positive integer."
+    if prior_progress_cp < 0:
+        return f"SYSTEM ERROR: prior_progress_cp cannot be negative."
+
+    daily_progress_per_crafter = _DAILY_CRAFT_PROGRESS
+    if has_crafter_feat:
+        daily_progress_per_crafter = int(daily_progress_per_crafter * 1.25)
+
+    daily_total = daily_progress_per_crafter * num_crafters
+    # _DAILY_CRAFT_PROGRESS is in GP/day; convert to CP for storage
+    new_progress_cp = prior_progress_cp + int(daily_total * days_worked * 100)
+    gp_remaining = (item_base_cost_cp - new_progress_cp) / 100
+    item_gp_float = item_base_cost_cp / 100
+
+    lines = [
+        f"Crafting Progress (REQ-CRF-002): '{item_name}'.",
+        f"  Item base cost: {item_base_cost_cp // 100} gp {item_base_cost_cp % 100} cp.",
+        f"  Progress before: {prior_progress_cp // 100} gp {prior_progress_cp % 100} cp.",
+        f"  Days worked: {days_worked} x {num_crafters} crafter(s) = {daily_total * days_worked} gp progress.",
+        f"  New progress: {new_progress_cp // 100} gp {new_progress_cp % 100} cp.",
+    ]
+
+    if new_progress_cp >= item_base_cost_cp:
+        lines.append(f"  Status: ✅ COMPLETE! Item '{item_name}' is finished.")
+        if new_progress_cp > item_base_cost_cp:
+            excess = new_progress_cp - item_base_cost_cp
+            lines.append(f"  Note: {excess // 100} gp {excess % 100} cp of excess progress (discarded).")
+    else:
+        lines.append(f"  Status: ⏳ IN PROGRESS. {gp_remaining:.0f} gp remaining.")
+        pct = (new_progress_cp * 100) / item_base_cost_cp
+        lines.append(f"  Completion: {pct:.1f}%.")
+
+    return "\n".join(lines)
+
+
 __all__ = [
     "roll_generic_dice",
     "search_vault_by_tag",
@@ -1329,4 +1652,9 @@ __all__ = [
     "build_encounter",
     "distribute_encounter_xp",
     "calculate_carrying_capacity",
+    "sell_item",
+    "deduct_lifestyle_expense",
+    "check_craft_prerequisites",
+    "calculate_crafting_time",
+    "record_crafting_progress",
 ]

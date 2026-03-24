@@ -268,6 +268,14 @@ async def update_combat_state(  # noqa: C901
                     new_turn_ent.reaction_used = False
                     new_turn_ent.legendary_actions_current = new_turn_ent.legendary_actions_max
                     new_turn_ent.movement_remaining = max(0, new_turn_ent.speed - (new_turn_ent.exhaustion_level * 5))
+                    # REQ-PET-006: Reset companion command flag at start of ranger's turn
+                    if getattr(new_turn_ent, "companion_commanded_this_turn", False):
+                        new_turn_ent.companion_commanded_this_turn = False
+                    # Also reset the companion's command flag if the new turn entity IS the companion
+                    for ent_uuid in spatial_service._entities.get(vault_path, {}):
+                        ent = spatial_service._entities[vault_path][ent_uuid]
+                        if isinstance(ent, Creature) and getattr(ent, "companion_of_uuid", None) == new_turn_ent.entity_uuid:
+                            ent.companion_commanded_this_turn = False
                 new_turn_ent.spell_slots_expended_this_turn = 0
 
                 sot_event = GameEvent(

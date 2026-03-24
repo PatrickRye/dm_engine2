@@ -72,17 +72,17 @@ def test_spatial_line_of_sight_and_cover():
     spatial_service.sync_entity(attacker)
     spatial_service.sync_entity(target)
 
-    # Create a wall that blocks exactly half the target (Y from 0 to 5)
-    wall = Wall(start=(5, 0), end=(5, 5), z=0, height=10, is_solid=True)
+    # Wall at x=3, y=[0, 2]: blocks exactly 3 of 16 rays = Three-Quarters (REQ-GEO-013)
+    wall = Wall(start=(3, 0), end=(3, 2), z=0, height=10, is_solid=True)
     spatial_service.add_wall(wall)
 
     dist, cover = spatial_service.get_distance_and_cover(attacker.entity_uuid, target.entity_uuid)
-    assert cover == "Half"  # Partial blockage yields Half cover
+    assert cover == "Three-Quarters", f"Expected Three-Quarters but got {cover}"  # 3 rays blocked (REQ-GEO-013)
 
-    # Extend wall to block entirely
+    # Extend wall to block all 16 rays = Total cover
     spatial_service.remove_wall(wall.wall_id)
-    wall.start = (5, 5)
-    wall.end = (5, -5)  # Now perfectly spans Y: 5 to -5, completely covering the 5x5 bounding box
+    wall.start = (3, -5)
+    wall.end = (3, 3)  # Now spans y=-5..3, blocking all rays
     spatial_service.add_wall(wall)
     dist, cover = spatial_service.get_distance_and_cover(attacker.entity_uuid, target.entity_uuid)
     assert cover == "Total"
