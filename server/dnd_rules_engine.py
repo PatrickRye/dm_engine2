@@ -191,20 +191,25 @@ class DamageCondition(BaseModel):
 
 
 class ConditionalDamageWeapon(MagicWeaponDecorator):
-    """A decorator that deals extra damage based on target properties."""
+    """
+    A decorator that deals extra damage based on target properties.
+
+    Uses model_post_init (Pydantic v2 hook) for the side-effect of subscribing
+    to EventBus, rather than overriding __init__ which fights Pydantic's init
+    machinery (model_copy, model_validate, etc.).
+    """
 
     conditions: List[DamageCondition]
     # Class-level flag: shared across all instances. Reset in tests to force re-subscription.
     _subscribed: bool = False
 
-    def __init__(self, *, weapon: Weapon, **data):
-        super().__init__(weapon=weapon, **data)
-        # Subscribe once globally (not per-instance).
-        # EventBus.subscribe deduplicates by handler identity, so re-subscription is safe.
-        with _CDW_LOCK:
-            if not ConditionalDamageWeapon._subscribed:
-                EventBus.subscribe("MeleeAttack", self.handle_attack, priority=50)
-                ConditionalDamageWeapon._subscribed = True
+    def model_post_init(self, __context) -> None:
+        """Pydantic v2 hook — called after the model is fully initialized."""
+        if not ConditionalDamageWeapon._subscribed:
+            with _CDW_LOCK:
+                if not ConditionalDamageWeapon._subscribed:
+                    EventBus.subscribe("MeleeAttack", self.handle_attack, priority=50)
+                    ConditionalDamageWeapon._subscribed = True
 
     def handle_attack(self, event: "GameEvent"):
         # This handler should run before the main resolve_attack_handler
@@ -366,44 +371,77 @@ class EventBus:
     (dispatch -> _notify -> handler -> dispatch) never deadlock. The lock also
     allows concurrent dispatches from different threads (via asyncio.to_thread)
     to safely coexist since they each acquire the lock independently.
+
+    Per-vault routing: handlers are scoped to a vault_path. When dispatch() is called,
+    only handlers registered to event.vault_path are notified. This prevents events
+    in one campaign vault from triggering handlers registered by another vault.
     """
 
-    _listeners: ClassVar[Dict[str, List[Tuple[Callable, int]]]] = {}
+    # { vault_path: { event_type: [ (handler, priority) ] } }
+    _listeners: ClassVar[Dict[str, Dict[str, List[Tuple[Callable, int]]]]] = {}
     _lock: ClassVar[threading.RLock] = threading.RLock()
 
     @classmethod
-    def subscribe(cls, event_type: str, handler: Callable, priority: int = 10):
+    def subscribe(
+        cls, event_type: str, handler: Callable, priority: int = 10, vault_path: str = "default"
+    ):
+        """
+        Register a handler for an event type within a specific vault.
+
+        The same handler+event_type combination is deduplicated within each vault.
+        A handler can be registered to multiple vaults independently if needed.
+        """
         with cls._lock:
-            if event_type not in cls._listeners:
-                cls._listeners[event_type] = []
-            # Deduplicate: skip if the same handler is already registered
-            if any(h == handler for h, _ in cls._listeners[event_type]):
+            if vault_path not in cls._listeners:
+                cls._listeners[vault_path] = {}
+            if event_type not in cls._listeners[vault_path]:
+                cls._listeners[vault_path][event_type] = []
+            # Deduplicate within this vault
+            if any(h == handler for h, _ in cls._listeners[vault_path][event_type]):
                 return
-            cls._listeners[event_type].append((handler, priority))
-            # Sort by priority, lowest number first
-            cls._listeners[event_type].sort(key=lambda x: x[1])
+            cls._listeners[vault_path][event_type].append((handler, priority))
+            cls._listeners[vault_path][event_type].sort(key=lambda x: x[1])
 
     @classmethod
     def dispatch(cls, event: GameEvent) -> GameEvent:
-        sys.stderr.write(f"[{threading.current_thread().name}] --- Event: {event.event_type} ---\n")
+        """
+        Dispatch an event to the handlers registered for event.vault_path.
 
-        # Acquire lock for the full dispatch cycle (handles reentrancy from
-        # handler -> dispatch calls within the same thread via RLock).
+        Vault isolation: only handlers registered for the event's vault_path are invoked.
+        Fallback to "default" vault: if the specific vault has no handlers for this
+        event_type, the "default" vault's handlers are used as a fallback. This lets
+        tools dispatch to arbitrary vault paths while still reaching globally-registered
+        handlers (e.g. from register_event_handlers called at module init time).
+        """
+        sys.stderr.write(
+            f"[{threading.current_thread().name}] --- Event: {event.event_type} (vault={event.vault_path}) ---\n"
+        )
+
+        vault_path = event.vault_path or "default"
         with cls._lock:
+            # Collect handlers from the specific vault, with fallback to "default"
+            vault_listeners = cls._listeners.get(vault_path, {})
+            default_listeners = cls._listeners.get("default", {})
+
+            # Per-vault handlers take priority; "default" handlers fill gaps
+            all_handlers = vault_listeners.get(event.event_type, [])
+            if not all_handlers and vault_path != "default":
+                all_handlers = default_listeners.get(event.event_type, [])
+
             event.status = EventStatus.PRE_EVENT
-            cls._notify(event)
+            cls._notify_handlers(all_handlers, event)
             if event.status == EventStatus.CANCELLED:
                 sys.stderr.write(f"[{threading.current_thread().name}] Event was CANCELLED during Pre-Event.\n")
                 return event
 
             event.status = EventStatus.EXECUTION
-            cls._notify(event)
+            cls._notify_handlers(all_handlers, event)
 
             event.status = EventStatus.POST_EVENT
-            cls._notify(event)
+            cls._notify_handlers(all_handlers, event)
 
             event.status = EventStatus.RESOLVED
-            cls._notify(event)
+            cls._notify_handlers(all_handlers, event)
             return event
 
     @classmethod
@@ -413,16 +451,47 @@ class EventBus:
         return await asyncio.to_thread(cls.dispatch, event)
 
     @classmethod
-    def _notify(cls, event: GameEvent):
-        # Called while holding _lock — safe even when handlers synchronously re-dispatch.
-        for handler, _ in cls._listeners.get(event.event_type, []):
+    def _notify_handlers(cls, handlers: List[Tuple[Callable, int]], event: GameEvent):
+        """Notify registered handlers. Called while holding _lock."""
+        for handler, _ in handlers:
             handler(event)
 
     @classmethod
-    def clear_listeners(cls) -> None:
-        """Thread-safe clear of all listeners. Use instead of direct _listeners.clear()."""
+    def _notify(cls, event: GameEvent):
+        """
+        Backward-compatible direct notify.
+
+        Notifies handlers for event.event_type *at whatever phase the event's
+        status is already set to*, bypassing the normal PRE→EXEC→POST→RESOLVED
+        phase sequence of dispatch().
+
+        Tests use this to jump straight to POST_EVENT (event.status=3) so that
+        apply_damage_handler runs without re-running attack resolution.
+
+        Uses per-vault + "default" fallback routing.
+        """
+        vault_path = event.vault_path or "default"
         with cls._lock:
-            cls._listeners.clear()
+            vault_listeners = cls._listeners.get(vault_path, {})
+            default_listeners = cls._listeners.get("default", {})
+            handlers = vault_listeners.get(event.event_type, [])
+            if not handlers and vault_path != "default":
+                handlers = default_listeners.get(event.event_type, [])
+            cls._notify_handlers(handlers, event)
+
+    @classmethod
+    def clear_listeners(cls, vault_path: Optional[str] = None) -> None:
+        """
+        Thread-safe clear of listeners.
+
+        - clear_listeners()           → clear all vaults (backward compat, used by tests)
+        - clear_listeners("my_vault")  → clear only that vault's listeners
+        """
+        with cls._lock:
+            if vault_path is None:
+                cls._listeners.clear()
+            elif vault_path in cls._listeners:
+                del cls._listeners[vault_path]
 
 
 # ==========================================

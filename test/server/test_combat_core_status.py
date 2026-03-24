@@ -119,9 +119,9 @@ async def test_req_act_003_simultaneous_effects_priority(mock_obsidian_vault):
     def handler_high_priority(event):
         execution_order.append("High")
 
-    EventBus._listeners["TestEvent"] = []
-    EventBus.subscribe("TestEvent", handler_low_priority, priority=100)
-    EventBus.subscribe("TestEvent", handler_high_priority, priority=10)
+    EventBus.clear_listeners(vault_path)
+    EventBus.subscribe("TestEvent", handler_low_priority, priority=100, vault_path=vault_path)
+    EventBus.subscribe("TestEvent", handler_high_priority, priority=10, vault_path=vault_path)
 
     event = GameEvent(event_type="TestEvent", source_uuid=uuid.uuid4(), vault_path=vault_path)
     EventBus.dispatch(event)

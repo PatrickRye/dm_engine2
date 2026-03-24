@@ -491,16 +491,8 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         draft = response.content
 
         # HARD GUARDRAILS: Validate draft against Knowledge Graph before QA
-        from hard_guardrails import HardGuardrails
-        from storylet import GraphMutation
-
-        guardrails = HardGuardrails(kg)
-        # Note: pending_mutations are re-validated here (redundant but harmless) and
-        # then executed by the commit block above AFTER approval.
-        pending = list(state.get("pending_mutations", []))
-        mutations = [GraphMutation(**m) for m in pending] if pending else []
         ctx = {"vault_path": vault_path, "active_character": state.get("active_character", "Unknown")}
-        guard_result = guardrails.validate_full_pipeline(draft, mutations, ctx)
+        guardrails, guard_result = _mutation_manager.validate(state, draft, kg, ctx)
 
         if not guard_result.allowed:
             await write_audit_log(
@@ -514,6 +506,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                 if guard_result.required_revisions
                 else "Rewrite the narrative to address the violations above."
             )
+            _mutation_manager.clear(state)
             return {
                 "qa_feedback": (
                     f"[HARD GUARDRAIL REJECTED]: {guard_result.reason}\n\n"
@@ -521,31 +514,14 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     f"Your draft: {draft}"
                 ),
                 "revision_count": state.get("revision_count", 0) + 1,
-                "pending_mutations": [],
             }
 
-        # Gap 6 fix (structural): Mutations are NOT executed here anymore.
-        # The checkpointer saves state after each node, so committing mutations BEFORE
-        # QA approval means a rejected narrative's mutations are already in the KG
-        # and checkpointed. The proper fix is to defer commits to a post-QA node.
-        #
-        # Mutations stay in pending_mutations until commit_node (after QA approval).
-        # Hard guardrails still validate here to catch violations early.
-        pending = list(state.get("pending_mutations", []))
-        mutation_errors: List[str] = []
-
-        # Snapshot the KG state before QA approval so we have a clean rollback
-        # reference. This is now a "pre-QA" snapshot — if QA rejects, we restore it.
-        kg_snapshot = kg.model_dump()
+        # Snapshot KG state before QA — if QA rejects, we restore from this snapshot.
+        _mutation_manager.snapshot(state, kg)
 
         # Preserve qa_feedback="COMMIT" if already set (commit_node will execute mutations).
-        # Without this, the state merge would clear qa_feedback to "", causing qa_router
-        # to route back to narrator instead of to commit, creating an infinite loop.
-        return_dict = {
+        return_dict: Dict[str, Any] = {
             "draft_response": draft,
-            "pending_mutations": pending,
-            "kg_snapshot": kg_snapshot,
-            "mutation_errors": mutation_errors,
         }
         if state.get("qa_feedback") == "COMMIT":
             return_dict["qa_feedback"] = "COMMIT"
@@ -590,49 +566,52 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         # or if the draft implies world changes without mutations.
         # Skip this check when the next rejection would hit MAX_QA_REVISIONS (force-commit
         # will execute mutations anyway, so let them through to commit_node).
-        pending_mutations = list(state.get("pending_mutations", []))
-        leak_msg = _mutation_manager.detect_leak(pending_mutations, revisions)
+        leak_msg = _mutation_manager.detect_leak(state, revisions)
         if leak_msg:
+            pending_count = len(state.get("pending_mutations", []))
             await write_audit_log(
                 vault, "QA Agent", "Mutation Leak Detected",
-                f"{len(pending_mutations)} mutations leaked into QA without execution. Rejecting."
+                f"{pending_count} mutations leaked into QA without execution. Rejecting."
             )
+            # Signal rejection — rollback happens in the single reject path below
             return {
                 "qa_feedback": leak_msg,
                 "revision_count": revisions + 1,
-                "pending_mutations": [],
             }
 
         # Cross-check 2: mutation_errors — if mutations failed during narrator execution,
         # QA must reject because the KG may be in an inconsistent state
-        if mutation_errors:
+        errors = state.get("mutation_errors", [])
+        if errors:
             await write_audit_log(
                 vault, "QA Agent", "Mutation Errors Detected",
-                f"Errors during mutation execution: {'; '.join(mutation_errors)}. Rejecting."
+                f"Errors during mutation execution: {'; '.join(errors)}. Rejecting."
             )
+            # Signal rejection — rollback happens in the single reject path below
             return {
                 "qa_feedback": (
                     f"[MUTATION EXECUTION ERROR]: The following errors occurred while "
                     "committing world-state changes. The narrative cannot be approved until "
                     "the engine state is consistent:\n"
-                    + "\n".join(f"  - {e}" for e in mutation_errors)
+                    + "\n".join(f"  - {e}" for e in errors)
                 ),
                 "revision_count": revisions + 1,
-                "pending_mutations": [],
             }
 
         # Cross-check 3: Re-validate SVO claims in QA (independent backstop)
-        if draft and pending_mutations:
+        pending = state.get("pending_mutations", [])
+        if draft and pending:
             from storylet import GraphMutation
 
-            guardrails, _ = _mutation_manager.validate_pending(
-                pending_mutations, draft, kg,
+            guardrails, _ = _mutation_manager.validate(
+                state, draft, kg,
                 {"vault_path": vault, "active_character": state.get("active_character", "Unknown")}
             )
-            mutations = [GraphMutation(**m) for m in pending_mutations]
+            mutations = [GraphMutation(**m) for m in pending]
             svo_result = guardrails.validate_svo_claims(draft, mutations, {})
             if not svo_result.allowed:
                 await write_audit_log(vault, "QA Agent", "SVO Claim Rejected (QA backstop)", svo_result.reason)
+                # Signal rejection — rollback happens in the single reject path below
                 return {
                     "qa_feedback": (
                         f"[QA SVO BACKSTOP REJECTED]: {svo_result.reason}\n\n"
@@ -769,8 +748,9 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
 
             rejection_msg = result.feedback
             if rollback_performed:
+                pending_count = len(state.get("pending_mutations", []))
                 rejection_msg = (
-                    f"[KG ROLLED BACK — {len(pending_mutations)} speculative mutations discarded]\n\n"
+                    f"[KG ROLLED BACK — {pending_count} speculative mutations discarded]\n\n"
                     + rejection_msg
                 )
 
@@ -788,14 +768,14 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                     },
                 },
             )
+            # Clear pending_mutations so they cannot reach commit_node on the
+            # force-commit cycle. This also breaks the "mutation leak" self-loop:
+            # leaked mutations are discarded on first rejection, preventing them
+            # from surviving into the force-commit path.
             return {
                 "qa_feedback": rejection_msg,
                 "revision_count": revisions + 1,
-                # Clear pending_mutations so the retry loop doesn't re-trigger the mutation
-                # leak check. The pending_mutations were validated by narrator's HardGuardrails
-                # but not committed — on retry, narrator will re-validate and re-capture them.
                 "pending_mutations": [],
-                "mutation_errors": [],
             }
 
     # ------------------------------------------------------------------
@@ -882,17 +862,16 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
                 vault_path, "DramaManager", "Storylet Activated", selected.name
             )
 
-            existing = list(state.get("pending_mutations", []))
-            pending = _mutation_manager.accumulate_from_storylet_effects(
-                existing, selected, vault_path
+            has_mutations = _mutation_manager.accumulate_from_storylet_effects(
+                state, selected, vault_path
             )
 
-            result = {
+            result: Dict[str, Any] = {
                 "active_storylet_id": str(selected.id),
                 "tension_arc": dm.arc.to_dict(),
             }
-            if pending:
-                result["pending_mutations"] = pending
+            if has_mutations:
+                result["pending_mutations"] = state["pending_mutations"]
             return result
 
         return {
@@ -1065,10 +1044,8 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             "messages": [tool_msg],
         }
         if mutation_data:
-            existing = list(state.get("pending_mutations", []))
-            updates["pending_mutations"] = _mutation_manager.accumulate_from_tool_calls(
-                existing, mutation_data
-            )
+            _mutation_manager.accumulate_from_tool_calls(state, mutation_data)
+            updates["pending_mutations"] = state["pending_mutations"]
 
         return updates
 
@@ -1098,6 +1075,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         # Detect new player turn: HumanMessage means a fresh turn started.
         # Clear any stale pending_mutations from a QA-rejected previous turn.
         if _mutation_manager.should_clear_on_human_message(state):
+            _mutation_manager.clear(state)
             updates["pending_mutations"] = []
             await write_audit_log(
                 state.get("vault_path", "default"),
@@ -1221,25 +1199,20 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
 
         vault_path = state.get("vault_path", "default")
         kg = get_knowledge_graph(vault_path)
-        pending = list(state.get("pending_mutations", []))
         narrative_context = state.get("draft_response", "")
 
-        if pending:
-            mutation_errors, _ = await _mutation_manager.execute_pending(
-                pending, kg, vault_path, draft_llm, narrative_context
-            )
-        else:
-            mutation_errors = []
+        errors = await _mutation_manager.commit(state, kg, vault_path, draft_llm)
 
         await write_audit_log(
             vault_path, "CommitNode", "Turn Complete",
-            f"Draft approved. {len(pending)} mutations committed. Errors: {len(mutation_errors)}"
+            f"Draft approved. Errors: {len(errors)}"
         )
 
         return {
             "qa_feedback": "APPROVED",
+            # Explicitly return cleared lists so LangGraph state merge picks them up
             "pending_mutations": [],
-            "mutation_errors": mutation_errors,
+            "mutation_errors": errors,
         }
 
     # ------------------------------------------------------------------
