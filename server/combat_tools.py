@@ -381,6 +381,17 @@ async def modify_health(
         if hp_change > 0 and current_hp <= 0:
             result_msg += f"\nSYSTEM ALERT: {target.name} is healed from 0 HP! They regain consciousness."
 
+    # Notify connected clients of state changes
+    try:
+        from main import push_state_change
+        push_state_change("entity_update", target.name, {
+            "hp": target.hp.base_value,
+            "max_hp": target.max_hp,
+            "conditions": [c.name for c in target.active_conditions],
+        })
+    except Exception:
+        pass  # Don't fail the tool if notification fails
+
     return result_msg
 
 
@@ -988,6 +999,17 @@ async def toggle_condition(  # noqa: C901
                 f"Constructs, undead, and creatures with Water Breathing or similar traits are immune — "
                 f"do NOT apply this condition to them."
             )
+
+    # Notify connected clients of condition changes
+    try:
+        from main import push_state_change
+        push_state_change("entity_update", character_name, {
+            "hp": getattr(engine_creature, "hp", None) and engine_creature.hp.base_value,
+            "max_hp": getattr(engine_creature, "max_hp", 0),
+            "conditions": [c.name for c in getattr(engine_creature, "active_conditions", [])],
+        })
+    except Exception:
+        pass  # Don't fail the tool if notification fails
 
     return result_msg
 

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -8,74 +9,92 @@
     <!-- Markdown Parser -->
     <script src="marked.min.js"></script>
 </head>
+
 <body>
-    <div id="app-container">
-        <!-- Top Control Bar -->
-        <div id="top-bar">
-            <div class="title-container">
-                <h2>DM Engine</h2>
-                <span id="status-indicator">🔴 Disconnected</span>
-            </div>
-            <div class="vault-container">
-                <input type="text" id="vault-path-input" placeholder="Absolute path to Obsidian Vault...">
-                <button id="connect-btn">Connect</button>
-            </div>
-            <label class="listen-toggle">
-                <input type="checkbox" id="listen-checkbox"> Listen to Broadcasts
-            </label>
+    <div id="app-container"
+        style="display: flex; height: 100vh; overflow: hidden; background-color: var(--background-primary);">
+        <!-- Sidebar -->
+        <div id="party-sidebar"
+            style="width: 250px; background: var(--background-secondary); border-right: 1px solid var(--background-modifier-border); padding: 15px; overflow-y: auto;">
+            <h3
+                style="margin-top: 0; padding-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border);">
+                Party</h3>
+            <div id="party-list" style="font-size: 0.9em; margin-top: 10px;">Waiting for connection...</div>
         </div>
 
-        <!-- Character Select -->
-        <div id="char-select-container">
-            <span>Connect to vault to load characters...</span>
-        </div>
-
-        <!-- Settings Panel -->
-        <div id="settings-wrapper">
-            <div id="settings-header">
-                <span id="settings-icon">▶</span> Player Roll Automations
+        <div id="main-area" style="flex: 1; display: flex; flex-direction: column; overflow: hidden;">
+            <!-- Top Control Bar -->
+            <div id="top-bar">
+                <div class="title-container">
+                    <h2>DM Engine</h2>
+                    <span id="status-indicator">🔴 Disconnected</span>
+                </div>
+                <div class="server-container">
+                    <div style="position: relative; display: inline-block;">
+                        <input type="text" id="server-url-input" placeholder="192.168.1.x:8000" style="width: 200px; padding-right: 20px;">
+                        <span id="server-dropdown-arrow" style="position: absolute; right: 6px; top: 50%; transform: translateY(-50%); pointer-events: none;">▼</span>
+                        <div id="server-dropdown" style="display: none; position: absolute; top: 100%; left: 0; right: 0; background: var(--background-secondary); border: 1px solid var(--background-modifier-border); border-radius: 4px; max-height: 200px; overflow-y: auto; z-index: 1000; min-width: 300px;"></div>
+                    </div>
+                    <button id="connect-btn">Connect</button>
+                </div>
             </div>
-            <div id="settings-content" style="display: none;">
-                <label class="setting-item">
-                    <span>Server URL:</span>
-                    <input type="text" id="server-url-input">
-                </label>
-                <label><input type="checkbox" id="auto-hidden" checked> Automate Hidden Rolls</label>
-                <label><input type="checkbox" id="auto-saves" checked> Automate Saving Throws</label>
-                <label><input type="checkbox" id="auto-skills" checked> Automate Skill Checks</label>
-                <label><input type="checkbox" id="auto-attacks" checked> Automate Attack Rolls</label>
+
+            <!-- Character Select -->
+            <div id="char-select-container">
+                <label style="font-size: 0.85em; margin-right: 8px;">Vault:</label>
+                <input type="text" id="vault-path-input" placeholder="C:\path\to\vault" style="width: 250px;">
             </div>
-        </div>
 
-        <!-- Tab Bar -->
-        <div id="tab-bar">
-            <button class="tab-btn active" data-target="view-chat">💬 Chat</button>
-            <button class="tab-btn" data-target="view-sheet">📜 Character Sheet</button>
-            <button class="tab-btn" data-target="view-maps">🗺️ Maps</button>
-        </div>
+            <!-- Settings Panel -->
+            <div id="settings-wrapper">
+                <div id="settings-header">
+                    <span id="settings-icon">▶</span> Player Roll Automations
+                </div>
+                <div id="settings-content" style="display: none;">
+                    <label><input type="checkbox" id="auto-hidden" checked> Automate Hidden Rolls</label>
+                    <label><input type="checkbox" id="auto-saves" checked> Automate Saving Throws</label>
+                    <label><input type="checkbox" id="auto-skills" checked> Automate Skill Checks</label>
+                    <label><input type="checkbox" id="auto-attacks" checked> Automate Attack Rolls</label>
+                </div>
+            </div>
 
-        <div id="views-container">
-            <!-- Chat View -->
-            <div id="view-chat" class="tab-view active">
-                <div id="chat-history">
-                    <div class="dm-message" style="opacity: 0.7; font-style: italic;">
-                        Welcome to the DM Engine. Please enter your vault path and connect above.
+            <!-- Tab Bar -->
+            <div id="tab-bar">
+                <button class="tab-btn active" data-target="view-chat">💬 Chat</button>
+                <button class="tab-btn" data-target="view-sheet">📜 Character Sheet</button>
+                <button class="tab-btn" data-target="view-maps">🗺️ Maps</button>
+            </div>
+
+            <div id="views-container">
+                <!-- Chat View -->
+                <div id="view-chat" class="tab-view active">
+                    <div id="chat-history">
+                        <div class="dm-message" style="opacity: 0.7; font-style: italic;">
+                            Welcome to the DM Engine. Please enter your vault path and connect above.
+                        </div>
+                    </div>
+                    <div id="input-container">
+                        <textarea id="chat-input" placeholder="What do you do? (Shift+Enter for new line)"
+                            disabled></textarea>
+                        <button id="send-btn" disabled>Send</button>
                     </div>
                 </div>
-                <div id="input-container">
-                    <textarea id="chat-input" placeholder="What do you do? (Shift+Enter for new line)" disabled></textarea>
-                    <button id="send-btn" disabled>Send</button>
+
+                <!-- Sheet View -->
+                <div id="view-sheet" class="tab-view">
+                    <div id="sheet-content">No character loaded.</div>
+                </div>
+
+                <!-- Maps View -->
+                <div id="view-maps" class="tab-view">
+                    <div id="maps-content">No maps available.</div>
                 </div>
             </div>
-
-            <!-- Sheet View -->
-            <div id="view-sheet" class="tab-view"><div id="sheet-content">No character loaded.</div></div>
-
-            <!-- Maps View -->
-            <div id="view-maps" class="tab-view"><div id="maps-content">No maps available.</div></div>
         </div>
     </div>
 
+    <script src="main.js"></script>
     <script src="app.js"></script>
 </body>
+
 </html>

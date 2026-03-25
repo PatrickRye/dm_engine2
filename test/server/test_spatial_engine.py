@@ -244,6 +244,35 @@ class TestSpatialEngine(unittest.TestCase):
         _, cover2 = spatial_service.get_distance_and_cover(p1.entity_uuid, p2.entity_uuid)
         self.assertEqual(cover2, "Total")
 
+    def test_has_line_of_sight_to_point(self):
+        """Test has_line_of_sight_to_point - used by the /visibility endpoint."""
+        p1 = self.create_combatant("P1", 0.0, 0.0)
+
+        # No walls - should see point
+        self.assertTrue(spatial_service.has_line_of_sight_to_point(p1.entity_uuid, 20.0, 0.0, 0.0))
+
+        # Wall blocks the path
+        wall = Wall(start=(10.0, -10.0), end=(10.0, 10.0))
+        spatial_service.add_wall(wall)
+        self.assertFalse(spatial_service.has_line_of_sight_to_point(p1.entity_uuid, 20.0, 0.0, 0.0))
+
+        # Target on same side as source (X=5, wall at X=10) - not blocked
+        self.assertTrue(spatial_service.has_line_of_sight_to_point(p1.entity_uuid, 5.0, 0.0, 0.0))
+
+    def test_get_perceivers(self):
+        """Test get_perceivers - returns entities that can perceive a source entity."""
+        p1 = self.create_combatant("P1", 0.0, 0.0)
+        p2 = self.create_combatant("P2", 10.0, 0.0)
+        p3 = self.create_combatant("P3", 100.0, 0.0)
+
+        # p1 should perceive p2 (within 60ft radius)
+        perceivers = spatial_service.get_perceivers(p1.entity_uuid, radius=60.0, vault_path="default")
+        self.assertIn(p2.entity_uuid, perceivers)
+        self.assertNotIn(p3.entity_uuid, perceivers)  # Too far
+
+        # p1 should NOT perceive itself
+        self.assertNotIn(p1.entity_uuid, perceivers)
+
 
 if __name__ == "__main__":
     unittest.main()

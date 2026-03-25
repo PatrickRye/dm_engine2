@@ -54,6 +54,10 @@ class DMEngineClientCore {
             skill_checks: true,
             attack_rolls: true,
         };
+        this.activeTypers = new Set();
+        this.typingTimeout = null;
+        this.lastTypedTime = 0;
+        this.lastPartyData = [];
 
         if (this.platform === "obsidian") {
             this.serverUrl = window.localStorage.getItem("dm_server_url") || "http://127.0.0.1:8000";
@@ -100,6 +104,17 @@ class DMEngineClientCore {
         } else {
             this.pingAnimationId = null;
         }
+    }
+
+    is_visible_to_player(x, y) {
+        // Check if a point is within any explored area
+        const explored = this.currentMapData?.explored_areas || [];
+        for (const area of explored) {
+            const [ax, ay, radius] = area;
+            const dist = Math.hypot(x - ax, y - ay);
+            if (dist <= radius) return true;
+        }
+        return false;
     }
 
     updatePerspectiveStyles() {
@@ -170,6 +185,11 @@ class DMEngineClientCore {
                 this.updateRadioUI(data.locked_characters || []);
                 this.setConnectionStatus(true);
 
+                // Use party info from heartbeat (includes typing status)
+                if (data.party && data.party.length > 0) {
+                    this.renderPartySidebar(data.party);
+                }
+
                 this.fetchCharacterSheet();
                 this.fetchMaps();
 
@@ -204,6 +224,123 @@ class DMEngineClientCore {
             this.view.ui.statusIndicator.textContent = "🔴 Disconnected";
             this.view.ui.statusIndicator.style.color = "var(--text-error, #dc3545)";
         }
+    }
+
+    async fetchPartyStatus() {
+        try {
+            const res = await fetch(`${this.serverUrl}/party_status`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ vault_path: this.vaultPath })
+            });
+            if (res.ok) {
+                const data = await res.json();
+                this.lastPartyData = data.party || [];
+                this.renderPartySidebar(this.lastPartyData);
+            }
+        } catch (e) { }
+    }
+
+    renderPartySidebar(partyMembers) {
+        if (!this.view.ui || !this.view.ui.partyList) return;
+        const container = this.view.ui.partyList;
+        container.innerHTML = "";
+
+        // Merge typing status from activeTypers (SSE) with heartbeat data
+        const typingFromSSE = this.activeTypers || new Set();
+
+        // Group by location
+        const groups = {};
+        partyMembers.forEach(m => {
+            const map = m.current_map || "Unknown Location";
+            if (!groups[map]) groups[map] = [];
+            groups[map].push(m);
+        });
+
+        for (const [map, members] of Object.entries(groups)) {
+            const groupDiv = document.createElement("div");
+            groupDiv.style.marginBottom = "15px";
+
+            const mapHeader = document.createElement("h4");
+            mapHeader.textContent = map;
+            mapHeader.style.margin = "0 0 5px 0";
+            mapHeader.style.fontSize = "0.9em";
+            mapHeader.style.color = "var(--text-muted)";
+            mapHeader.style.borderBottom = "1px solid var(--background-modifier-border)";
+            groupDiv.appendChild(mapHeader);
+
+            members.forEach(m => {
+                const memberDiv = document.createElement("div");
+                memberDiv.style.display = "flex";
+                memberDiv.style.flexDirection = "column";
+                memberDiv.style.padding = "5px";
+                memberDiv.style.marginBottom = "5px";
+                memberDiv.style.background = "var(--background-modifier-form-field)";
+                memberDiv.style.border = "1px solid var(--background-modifier-border)";
+                memberDiv.style.borderRadius = "4px";
+
+                // Dim if locked by another client
+                if (m.locked_by_other) {
+                    memberDiv.style.opacity = "0.6";
+                }
+
+                const topRow = document.createElement("div");
+                topRow.style.display = "flex";
+                topRow.style.justifyContent = "space-between";
+                topRow.style.alignItems = "center";
+
+                const nameSpan = document.createElement("span");
+                nameSpan.style.fontWeight = "bold";
+                nameSpan.textContent = m.name;
+                if (m.locked_by_other) {
+                    nameSpan.style.textDecoration = "line-through";
+                    nameSpan.title = "In use by another player";
+                }
+
+                const statusSpan = document.createElement("span");
+                statusSpan.style.fontSize = "1.2em";
+                let statusHtml = m.is_online ? "<span title='Online'>🟢</span>" : "<span title='Offline' style='opacity:0.5'>🔴</span>";
+                if (m.is_active) statusHtml += " <span title='Active recently'>⚡</span>";
+                // Use typing from SSE (live) or from heartbeat data
+                const isTyping = typingFromSSE.has(m.name) || m.is_typing;
+                if (isTyping) statusHtml += " <span title='Typing...'>💬</span>";
+                statusSpan.innerHTML = statusHtml;
+
+                topRow.appendChild(nameSpan);
+                topRow.appendChild(statusSpan);
+
+                const hpRow = document.createElement("div");
+                hpRow.style.fontSize = "0.85em";
+                hpRow.textContent = `HP: ${m.hp} / ${m.max_hp}`;
+                let hpColor = "var(--text-success)";
+                if (m.hp <= m.max_hp / 2) hpColor = "var(--text-warning)";
+                if (m.hp <= 0) hpColor = "var(--text-error)";
+                hpRow.style.color = hpColor;
+
+                memberDiv.appendChild(topRow);
+                memberDiv.appendChild(hpRow);
+                groupDiv.appendChild(memberDiv);
+            });
+            container.appendChild(groupDiv);
+        }
+    }
+
+    handleTyping() {
+        const now = Date.now();
+        if (now - this.lastTypedTime > 2000) { // Debounce sending to every 2 seconds
+            this.lastTypedTime = now;
+            fetch(`${this.serverUrl}/typing`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ client_id: this.clientId, character: this.activeCharacter, is_typing: true })
+            }).catch(() => { });
+        }
+
+        if (this.typingTimeout) clearTimeout(this.typingTimeout);
+        this.typingTimeout = setTimeout(() => {
+            fetch(`${this.serverUrl}/typing`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ client_id: this.clientId, character: this.activeCharacter, is_typing: false })
+            }).catch(() => { });
+        }, 4000); // Expire if no keys pressed for 4 seconds
     }
 
     async fetchCharacters() {
@@ -257,21 +394,64 @@ class DMEngineClientCore {
         const s = data.sheet;
         const hp = s.hp !== undefined ? s.hp : "?";
         const maxHp = s.max_hp !== undefined ? s.max_hp : "?";
-        const conds = s.active_conditions ? s.active_conditions.map(c => c.name).join(", ") : "None";
-        const equip = s.equipment ? Object.entries(s.equipment).map(([k, v]) => `<li><b>${k.replace('_', ' ')}</b>: ${v}</li>`).join("") : "None";
+
+        // Handle conditions - could be array of strings or objects
+        let condsHtml = "None";
+        if (s.conditions && s.conditions.length > 0) {
+            condsHtml = s.conditions.map(c => {
+                const name = typeof c === 'string' ? c : c.name;
+                return `<span style="background:var(--background-modifier-border); padding:2px 6px; border-radius:3px; margin-right:4px;">${name}</span>`;
+            }).join("");
+        }
+
+        const equip = s.equipment ? Object.entries(s.equipment).map(([k, v]) => `<li><b>${k.replace(/_/g, ' ')}</b>: ${v}</li>`).join("") : "None";
         const res = s.resources ? Object.entries(s.resources).map(([k, v]) => `<li><b>${k}</b>: ${v}</li>`).join("") : "None";
 
+        // Ability scores
+        let abilitiesHtml = "";
+        if (s.abilities && Object.keys(s.abilities).length > 0) {
+            const abbr = { str: "STR", dex: "DEX", con: "CON", int: "INT", wis: "WIS", cha: "CHA" };
+            abilitiesHtml = `<div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-top:10px;">
+                ${Object.entries(s.abilities).map(([k, v]) => {
+                    const mod = Math.floor((v - 10) / 2);
+                    const sign = mod >= 0 ? "+" : "";
+                    return `<div style="background:var(--background-modifier-form-field); padding:8px; border-radius:4px; text-align:center;">
+                        <div style="font-size:0.8em; color:var(--text-muted);">${abbr[k] || k.toUpperCase()}</div>
+                        <div style="font-size:1.3em; font-weight:bold;">${v}</div>
+                        <div style="font-size:0.85em; color:var(--text-accent);">${sign}${mod}</div>
+                    </div>`;
+                }).join("")}
+            </div>`;
+        }
+
+        // Speed
+        const speed = s.speed || "30 ft";
+
+        // Spell slots
+        const spellSlots = s.spell_slots || null;
+
         if (this.view.viewSheet) this.view.viewSheet.innerHTML = `
-            <h2 style="margin-top:0;">${s.name}</h2>
-            <div style="display:flex; gap:10px; margin-bottom:15px;">
-                <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; text-align:center;"><b>HP</b><br><span style="font-size:1.5em; color:var(--text-success);">${hp} / ${maxHp}</span></div>
-                <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; text-align:center;"><b>AC</b><br><span style="font-size:1.5em;">${s.ac || 10}</span></div>
+            <h2 style="margin-top:0;">${s.name || "Unknown"}</h2>
+            <div style="display:flex; gap:10px; margin-bottom:15px; flex-wrap:wrap;">
+                <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; min-width:100px; text-align:center;"><b>HP</b><br><span style="font-size:1.5em; color:${hp <= 0 ? 'var(--text-error)' : hp <= maxHp/2 ? 'var(--text-warning)' : 'var(--text-success)'};">${hp} / ${maxHp}</span></div>
+                <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; min-width:100px; text-align:center;"><b>AC</b><br><span style="font-size:1.5em;">${s.ac || 10}</span></div>
+                <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; min-width:100px; text-align:center;"><b>Speed</b><br><span style="font-size:1.1em;">${speed}</span></div>
             </div>
-            <p><b>Conditions:</b> <span style="color:var(--text-error);">${conds}</span></p>
-            <p><b>Spell Slots:</b> ${s.spell_slots || "N/A"}</p>
-            <p><b>Attunement:</b> ${s.attunement_slots || "0/3"}</p>
-            <h4 style="margin-bottom:5px;">Resources</h4><ul style="margin-top:0;">${res}</ul>
-            <h4 style="margin-bottom:5px;">Equipment</h4><ul style="margin-top:0;">${equip}</ul>
+
+            ${abilitiesHtml}
+
+            <div style="margin-top:15px;">
+                <b>Conditions:</b>
+                <div style="margin-top:5px;">${condsHtml}</div>
+            </div>
+
+            ${spellSlots ? `<p style="margin-top:10px;"><b>Spell Slots:</b> ${spellSlots}</p>` : ""}
+
+            <h4 style="margin-bottom:5px; margin-top:15px;">Resources</h4>
+            <ul style="margin-top:0;">${res}</ul>
+
+            <h4 style="margin-bottom:5px;">Equipment</h4>
+            <ul style="margin-top:0;">${equip}</ul>
         `;
     }
 
@@ -327,17 +507,25 @@ class DMEngineClientCore {
                 imagePath = mapData.player_map_image_path || mapData.dm_map_image_path;
             }
 
+            // Canvas sizing: use image dimensions if available, else use map data dimensions
+            // SCALE: pixels per foot (15 is standard, gives 75px per 5ft square)
+            const SCALE = 15;
+            const mapWidth = mapData.width || 200;
+            const mapHeight = mapData.height || 200;
+
             const canvas = document.createElement('canvas');
-            canvas.width = 1600; // Arbitrary bounds, can be scrolled within the tab
-            canvas.height = 1600;
+            canvas.width = mapWidth * SCALE;
+            canvas.height = mapHeight * SCALE;
             canvas.style.backgroundColor = "var(--background-modifier-form-field)";
             canvas.style.borderRadius = "4px";
             canvasContainer.appendChild(canvas);
 
             const ctx = canvas.getContext('2d');
-            const SCALE = 15; // 15 pixels per foot. A 5ft square = 75px.
 
             let bgImageRef = null;
+
+            // Track if we should resize canvas when image loads
+            let pendingImageResize = false;
 
             aoeShapeSelect.addEventListener("change", (e) => {
                 this.aoeMode = e.target.value === "none" ? null : e.target.value;
@@ -414,11 +602,7 @@ class DMEngineClientCore {
 
                     // Enforce FoW visibility for players looking at NPCs
                     if (this.activeCharacter !== "Human DM" && !ent.is_pc) {
-                        let isRevealed = false;
-                        for (const area of mapData.explored_areas || []) {
-                            if (Math.hypot(ent.x - area[0], ent.y - area[1]) <= area[2]) { isRevealed = true; break; }
-                        }
-                        if (!isRevealed) return; // Do not draw hidden monsters!
+                        if (!this.is_visible_to_player(ent.x, ent.y)) return; // Do not draw hidden monsters!
                     }
 
                     ctx.beginPath();
@@ -636,6 +820,9 @@ class DMEngineClientCore {
 
             if (imagePath) {
                 if (this.loadedImages[imagePath] instanceof Image) {
+                    // Resize canvas to match image
+                    canvas.width = this.loadedImages[imagePath].width;
+                    canvas.height = this.loadedImages[imagePath].height;
                     drawScene(this.loadedImages[imagePath]);
                 } else if (this.loadedImages[imagePath] === "failed") {
                     drawScene(null);
@@ -644,6 +831,9 @@ class DMEngineClientCore {
                     const img = new Image();
                     img.onload = () => {
                         this.loadedImages[imagePath] = img;
+                        // Resize canvas to match image when it loads
+                        canvas.width = img.width;
+                        canvas.height = img.height;
                         drawScene(img);
                     };
                     img.onerror = () => {
@@ -922,6 +1112,15 @@ class DMEngineClientCore {
                                 if (!this.pingAnimationId) this.animatePings();
                             }
 
+                            if (data.type === "typing") {
+                                if (data.is_typing) {
+                                    this.activeTypers.add(data.character);
+                                } else {
+                                    this.activeTypers.delete(data.character);
+                                }
+                                this.renderPartySidebar(this.lastPartyData); // Instantly update UI bubble
+                            }
+
                             if (data.status === "streaming" || data.status === "error") {
                                 if (data.reply) {
                                     if (!msgDiv) {
@@ -980,6 +1179,13 @@ class DMEngineClientCore {
         this.view.ui.chatInput.style.height = "auto";
         this.view.ui.chatInput.style.height = "40px";
         this.view.ui.chatInput.disabled = true;
+
+        if (this.typingTimeout) clearTimeout(this.typingTimeout);
+        // Tell server immediately we stopped typing
+        fetch(`${this.serverUrl}/typing`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ client_id: this.clientId, character: this.activeCharacter, is_typing: false })
+        }).catch(() => { });
 
         this.appendMessage(this.activeCharacter, text, "var(--text-accent)");
 
@@ -1246,8 +1452,33 @@ class DMChatView extends ItemView {
         container.style.height = "100%";
         container.style.overflow = "hidden"; // This kills the ugly outer scrollbar!
 
+        // Main layout wrapper to support horizontal sidebar
+        const layoutWrapper = container.createDiv();
+        layoutWrapper.style.display = "flex";
+        layoutWrapper.style.flexDirection = "row";
+        layoutWrapper.style.height = "100%";
+        layoutWrapper.style.width = "100%";
+
+        const sidebar = layoutWrapper.createDiv({ cls: "dm-party-sidebar" });
+        sidebar.style.flex = "0 0 220px";
+        sidebar.style.borderRight = "1px solid var(--background-modifier-border)";
+        sidebar.style.padding = "10px";
+        sidebar.style.overflowY = "auto";
+        sidebar.style.backgroundColor = "var(--background-secondary)";
+        sidebar.createEl("h3", { text: "Party", margin: "0" }).style.marginTop = "0";
+
+        this.ui.partyList = sidebar.createDiv();
+        this.ui.partyList.style.marginTop = "10px";
+        this.ui.partyList.textContent = "Waiting for data...";
+
+        const mainArea = layoutWrapper.createDiv();
+        mainArea.style.flex = "1";
+        mainArea.style.display = "flex";
+        mainArea.style.flexDirection = "column";
+        mainArea.style.overflow = "hidden";
+
         // Top Control Bar
-        const topBar = container.createDiv();
+        const topBar = mainArea.createDiv();
         topBar.style.display = "flex";
         topBar.style.justifyContent = "space-between";
         topBar.style.alignItems = "center";
@@ -1311,7 +1542,7 @@ class DMChatView extends ItemView {
         });
 
         // Character Select Container
-        this.ui.charSelect = container.createDiv();
+        this.ui.charSelect = mainArea.createDiv();
         this.ui.charSelect.style.flex = "0 0 auto";
         this.ui.charSelect.style.padding = "5px 10px";
         this.ui.charSelect.style.display = "flex";
@@ -1320,7 +1551,7 @@ class DMChatView extends ItemView {
         this.ui.charSelect.style.borderBottom = "1px solid var(--background-modifier-border)";
 
         // Collapsible Settings Panel
-        const settingsWrapper = container.createDiv({ cls: "dm-settings-wrapper" });
+        const settingsWrapper = mainArea.createDiv({ cls: "dm-settings-wrapper" });
         settingsWrapper.style.flex = "0 0 auto";
         settingsWrapper.style.padding = "5px 10px";
         settingsWrapper.style.borderBottom = "1px solid var(--background-modifier-border)";
@@ -1418,7 +1649,7 @@ class DMChatView extends ItemView {
         });
 
         // Tab Bar
-        const tabBar = container.createDiv({ cls: "dm-tab-bar" });
+        const tabBar = mainArea.createDiv({ cls: "dm-tab-bar" });
         tabBar.style.display = "flex";
         tabBar.style.flex = "0 0 auto";
         tabBar.style.borderBottom = "1px solid var(--background-modifier-border)";
@@ -1440,7 +1671,7 @@ class DMChatView extends ItemView {
         btnChat.style.borderBottom = "2px solid var(--interactive-accent)";
 
         // Views Container
-        const viewsContainer = container.createDiv();
+        const viewsContainer = mainArea.createDiv();
         viewsContainer.style.flex = "1 1 auto";
         viewsContainer.style.display = "flex";
         viewsContainer.style.flexDirection = "column";
@@ -1520,6 +1751,7 @@ What do you do? (Shift+Enter for new line)`;
 
         // Auto-expand height as the user types
         this.ui.chatInput.addEventListener("input", () => {
+            this.clientCore.handleTyping();
             this.ui.chatInput.style.height = "auto";
             this.ui.chatInput.style.height = Math.min(this.ui.chatInput.scrollHeight, 160) + "px";
         });

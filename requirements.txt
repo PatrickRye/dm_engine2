@@ -7,23 +7,24 @@ aiofiles
 filelock
 psutil
 python-dotenv
+watchdog
 
 # --- Spatial & GIS Engine ---
 shapely
 rtree
 
-# --- AI & LangChain ---
+# --- AI & LangGraph ---
 langchain-core
 langchain-google-genai
 langgraph
+langgraph-checkpoint-sqlite
 
-# --- MCP & GitHub Integration ---
-mcp
-langchain-mcp-adapters
-PyGithub
+# --- QA & Repo Integration ---
+#PyGithub
+#gitlab
 
 # --- Testing & Linting (Dev) ---
-pytest
-pytest-asyncio
-pytest-cov
-flake8
+#pytest
+#pytest-asyncio
+#pytest-cov
+#flake8

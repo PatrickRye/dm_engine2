@@ -143,6 +143,8 @@ class MapData(BaseModel):
     grid_scale: float = 5.0  # 1 square = 5ft
     distance_metric: str = "chebyshev"  # "chebyshev" or "euclidean"
     pixels_per_foot: float = 1.0
+    width: float = 200.0  # Map width in feet (for canvas sizing)
+    height: float = 200.0  # Map height in feet (for canvas sizing)
 
     @property
     def active_walls(self) -> List[Wall]:
@@ -694,6 +696,40 @@ class SpatialQueryService:
                     hit_uuids.append(ent_uuid)
 
         return hit_uuids
+
+    @locked
+    def get_perceivers(
+        self, source_uuid: uuid.UUID, radius: float = 60.0, require_los: bool = False, vault_path: str = "default"
+    ) -> List[uuid.UUID]:
+        """Returns a list of entity UUIDs that can perceive (hear or see) the source entity."""
+        if not HAS_GIS:
+            return []
+        source = self._entities.get(vault_path, {}).get(source_uuid)
+        if not source:
+            return []
+
+        # 1. Broad phase: Find everyone within radius (standard talking/shouting distance)
+        nearby_uuids = self.get_targets_in_radius(source.x, source.y, radius, vault_path)
+
+        perceivers = []
+        for uid in nearby_uuids:
+            if uid == source_uuid:
+                continue
+
+            if require_los:
+                if self.has_line_of_sight(uid, source_uuid, vault_path):
+                    perceivers.append(uid)
+            else:
+                # For auditory, check if either is deafened/silenced
+                target = self._entities.get(vault_path, {}).get(uid)
+                if target:
+                    s_conds = [c.name.lower() for c in getattr(source, "active_conditions", [])]
+                    t_conds = [c.name.lower() for c in getattr(target, "active_conditions", [])]
+                    if "silenced" in s_conds or "deafened" in t_conds:
+                        continue
+                    perceivers.append(uid)
+
+        return perceivers
 
     @locked
     def get_targets_in_cone(

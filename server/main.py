@@ -8,6 +8,8 @@ import time
 import socket
 import psutil
 import subprocess
+import math
+from typing import List, Dict, Any
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,11 +39,20 @@ from langgraph.checkpoint.memory import MemorySaver
 
 try:
     import sqlite3 as _sqlite3
-    from langgraph.checkpoint.sqlite import SqliteSaver as _SqliteSaver
+    import aiosqlite as _aiosqlite
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver as _AsyncSqliteSaver
 
     _SQLITE_AVAILABLE = True
+    _ASYNC_SQLITE_AVAILABLE = True
 except ImportError:
-    _SQLITE_AVAILABLE = False
+    try:
+        import sqlite3 as _sqlite3
+        from langgraph.checkpoint.sqlite import SqliteSaver as _SqliteSaver
+        _SQLITE_AVAILABLE = True
+        _ASYNC_SQLITE_AVAILABLE = False
+    except ImportError:
+        _SQLITE_AVAILABLE = False
+        _ASYNC_SQLITE_AVAILABLE = False
 from shapely.geometry import LineString
 from dnd_rules_engine import Creature
 from state import DMState
@@ -208,7 +219,41 @@ VAULT_LOCKS = {}
 # MULTIPLAYER LOCKS: Maps character_name -> client_id
 CHARACTER_LOCKS = {}
 LAST_SEEN = {}  # client_id -> timestamp
+LAST_MESSAGE_TIME = {}  # character_name -> timestamp
+ACTIVE_TYPERS = {}  # character_name -> timestamp (for timeout-based expiry)
 CHARACTER_LOCK_MUTEX = asyncio.Lock()  # Serializes mutations to CHARACTER_LOCKS / LAST_SEEN
+
+# Server discovery state
+ACTIVE_VAULT_PATH = ""  # Set when DM loads a vault
+ACTIVE_CAMPAIGN_NAME = "No Campaign Loaded"  # Display name for clients
+SERVER_NAME = "DM Engine"  # Configurable server display name
+
+# State change notification system for real-time client updates
+STATE_CHANGES: List[Dict[str, Any]] = []
+STATE_CHANGES_LOCK = asyncio.Lock()
+
+
+def push_state_change(change_type: str, entity_name: str, changes: Dict[str, Any]):
+    """Push a state change notification for clients. Thread-safe."""
+    global STATE_CHANGES
+    STATE_CHANGES.append({
+        "type": change_type,
+        "entity": entity_name,
+        "changes": changes,
+        "timestamp": time.time(),
+    })
+    # Keep only recent changes (last 100)
+    if len(STATE_CHANGES) > 100:
+        STATE_CHANGES = STATE_CHANGES[-100:]
+
+
+async def get_and_clear_state_changes() -> List[Dict[str, Any]]:
+    """Get all pending state changes and clear the queue. For use by heartbeat."""
+    global STATE_CHANGES
+    async with STATE_CHANGES_LOCK:
+        changes = list(STATE_CHANGES)
+        STATE_CHANGES = []
+    return changes
 
 
 class EventBroadcaster:
@@ -222,13 +267,14 @@ class EventBroadcaster:
         if (client_id, q) in self.queues:
             self.queues.remove((client_id, q))
 
-    async def broadcast(self, sender_id: str, data: str):
+    async def broadcast(self, sender_id: str, data: str, target_client_ids: list[str] = None):
         for cid, q in list(self.queues):
             if cid != sender_id:
-                try:
-                    await q.put(data)
-                except Exception:
-                    pass
+                if target_client_ids is None or cid in target_client_ids:
+                    try:
+                        await q.put(data)
+                    except Exception:
+                        pass
 
 
 broadcaster = EventBroadcaster()
@@ -260,13 +306,25 @@ async def lifespan(app: FastAPI):
         print(f"Starting QA Reporters at {qa_path}...")
         qa_process = subprocess.Popen(["python", qa_path])
 
-    try:
-        # Upgraded to Pro for deeper reasoning, and Temp 0.6 to encourage "Jazz"
-        draft_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.6)
-        qa_llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
+    # Get model from env or default to flash (much higher rate limits than Pro)
+    _model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
-        # Build checkpointer: prefer SQLite (persistent across restarts) over in-memory
-        if _SQLITE_AVAILABLE:
+    try:
+        # Using Flash for better rate limits - Pro exhausts quickly
+        draft_llm = ChatGoogleGenerativeAI(model=_model, temperature=0.6)
+        qa_llm = ChatGoogleGenerativeAI(model=_model, temperature=0.1)
+
+        # Build checkpointer: prefer AsyncSqliteSaver (persistent across restarts) over in-memory
+        if _ASYNC_SQLITE_AVAILABLE:
+            db_path = os.path.join(BASE_DIR, "checkpoints.db")
+            try:
+                _checkpoint_conn = await asyncio.wait_for(_aiosqlite.connect(db_path), timeout=5.0)
+                checkpointer = _AsyncSqliteSaver(_checkpoint_conn)
+                print(f"Using AsyncSqliteSaver checkpoint store at {db_path}")
+            except asyncio.TimeoutError:
+                print(f"AsyncSqliteSaver connection timed out, falling back to MemorySaver")
+                checkpointer = MemorySaver()
+        elif _SQLITE_AVAILABLE:
             db_path = os.path.join(BASE_DIR, "checkpoints.db")
             _checkpoint_conn = _sqlite3.connect(db_path, check_same_thread=False)
             checkpointer = _SqliteSaver(_checkpoint_conn)
@@ -282,11 +340,20 @@ async def lifespan(app: FastAPI):
         dm_engine_app = build_graph(draft_llm, qa_llm, MASTER_TOOLS_LIST, checkpointer=checkpointer)
 
         async def heartbeat_emitter():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # UDP socket for local monitoring (127.0.0.1:9999)
+            local_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            local_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            # UDP socket for LAN broadcast (255.255.255.255:9998)
+            broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
             p = psutil.Process(os.getpid())
             while True:
                 try:
-                    payload = json.dumps(
+                    # Local monitoring heartbeat
+                    local_payload = json.dumps(
                         {
                             "pid": p.pid,
                             "cpu_percent": p.cpu_percent(),
@@ -294,10 +361,25 @@ async def lifespan(app: FastAPI):
                             "timestamp": time.time(),
                         }
                     ).encode("utf-8")
-                    sock.sendto(payload, ("127.0.0.1", 9999))
+                    local_sock.sendto(local_payload, ("127.0.0.1", 9999))
                 except Exception:
                     pass
-                await asyncio.sleep(1)
+                try:
+                    # LAN broadcast for server discovery
+                    global ACTIVE_VAULT_PATH, ACTIVE_CAMPAIGN_NAME, SERVER_NAME
+                    broadcast_payload = json.dumps(
+                        {
+                            "server_name": SERVER_NAME,
+                            "campaign": ACTIVE_CAMPAIGN_NAME,
+                            "vault_path": ACTIVE_VAULT_PATH,
+                            "port": 8000,
+                            "timestamp": time.time(),
+                        }
+                    ).encode("utf-8")
+                    broadcast_sock.sendto(broadcast_payload, ("255.255.255.255", 9998))
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
 
         heartbeat_task = asyncio.create_task(heartbeat_emitter())
         print("DM Engine initialized successfully with ReAct architecture.")
@@ -376,7 +458,7 @@ async def log_requests(request: Request, call_next):
 class ChatRequest(BaseModel):
     message: str
     character: str
-    vault_path: str
+    vault_path: str = ""
     client_id: str
     roll_automations: dict = Field(default_factory=dict)
 
@@ -450,6 +532,16 @@ class ToggleLivePatchRequest(BaseModel):
     client_id: str
     character: str
     enabled: bool
+
+
+class TypingRequest(BaseModel):
+    client_id: str
+    character: str
+    is_typing: bool
+
+
+class PartyStatusRequest(BaseModel):
+    vault_path: str
 
 
 @app.post("/toggle_live_patch")
@@ -569,6 +661,58 @@ async def ping_endpoint(request: PingRequest):
     await broadcaster.broadcast("", f"data: {json.dumps(payload)}\n\n")
     await broadcaster.broadcast("", f"data: {json.dumps({'status': 'done'})}\n\n")
     return {"status": "success"}
+
+
+@app.post("/typing")
+async def typing_endpoint(request: TypingRequest):
+    """Broadcasts a typing indicator to all connected clients."""
+    global ACTIVE_TYPERS
+    current_time = time.time()
+    if request.is_typing:
+        ACTIVE_TYPERS[request.character] = current_time
+    elif request.character in ACTIVE_TYPERS:
+        del ACTIVE_TYPERS[request.character]
+    payload = {"type": "typing", "character": request.character, "is_typing": request.is_typing}
+    await broadcaster.broadcast(request.client_id, f"data: {json.dumps(payload)}\n\n")
+    return {"status": "success"}
+
+
+@app.post("/party_status")
+async def party_status_endpoint(request: PartyStatusRequest):
+    """Returns the health, location, and presence status of all party members."""
+    party_members = []
+    current_time = time.time()
+
+    entities = get_all_entities(request.vault_path)
+    for uid, ent in entities.items():
+        tags = [t.lower() for t in getattr(ent, "tags", [])]
+        if any(t in tags for t in ["pc", "player", "party_npc"]):
+            char_name = ent.name
+
+            # Check online status (Heartbeat in last 15 seconds)
+            client_id = CHARACTER_LOCKS.get(char_name)
+            is_online = False
+            if client_id and client_id in LAST_SEEN:
+                is_online = (current_time - LAST_SEEN[client_id]) <= 15
+
+            # Check active status (Message sent in last 5 mins / 300 seconds)
+            last_msg_ts = LAST_MESSAGE_TIME.get(char_name, 0)
+            is_active = (current_time - last_msg_ts) <= 300
+
+            hp = ent.hp.base_value if hasattr(ent, "hp") and hasattr(ent.hp, "base_value") else 0
+
+            party_members.append(
+                {
+                    "name": char_name,
+                    "hp": hp,
+                    "max_hp": getattr(ent, "max_hp", 0),
+                    "current_map": getattr(ent, "current_map", "Unknown Location"),
+                    "is_online": is_online,
+                    "is_active": is_active,
+                }
+            )
+
+    return {"party": party_members}
 
 
 @app.post("/propose_move", response_model=ProposeMoveResponse)
@@ -700,7 +844,10 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
             # REQ-GEO-007, REQ-GEO-008: Moving through creatures
             # Use rtree spatial index to narrow candidates before detailed checks
             path_candidates = spatial_service.get_entities_on_path(
-                start[0], start[1], end[0], end[1],
+                start[0],
+                start[1],
+                end[0],
+                end[1],
                 vault_path=request.vault_path,
                 exclude_uuid=entity.entity_uuid,
             )
@@ -714,9 +861,7 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                     c.name.lower() in ["incapacitated", "unconscious", "stunned", "paralyzed", "petrified", "dead"]
                     for c in getattr(other_entity, "active_conditions", [])
                 )
-                is_other_tiny = (
-                    "tiny" in [t.lower() for t in getattr(other_entity, "tags", [])] or other_entity.size <= 2.5
-                )
+                is_other_tiny = "tiny" in [t.lower() for t in getattr(other_entity, "tags", [])] or other_entity.size <= 2.5
 
                 def size_cat(size: float, tags: list):
                     tags_lower = [t.lower() for t in tags]
@@ -744,16 +889,9 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
                 cat_o = size_cat(other_entity.size, getattr(other_entity, "tags", []))
 
                 # REQ-MOV-012: Tiny/Incapacitated allow passage. Otherwise check size diff.
-                if (
-                    is_entity_pc != is_other_pc
-                    and abs(cat_e - cat_o) < 2
-                    and not is_other_incapacitated
-                    and not is_other_tiny
-                ):
+                if is_entity_pc != is_other_pc and abs(cat_e - cat_o) < 2 and not is_other_incapacitated and not is_other_tiny:
                     is_valid = False
-                    invalid_reason = (
-                        f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
-                    )
+                    invalid_reason = f"Cannot move through hostile creature {other_entity.name} (Size difference too small)."
                     break
                 else:
                     segment_cost += segment_dist * (overlap_len / path_line.length) if path_line.length > 0 else 0
@@ -896,7 +1034,11 @@ async def propose_move_endpoint(request: ProposeMoveRequest):  # noqa: C901
 @app.post("/characters")
 async def list_characters_endpoint(request: VaultRequest):
     """Allows external Web UIs to fetch the list of active player characters in the vault."""
-    j_dir = get_journals_dir(request.vault_path)
+    # Use provided vault_path, or fall back to server's active vault
+    vault_path = request.vault_path or ACTIVE_VAULT_PATH
+    if not vault_path:
+        return {"characters": ["Human DM"], "error": "No vault loaded on server"}
+    j_dir = get_journals_dir(vault_path)
     chars = ["Human DM"]
     if os.path.exists(j_dir):
         for filename in os.listdir(j_dir):
@@ -926,9 +1068,20 @@ class CharSheetRequest(BaseModel):
 
 @app.post("/character_sheet")
 async def character_sheet_endpoint(request: CharSheetRequest):
-    """Fetches the parsed YAML data for the active character to populate the UI."""
+    """Fetches the parsed YAML data for the active character, merged with live engine state."""
     if request.character == "Human DM":
-        return {"sheet": {"name": "Human DM", "role": "Dungeon Master", "hp": "∞", "ac": "∞"}}
+        return {
+            "sheet": {
+                "name": "Human DM",
+                "role": "Dungeon Master",
+                "hp": "—",
+                "max_hp": "—",
+                "ac": "—",
+                "conditions": [],
+                "speed": "—",
+                "abilities": {},
+            }
+        }
 
     file_path = os.path.join(get_journals_dir(request.vault_path), f"{request.character}.md")
     if not os.path.exists(file_path):
@@ -937,13 +1090,46 @@ async def character_sheet_endpoint(request: CharSheetRequest):
     try:
         async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
             content = await f.read()
+            sheet = {}
             if content.startswith("---"):
                 parts = content.split("---", 2)
                 if len(parts) >= 3:
-                    return {"sheet": await asyncio.to_thread(yaml.safe_load, parts[1]) or {}}
+                    sheet = await asyncio.to_thread(yaml.safe_load, parts[1]) or {}
     except Exception as e:
         return {"error": str(e)}
-    return {"error": "Invalid format."}
+
+    # Merge live engine state (HP, conditions, etc.) into sheet data
+    vault_path = request.vault_path or ACTIVE_VAULT_PATH
+    if vault_path:
+        entity = await _get_entity_by_name(request.character, vault_path)
+        if entity:
+            # Override static YAML data with live engine state
+            sheet["hp"] = entity.hp.base_value if hasattr(entity, "hp") else sheet.get("hp", 0)
+            sheet["max_hp"] = entity.max_hp if hasattr(entity, "max_hp") else sheet.get("max_hp", 0)
+            sheet["ac"] = getattr(entity, "ac", sheet.get("ac", 10))
+            sheet["speed"] = getattr(entity, "speed", sheet.get("speed", "30 ft"))
+
+            # Merge conditions
+            engine_conds = [c.name for c in getattr(entity, "active_conditions", [])]
+            yaml_conds = sheet.get("conditions", [])
+            if isinstance(yaml_conds, str):
+                yaml_conds = [c.strip() for c in yaml_conds.split(",")]
+            # Combine, remove duplicates, prefer engine state
+            all_conds = list(dict.fromkeys(yaml_conds + engine_conds))
+            sheet["conditions"] = all_conds
+
+            # Ability scores from engine if available
+            if hasattr(entity, "ability_scores"):
+                sheet["abilities"] = {
+                    "str": getattr(entity.ability_scores, "strength", 10),
+                    "dex": getattr(entity.ability_scores, "dexterity", 10),
+                    "con": getattr(entity.ability_scores, "constitution", 10),
+                    "int": getattr(entity.ability_scores, "intelligence", 10),
+                    "wis": getattr(entity.ability_scores, "wisdom", 10),
+                    "cha": getattr(entity.ability_scores, "charisma", 10),
+                }
+
+    return {"sheet": sheet}
 
 
 @app.get("/vault_media")
@@ -1035,6 +1221,52 @@ async def map_state_endpoint(request: VaultRequest):
     }
 
 
+class VisibilityRequest(BaseModel):
+    character: str  # The character whose perspective we're checking
+    target_x: float
+    target_y: float
+    vault_path: str = ""
+
+
+@app.post("/visibility")
+async def visibility_endpoint(request: VisibilityRequest):
+    """Checks if a point is visible to a character, considering walls and fog of war."""
+    vault_path = request.vault_path or ACTIVE_VAULT_PATH
+    if not vault_path:
+        return {"visible": False, "reason": "no_vault"}
+
+    # Get the character's entity
+    entity = await _get_entity_by_name(request.character, vault_path)
+    if not entity:
+        return {"visible": False, "reason": "character_not_found"}
+
+    # Check line of sight through walls
+    has_los = spatial_service.has_line_of_sight_to_point(
+        entity.entity_uuid, request.target_x, request.target_y, 0.0, vault_path
+    )
+
+    # Check if in an explored area
+    md = spatial_service.get_map_data(vault_path)
+    in_explored = False
+    for area in md.explored_areas:
+        ax, ay, radius = area
+        dist = math.hypot(request.target_x - ax, request.target_y - ay)
+        if dist <= radius:
+            in_explored = True
+            break
+
+    # For players (not DM), both LOS and explored area are required
+    is_dm = request.character.lower() == "human dm"
+    visible = has_los and (is_dm or in_explored)
+
+    return {
+        "visible": visible,
+        "has_line_of_sight": has_los,
+        "in_explored_area": in_explored,
+        "is_dm": is_dm,
+    }
+
+
 @app.post("/heartbeat")
 async def heartbeat_endpoint(request: HeartbeatRequest):
     async with CHARACTER_LOCK_MUTEX:
@@ -1057,7 +1289,50 @@ async def heartbeat_endpoint(request: HeartbeatRequest):
                 CHARACTER_LOCKS[request.character] = request.client_id
 
         locked_by_others = [k for k, v in CHARACTER_LOCKS.items() if v != request.client_id]
-    return {"locked_characters": locked_by_others}
+
+    # Build party info for connecting clients
+    party_info = []
+    current_time = time.time()
+
+    # Purge stale typers (typing indicator expires after 10 seconds)
+    stale_typers = [c for c, ts in ACTIVE_TYPERS.items() if current_time - ts > 10]
+    for c in stale_typers:
+        del ACTIVE_TYPERS[c]
+
+    if ACTIVE_VAULT_PATH:
+        entities = get_all_entities(ACTIVE_VAULT_PATH)
+        for uid, ent in entities.items():
+            tags = [t.lower() for t in getattr(ent, "tags", [])]
+            if any(t in tags for t in ["pc", "player", "party_npc"]):
+                char_name = ent.name
+                client_id = CHARACTER_LOCKS.get(char_name)
+                is_online = client_id and client_id in LAST_SEEN and (current_time - LAST_SEEN[client_id]) <= 15
+                last_msg_ts = LAST_MESSAGE_TIME.get(char_name, 0)
+                is_active = (current_time - last_msg_ts) <= 300
+                is_typing = char_name in ACTIVE_TYPERS
+
+                party_info.append({
+                    "name": char_name,
+                    "hp": getattr(ent, "hp", 0) if hasattr(ent, "hp") else 0,
+                    "max_hp": getattr(ent, "max_hp", 0),
+                    "current_map": getattr(ent, "current_map", "Unknown Location"),
+                    "is_online": is_online,
+                    "is_active": is_active,
+                    "is_typing": is_typing,
+                    "is_locked": char_name in CHARACTER_LOCKS and CHARACTER_LOCKS[char_name] != request.client_id,
+                    "locked_by_other": char_name in locked_by_others,
+                })
+
+    # Get pending state changes (HP updates, condition changes, etc.)
+    state_changes = await get_and_clear_state_changes()
+
+    return {
+        "locked_characters": locked_by_others,
+        "server_name": SERVER_NAME,
+        "campaign": ACTIVE_CAMPAIGN_NAME,
+        "party": party_info,
+        "state_changes": state_changes,
+    }
 
 
 @app.post("/switch_character")
@@ -1105,6 +1380,12 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
     if not dm_engine_app:
         raise HTTPException(status_code=500, detail="DM Engine not initialized.")
 
+    # Use server's active vault if player didn't specify one
+    if not request.vault_path:
+        request.vault_path = ACTIVE_VAULT_PATH
+    if not request.vault_path:
+        raise HTTPException(status_code=400, detail="No vault loaded. DM must load a vault first.")
+
     # MULTIPLAYER LOCK ENFORCEMENT
     async with CHARACTER_LOCK_MUTEX:
         if request.character in CHARACTER_LOCKS and CHARACTER_LOCKS[request.character] != request.client_id:
@@ -1122,6 +1403,9 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
     if request.message.strip().startswith(">") and request.character.lower() != "human dm":
         raise HTTPException(status_code=403, detail="Only the Human DM may use OOC commands (>).")
 
+    # Track activity for the "Active" indicator
+    LAST_MESSAGE_TIME[request.character] = time.time()
+
     clean_msg = request.message[1:].strip() if request.message.startswith(">") else request.message
     if request.character.lower() == "human dm":
         prefix = "[OOC Override from Human DM]:"
@@ -1129,13 +1413,191 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
         prefix = f"[{request.character} acts/speaks]:"
     formatted_prompt = f"{prefix} {clean_msg}"
 
+    # WHISPER INTERCEPT
+    is_whisper = False
+    target_ent = None
+    target_name = ""
+    whisper_text = ""
+
+    if clean_msg.lower().startswith("/w ") or clean_msg.lower().startswith("/whisper "):
+        is_whisper = True
+        cmd_len = 3 if clean_msg.lower().startswith("/w ") else 9
+        content_after = clean_msg[cmd_len:].strip()
+
+        all_ents = get_all_entities(request.vault_path)
+        # Find PC targets sorted by length to match the longest full names first
+        possible_names = sorted(
+            [
+                e.name
+                for e in all_ents.values()
+                if any(t.lower() in ["pc", "player", "party_npc"] for t in getattr(e, "tags", []))
+            ],
+            key=len,
+            reverse=True,
+        )
+        for name in possible_names:
+            if content_after.lower().startswith(name.lower()):
+                # Ensure clean name break (handles cases like John matching Johnathon incorrectly)
+                if len(content_after) == len(name) or content_after[len(name)] == " ":
+                    target_ent = await _get_entity_by_name(name, request.vault_path)
+                    whisper_text = content_after[len(name) :].strip()
+                    break
+        if content_after.lower().startswith("dm ") or content_after.lower() == "dm":
+            target_name = "DM"
+            whisper_text = content_after[3:].strip() if content_after.lower().startswith("dm ") else ""
+        else:
+            all_ents = get_all_entities(request.vault_path)
+            # Find PC targets sorted by length to match the longest full names first
+            possible_names = sorted(
+                [
+                    e.name
+                    for e in all_ents.values()
+                    if any(t.lower() in ["pc", "player", "party_npc"] for t in getattr(e, "tags", []))
+                ],
+                key=len,
+                reverse=True,
+            )
+            for name in possible_names:
+                if content_after.lower().startswith(name.lower()):
+                    # Ensure clean name break (handles cases like John matching Johnathon incorrectly)
+                    if len(content_after) == len(name) or content_after[len(name)] == " ":
+                        target_ent = await _get_entity_by_name(name, request.vault_path)
+                        target_name = target_ent.name if target_ent else name
+                        whisper_text = content_after[len(name) :].strip()
+                        break
+
+    if is_whisper:
+
+        async def whisper_generator():
+            if not target_ent or not target_name:
+                yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Could not find a valid player target for whisper.', 'status': 'error'})}\n\n"
+                return
+
+            if not whisper_text:
+                yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Whisper message cannot be empty.', 'status': 'error'})}\n\n"
+                return
+
+            source_ent = await _get_entity_by_name(request.character, request.vault_path)
+            if not source_ent and request.character != "Human DM":
+                yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Source character not found.', 'status': 'error'})}\n\n"
+                return
+
+            if request.character != "Human DM":
+                if getattr(source_ent, "current_map", "") != getattr(target_ent, "current_map", ""):
+                    yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_ent.name} is not in the same location.', 'status': 'error'})}\n\n"
+            if target_name != "DM":
+                source_ent = await _get_entity_by_name(request.character, request.vault_path)
+                if not source_ent and request.character != "Human DM":
+                    yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Source character not found.', 'status': 'error'})}\n\n"
+                    return
+
+                # Enforce standard 120ft telepathy/message range
+                dist = spatial_service.calculate_distance(
+                    getattr(source_ent, "x", 0.0),
+                    getattr(source_ent, "y", 0.0),
+                    getattr(source_ent, "z", 0.0),
+                    getattr(target_ent, "x", 0.0),
+                    getattr(target_ent, "y", 0.0),
+                    getattr(target_ent, "z", 0.0),
+                    request.vault_path,
+                )
+                if dist > 120.0:
+                    yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_ent.name} is too far away to whisper ({dist:.1f}ft > 120ft).', 'status': 'error'})}\n\n"
+                    return
+                if request.character != "Human DM":
+                    if getattr(source_ent, "current_map", "") != getattr(target_ent, "current_map", ""):
+                        yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_name} is not in the same location.', 'status': 'error'})}\n\n"
+                        return
+
+                    # Enforce standard 120ft telepathy/message range
+                    dist = spatial_service.calculate_distance(
+                        getattr(source_ent, "x", 0.0),
+                        getattr(source_ent, "y", 0.0),
+                        getattr(source_ent, "z", 0.0),
+                        getattr(target_ent, "x", 0.0),
+                        getattr(target_ent, "y", 0.0),
+                        getattr(target_ent, "z", 0.0),
+                        request.vault_path,
+                    )
+                    if dist > 120.0:
+                        yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_name} is too far away to whisper ({dist:.1f}ft > 120ft).', 'status': 'error'})}\n\n"
+                        return
+
+            target_client_ids = []
+            assigned_cids = set(CHARACTER_LOCKS.values())
+            unassigned_cids = [cid for cid, q in broadcaster.queues if cid not in assigned_cids]
+            target_client_ids.extend(unassigned_cids)
+            if "Human DM" in CHARACTER_LOCKS:
+                target_client_ids.append(CHARACTER_LOCKS["Human DM"])
+
+            if target_ent.name in CHARACTER_LOCKS:
+                target_client_ids.append(CHARACTER_LOCKS[target_ent.name])
+            if target_name != "DM" and target_name in CHARACTER_LOCKS:
+                target_client_ids.append(CHARACTER_LOCKS[target_name])
+
+            target_client_ids = list(set(target_client_ids))
+
+            await write_audit_log(request.vault_path, request.character, f"Whispered to {target_ent.name}", whisper_text)
+            await write_audit_log(request.vault_path, request.character, f"Whispered to {target_name}", whisper_text)
+
+            # Feedback to the sender (Formatted beautifully for the DM, plain text for players due to CSS constraints)
+            if request.character == "Human DM":
+                sender_feedback = f'<div class="perspective" data-target="{target_ent.name}">**[You whisper to {target_ent.name}]**: {whisper_text}</div>\\n\\n'
+                sender_feedback = f'<div class="perspective" data-target="{target_name}">**[You whisper to {target_name}]**: {whisper_text}</div>\\n\\n'
+            else:
+                sender_feedback = f"*(Message secretly sent to {target_ent.name})*\\n\\n"
+                sender_feedback = f"*(Message secretly sent to {target_name})*\\n\\n"
+            yield f"data: {json.dumps({'reply': sender_feedback, 'status': 'done'})}\n\n"
+
+            # Broadcast secretly to the Target and the DM using the Perspective HTML wrappers
+            broadcast_targets = [cid for cid in target_client_ids if cid != request.client_id]
+            if broadcast_targets:
+                await broadcaster.broadcast(
+                    request.client_id,
+                    f"data: {json.dumps({'reply': f'<div class=\"perspective\" data-target=\"{target_ent.name}\">**[{request.character} whispers]**: {whisper_text}</div>\\n\\n', 'status': 'streaming'})}\n\n",
+                    f"data: {json.dumps({'reply': f'<div class=\"perspective\" data-target=\"{target_name}\">**[{request.character} whispers]**: {whisper_text}</div>\\n\\n', 'status': 'streaming'})}\n\n",
+                    target_client_ids=broadcast_targets,
+                )
+                await broadcaster.broadcast(
+                    request.client_id, f"data: {json.dumps({'status': 'done'})}\n\n", target_client_ids=broadcast_targets
+                )
+
+        return StreamingResponse(whisper_generator(), media_type="text/event-stream")
+
     print(f"\nInitiating Supervisor Loop for: {formatted_prompt}")
     await write_audit_log(request.vault_path, request.character, "Input Received", clean_msg)
+
+    # Identify who should receive the chat echo and the resulting LLM response stream
+    target_client_ids = None  # None defaults to broadcasting to everyone (for Human DM)
+    if request.character != "Human DM":
+        target_client_ids = []
+
+        # 1. DMs and Unassigned clients (Observers/QA) are omniscient and always get the broadcast
+        assigned_cids = set(CHARACTER_LOCKS.values())
+        unassigned_cids = [cid for cid, q in broadcaster.queues if cid not in assigned_cids]
+        target_client_ids.extend(unassigned_cids)
+        if "Human DM" in CHARACTER_LOCKS:
+            target_client_ids.append(CHARACTER_LOCKS["Human DM"])
+
+        # 2. Find nearby players who can actually perceive the sender
+        source_entity = await _get_entity_by_name(request.character, request.vault_path)
+        if source_entity:
+            nearby_uuids = spatial_service.get_perceivers(
+                source_entity.entity_uuid, radius=60.0, require_los=False, vault_path=request.vault_path
+            )
+            all_ents = get_all_entities(request.vault_path)
+            for uid in nearby_uuids:
+                ent = all_ents.get(uid)
+                if ent and ent.name in CHARACTER_LOCKS:
+                    target_client_ids.append(CHARACTER_LOCKS[ent.name])
+
+        target_client_ids = list(set(target_client_ids))  # Deduplicate
 
     # Broadcast the user's action to listeners
     await broadcaster.broadcast(
         request.client_id,
         f"data: {json.dumps({'reply': f'**[{request.character}]**: {clean_msg}\\n\\n', 'status': 'streaming'})}\n\n",
+        target_client_ids=target_client_ids,
     )
 
     initial_state = {
@@ -1159,6 +1621,11 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                 # 1. Initialize Deterministic Engine
                 await initialize_engine_from_vault(request.vault_path)
 
+                # Update server discovery info
+                global ACTIVE_VAULT_PATH, ACTIVE_CAMPAIGN_NAME
+                ACTIVE_VAULT_PATH = request.vault_path
+                ACTIVE_CAMPAIGN_NAME = os.path.basename(os.path.abspath(request.vault_path.rstrip("/\\"))) or "DM Engine"
+
                 # Yield an initial status
                 yield f"data: {json.dumps({'reply': '*(Thinking...)*\\n\\n', 'status': 'streaming'})}\n\n"
 
@@ -1173,7 +1640,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                         if chunk:
                             payload = f"data: {json.dumps({'reply': chunk, 'status': 'streaming'})}\n\n"
                             yield payload
-                            await broadcaster.broadcast(request.client_id, payload)
+                            await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 
                     # B. Expose Engine Tools so players see the math happening
                     elif kind == "on_tool_start":
@@ -1182,7 +1649,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                             msg = f"\n> *(Engine: Executing {tool_name}...)*\n"
                             payload = f"data: {json.dumps({'reply': msg, 'status': 'streaming'})}\n\n"
                             yield payload
-                            await broadcaster.broadcast(request.client_id, payload)
+                            await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 
                     # C. Intercept QA Rejections
                     elif kind == "on_chain_end" and node_name == "qa":
@@ -1194,19 +1661,19 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                                 intercept_msg = qa_out.get("draft_response")
                                 payload = f"data: {json.dumps({'reply': f'\\n\\n{intercept_msg}', 'status': 'streaming'})}\n\n"
                                 yield payload
-                                await broadcaster.broadcast(request.client_id, payload)
+                                await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
                             # If QA rejected and forced a rewrite
                             elif feedback and feedback != "APPROVED":
                                 msg = "\n\n> *(QA Intercept: Correcting mechanical discrepancy. Rewriting...)*\n\n"
                                 payload = f"data: {json.dumps({'reply': msg, 'status': 'streaming'})}\n\n"
                                 yield payload
-                                await broadcaster.broadcast(request.client_id, payload)
+                                await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 
                 # 3. Save combat math back to Obsidian files
                 await sync_engine_to_vault(request.vault_path)
                 payload = f"data: {json.dumps({'reply': '', 'status': 'done'})}\n\n"
                 yield payload
-                await broadcaster.broadcast(request.client_id, payload)
+                await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 
             except Exception as e:
                 logger.exception(
@@ -1222,7 +1689,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                 )
                 payload = f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {str(e)}', 'status': 'error'})}\n\n"
                 yield payload
-                await broadcaster.broadcast(request.client_id, payload)
+                await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 
     # Return the SSE stream bypassing the standard Pydantic model response
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
