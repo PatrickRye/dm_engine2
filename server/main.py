@@ -306,11 +306,11 @@ async def lifespan(app: FastAPI):
         print(f"Starting QA Reporters at {qa_path}...")
         qa_process = subprocess.Popen(["python", qa_path])
 
-    # Get model from env or default to flash (much higher rate limits than Pro)
-    _model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    # Get model from env or default to Gemini-2.5-flash (higher rate limits than Pro)
+    _model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
     try:
-        # Using Flash for better rate limits - Pro exhausts quickly
+        # Using Flash for better rate limits — Pro exhausts quickly
         draft_llm = ChatGoogleGenerativeAI(model=_model, temperature=0.6)
         qa_llm = ChatGoogleGenerativeAI(model=_model, temperature=0.1)
 
