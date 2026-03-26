@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -31,6 +32,46 @@ def apply_triage_assessment(labels: list[str], comment: str = "") -> str:
         return f"Successfully applied labels: {labels}" + (" and added comment." if comment else ".")
     except Exception as e:
         return f"Error applying triage assessment: {e}"
+
+
+# ----------------------------------------------------------------------
+# Deterministic pre-filter: bypass LLM for obvious pattern-matched issues
+# ----------------------------------------------------------------------
+# (priority, category, scale, status, needs_architect_comment)
+_PATTERNS = [
+    # Crash/exception → software, high priority
+    (re.compile(r"\b(crash|exception|traceback|stack trace|fatal error|critical error)\b", re.I), ["priority: high", "category: software", "scale: medium", "status: backlog"], False),
+    # Memory/performance issues → software, high
+    (re.compile(r"\b(memory leak|memory growth|performance|slow|latency|timeout|out of memory)\b", re.I), ["priority: high", "category: software", "scale: medium", "status: backlog"], False),
+    # Bug/error with no rules/narrative → software
+    (re.compile(r"\b(bug|error|wrong|incorrect|broken|fails? to|doesn.?t work)\b", re.I), ["priority: medium", "category: software", "scale: small", "status: backlog"], False),
+    # Rules violations
+    (re.compile(r"\b(rule|wrong|ruling|mechanic|damage|spell|ability|roll)\b", re.I), ["priority: medium", "category: rules", "scale: small", "status: backlog"], False),
+    # Narrative/player agency issues
+    (re.compile(r"\b(narrative|story|player agency|dialogue|prose|description|dm voice)\b", re.I), ["priority: low", "category: narrative-agency", "scale: small", "status: backlog"], False),
+    # Epic-scale keywords
+    (re.compile(r"\b(epic|large|refactor|architect|design overhaul|multi-file|redesign)\b", re.I), ["priority: medium", "category: software", "scale: epic", "status: needs_architect"], True),
+]
+
+
+def _deterministic_triage(issue_title: str, issue_body: str) -> dict | None:
+    """
+    Returns a dict with triage result if the issue matches a known pattern,
+    or None if it should escalate to the LLM.
+    """
+    text = f"{issue_title} {issue_body}"
+    for pattern, labels, needs_comment in _PATTERNS:
+        if pattern.search(text):
+            result = {
+                "labels": labels,
+                "needs_architect_comment": needs_comment,
+                "escalate_to_llm": False,
+            }
+            # Check for epic scale in body (not just title)
+            if "epic" in pattern.pattern.lower() and len(text) > 2000:
+                result["escalate_to_llm"] = True  # Too complex, needs LLM to subdivide
+            return result
+    return None  # Novel issue — escalate to LLM
 
 
 TRIAGER_PROMPT = """
@@ -65,6 +106,31 @@ def main():
     issue_body = os.environ.get("ISSUE_BODY", "No body provided.")
 
     print(f"Triaging Issue: {issue_title}")
+
+    # Try deterministic pre-filter first
+    deterministic = _deterministic_triage(issue_title, issue_body)
+
+    if deterministic and not deterministic["escalate_to_llm"]:
+        labels = deterministic["labels"]
+        needs_architect = deterministic["needs_architect_comment"]
+
+        comment = ""
+        if needs_architect:
+            comment = (
+                "This issue is too large for a single pass. "
+                "Please sub-divide it into smaller, focused tasks before implementation."
+            )
+
+        print(f"[Deterministic triage] Labels: {labels}")
+        result = apply_triage_assessment.invoke({
+            "labels": labels,
+            "comment": comment,
+        })
+        print(f"Result: {result}")
+        return
+
+    # Fall back to LLM for novel/mixed/unclear issues
+    print("[LLM triage] No deterministic match — using LLM.")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2)
     agent = create_react_agent(llm, [apply_triage_assessment])
     state = {

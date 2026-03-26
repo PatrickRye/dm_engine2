@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -102,6 +103,49 @@ def main():
             project_design_content = f.read()
 
     print(f"Planning Issue #{issue_number}: {issue_title}")
+
+    # ------------------------------------------------------------------
+    # Deterministic escape hatch: if implementer instructions already
+    # exist, skip LLM and execute the plan directly.
+    # ------------------------------------------------------------------
+    if "## Implementer Instructions" in issue_body or "## Implementer Instructions" in issue_title:
+        print("[Deterministic plan] Issue already has Implementer Instructions — skipping LLM.")
+
+        # Extract branch name
+        branch_name = f"feature/ISSUE-{issue_number}"
+        print(f"[Deterministic plan] Creating branch: {branch_name}")
+        create_branch.invoke({"branch_name": branch_name})
+
+        # Extract any file mentions to check for conflicts
+        file_patterns = re.findall(r'`([^`]+)`', issue_body)
+        if file_patterns:
+            conflict_result = check_open_prs_for_files.invoke({"files": file_patterns})
+            print(f"[Deterministic plan] Conflict check: {conflict_result}")
+            if "free" not in conflict_result.lower():
+                # Files are locked — just update status and exit
+                update_issue_and_assign.invoke({
+                    "issue_number": issue_number,
+                    "new_status_label": "status: backlog",
+                    "comment": f"Cannot create branch — files are locked in an open PR: {conflict_result}",
+                })
+                print("[Deterministic plan] Files locked. Status set to backlog.")
+                return
+
+        # Update issue: set to selected, add comment
+        comment = (
+            f"Branch `{branch_name}` created. "
+            "Issue already contains ## Implementer Instructions — implementation may begin."
+        )
+        update_issue_and_assign.invoke({
+            "issue_number": issue_number,
+            "new_status_label": "status: selected",
+            "comment": comment,
+        })
+        print(f"[Deterministic plan] Branch created. Issue #{issue_number} set to status: selected.")
+        return
+
+    # Fall back to LLM for issues needing requirements refinement
+    print("[LLM plan] No Implementer Instructions — using LLM to refine and plan.")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
     agent = create_react_agent(llm, [check_open_prs_for_files, create_branch, update_issue_and_assign])
 

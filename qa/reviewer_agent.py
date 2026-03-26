@@ -107,6 +107,24 @@ def main():
         sys.exit(1)
 
     print(f"Reviewing Branch: {target_branch} (Tests: {test_conclusion})")
+
+    # ------------------------------------------------------------------
+    # Deterministic shortcut: test failures skip LLM entirely
+    # ------------------------------------------------------------------
+    if test_conclusion.lower() == "failure":
+        print("[Deterministic reject] Tests failed — skipping LLM review.")
+        issue_num = target_branch.split("ISSUE-")[1] if "ISSUE-" in target_branch else "unknown"
+        print(f"[Deterministic reject] Updating issue #{issue_num} to status: backlog.")
+        update_issue_status.invoke({
+            "issue_number": int(issue_num) if issue_num != "unknown" else 0,
+            "new_label": "status: backlog",
+            "comment": f"Automated CI failure on branch `{target_branch}`. Tests did not pass. Please fix before re-review.",
+        })
+        print("[Deterministic reject] Done — no LLM review needed for failed tests.")
+        return
+
+    # Only use LLM for passing PRs
+    print("[LLM review] Tests passed — using LLM for quality review.")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0)
     tools = [get_pr_by_branch, get_file_from_branch, merge_pull_request, update_issue_status]
     prompt = REVIEWER_PROMPT.replace("{TARGET_BRANCH}", target_branch).replace("{TEST_CONCLUSION}", test_conclusion)

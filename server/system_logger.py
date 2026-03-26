@@ -16,10 +16,14 @@ class JSONFormatter(logging.Formatter):
             "character": getattr(record, 'context', {}).get("character", "SYSTEM"),
             "campaign_name": getattr(record, 'context', {}).get("vault_path", "UNKNOWN"),
             "message": record.getMessage(),
-            "context": getattr(record, 'context', {})
+            "context": getattr(record, 'context', {}),
+            # Canonical stack trace field name (also written as "exception" for backward compat)
+            "stack_trace": None,
         }
         if record.exc_info:
-            log_entry["exception"] = self.formatException(record.exc_info)
+            tb = self.formatException(record.exc_info)
+            log_entry["stack_trace"] = tb
+            log_entry["exception"] = tb   # backward-compat alias
         return json.dumps(log_entry)
 
 os.makedirs("logs/active", exist_ok=True)

@@ -2,14 +2,14 @@ import os
 import time
 import shutil
 import multiprocessing
-from datetime import datetime
-import urllib.request
-from urllib.parse import quote
-import socket
+import hashlib
 import json
 import re
 import glob
-import threading
+import socket
+import urllib.request
+from urllib.parse import quote
+from datetime import datetime
 from filelock import FileLock
 
 try:
@@ -45,7 +45,22 @@ for d in [LOGS_ACTIVE, LOGS_QA, LOGS_PROCESSED, LOGS_PUBLISHED_ISSUES]:
     os.makedirs(d, exist_ok=True)
 
 
-# 2. Agent Tools
+# 2. Error fingerprinting for duplicate detection
+def _error_fingerprint(error_msg: str, stack_trace: str = "") -> str:
+    """
+    Compute a short hash fingerprint from an error message and stack trace.
+    Normalizes whitespace and trims to first 200 chars of message to avoid
+    noise like timestamps or memory addresses.
+    """
+    normalized = re.sub(r'\s+', ' ', (error_msg + " " + stack_trace).strip()).lower()
+    normalized = re.sub(r'0x[0-9a-f]+', '0xADDR', normalized)  # normalize memory addresses
+    normalized = re.sub(r'line \d+', 'line N', normalized)      # normalize line numbers
+    normalized = re.sub(r'[0-9]{10,}', 'TIMESTAMP', normalized)  # normalize timestamps
+    short = normalized[:500]
+    return hashlib.md5(short.encode()).hexdigest()[:12]
+
+
+# 3. Agent Tools
 @tool
 def list_unprocessed_logs(directory: str) -> list:
     """Lists all .jsonl files in the specified directory ('active' or 'qa_audits')."""
@@ -216,6 +231,178 @@ def _invoke_agent_safe(agent, state, agent_label: str):
         print(f"[{agent_label}] API Error: {e}")
 
 
+def _find_duplicate_issue(repo, fingerprint: str, label: str = "bug") -> int | None:
+    """
+    Deterministic duplicate detection: search open issues for one whose body
+    contains the fingerprint hash. Returns issue number if found, else None.
+    """
+    try:
+        for issue in repo.get_issues(state="open", labels=[label]):
+            if fingerprint in (issue.body or ""):
+                return issue.number
+    except Exception:
+        pass
+    return None
+
+
+def _process_system_logs_deterministic(log_filepath: str) -> tuple[int, int]:
+    """
+    Deterministic pre-processor for system agent: parses a .jsonl log file,
+    fingerprints each ERROR/CRITICAL entry, and deduplicates against existing
+    GitHub issues before any LLM call.
+
+    Returns (novel_count, duplicate_count).
+    Novel errors are left in the log for LLM to process; duplicates are
+    commented on and the log entry is marked done.
+    """
+    novel_entries = []
+    dup_count = 0
+
+    try:
+        repo = _get_repo()
+    except Exception as e:
+        print(f"[System Agent] Could not connect to GitHub: {e}")
+        return (0, 0)
+
+    try:
+        with open(log_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                level = entry.get("level", "")
+                if level not in ("ERROR", "CRITICAL"):
+                    continue
+
+                error_msg = entry.get("message", "") or entry.get("error", "") or ""
+                # "stack_trace" is the canonical field (set by system_logger.py JSONFormatter)
+                stack_trace = entry.get("stack_trace", "") or entry.get("exception", "") or ""
+                timestamp = entry.get("timestamp", "")
+                agent_id = entry.get("agent_id", "unknown")
+
+                fingerprint = _error_fingerprint(error_msg, stack_trace)
+                dup_issue = _find_duplicate_issue(repo, fingerprint)
+
+                if dup_issue:
+                    # Deterministic duplicate: comment and done, no LLM needed
+                    comment_body = (
+                        f"**Recurrence detected** (fingerprint: `{fingerprint}`)\n"
+                        f"Another instance logged at: `{timestamp}`\n"
+                        f"Agent: `{agent_id}`"
+                    )
+                    try:
+                        comment_on_github_issue.invoke({
+                            "issue_number": dup_issue,
+                            "comment_body": comment_body,
+                        })
+                        print(f"[System Agent] Commented on duplicate issue #{dup_issue} (fingerprint: {fingerprint})")
+                    except Exception as e:
+                        print(f"[System Agent] Failed to comment on #{dup_issue}: {e}")
+                    dup_count += 1
+                else:
+                    # Novel error — mark fingerprint in entry so LLM can use it
+                    entry["_fingerprint"] = fingerprint
+                    novel_entries.append(entry)
+
+        # Write novel entries back to the log (LLM will process these)
+        if novel_entries:
+            processed_path = log_filepath + ".novel.tmp"
+            with open(processed_path, "w", encoding="utf-8") as f:
+                for entry in novel_entries:
+                    f.write(json.dumps(entry) + "\n")
+            # Overwrite original with novel-only content
+            shutil.move(processed_path, log_filepath)
+        else:
+            # All entries were duplicates — move to processed immediately
+            filename = os.path.basename(log_filepath)
+            dest = os.path.join(LOGS_PROCESSED, filename)
+            shutil.move(log_filepath, dest)
+            print(f"[System Agent] All entries were duplicates. Moved to processed: {filename}")
+
+    except Exception as e:
+        print(f"[System Agent] Deterministic pre-process failed: {e}")
+
+    return (len(novel_entries), dup_count)
+
+
+def _process_rules_logs_deterministic(log_filepath: str) -> tuple[int, int]:
+    """
+    Deterministic pre-processor for rules agent: fully deterministic routing based
+    on agent_id and level — no LLM needed for any of the three qa_audit event types.
+
+    Routing table:
+      QA_Agent + INFO + approval       → deterministic filter (normal approval, no issue)
+      QA_Agent + INFO + Clarification  → deterministic filter (player clarification, no issue)
+      QA_Agent + WARNING + REJECTED    → deterministic filter (QA self-correction, no issue)
+      PLAYER_CHALLENGE + WARNING       → LLM needed (genuine rules dispute to validate)
+      Any other agent_id / level       → deterministic filter (irrelevant to rules)
+
+    Returns (novel_count, filtered_count).
+    novel_count == 0 means 100% deterministic — no LLM call needed.
+    """
+    novel_entries = []
+    filtered_count = 0
+
+    try:
+        with open(log_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                agent_id = entry.get("agent_id", "")
+                level = entry.get("level", "")
+                message = entry.get("message", "")
+
+                # ── 1. QA Agent events: all deterministic, no LLM needed ──────────
+                if agent_id == "QA_Agent":
+                    msg_upper = message.upper()
+                    is_approval = "APPROVED" in msg_upper or "COMMIT" in msg_upper
+                    is_clarification = "CLARIFICATION" in msg_upper
+                    is_rejection = level == "WARNING" and "REJECTED" in msg_upper
+
+                    filtered_count += 1
+                    print(f"[Rules Agent] Filtered QA_Agent ({level}): {message[:60]}")
+                    continue
+
+                # ── 2. Player challenges: need LLM to validate ─────────────────────
+                if agent_id == "PLAYER_CHALLENGE":
+                    novel_entries.append(entry)
+                    continue
+
+                # ── 3. Any other agent_id: deterministic filter ───────────────────
+                filtered_count += 1
+                print(f"[Rules Agent] Filtered unrelated ({agent_id}): {message[:60]}")
+                continue
+
+        if novel_entries:
+            processed_path = log_filepath + ".novel.tmp"
+            with open(processed_path, "w", encoding="utf-8") as f:
+                for entry in novel_entries:
+                    f.write(json.dumps(entry) + "\n")
+            shutil.move(processed_path, log_filepath)
+        else:
+            # 100% deterministic — move straight to processed, no LLM needed at all
+            filename = os.path.basename(log_filepath)
+            dest = os.path.join(LOGS_PROCESSED, filename)
+            shutil.move(log_filepath, dest)
+            print(f"[Rules Agent] 100% deterministic — moved to processed without LLM: {filename}")
+
+    except Exception as e:
+        print(f"[Rules Agent] Deterministic pre-process failed: {e}")
+
+    return (len(novel_entries), filtered_count)
+
+
 def run_rules_agent():
     print("[Rules Agent] Started process. Monitoring /logs/qa_audits")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2)
@@ -242,7 +429,18 @@ def run_rules_agent():
     }
 
     def _run_once():
-        _invoke_agent_safe(agent, state_template, "Rules Agent")
+        # Deterministic pre-process: filter obvious non-issues before LLM
+        for filepath in list_unprocessed_logs.invoke({"directory": "qa_audits"}):
+            novel_count, filtered_count = _process_rules_logs_deterministic(filepath)
+            print(f"[Rules Agent] Processed {filepath}: {novel_count} valid, {filtered_count} filtered")
+
+        # Only invoke LLM if there are still entries for it to process
+        novel_files = list_unprocessed_logs.invoke({"directory": "qa_audits"})
+        if not novel_files:
+            print("[Rules Agent] No valid rules challenges after filtering. Skipping LLM.")
+        else:
+            print(f"[Rules Agent] Invoking LLM for {len(novel_files)} file(s).")
+            _invoke_agent_safe(agent, state_template, "Rules Agent")
 
     if _WATCHDOG_AVAILABLE:
         class _RulesHandler(FileSystemEventHandler):
@@ -305,7 +503,18 @@ def run_system_agent():
     }
 
     def _run_once():
-        _invoke_agent_safe(agent, state_template, "System Agent")
+        # Deterministic pre-process: fingerprint errors, deduplicate, comment on known dupes
+        for filepath in list_unprocessed_logs.invoke({"directory": "active"}):
+            novel_count, dup_count = _process_system_logs_deterministic(filepath)
+            print(f"[System Agent] Processed {filepath}: {novel_count} novel, {dup_count} duplicates")
+
+        # Only invoke LLM if there are still novel entries for it to process
+        novel_files = list_unprocessed_logs.invoke({"directory": "active"})
+        if not novel_files:
+            print("[System Agent] No novel errors after deduplication. Skipping LLM.")
+        else:
+            print(f"[System Agent] Invoking LLM for {len(novel_files)} file(s) with novel errors.")
+            _invoke_agent_safe(agent, state_template, "System Agent")
 
     if _WATCHDOG_AVAILABLE:
         class _SystemHandler(FileSystemEventHandler):
