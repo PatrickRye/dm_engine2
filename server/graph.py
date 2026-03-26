@@ -1086,7 +1086,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
 
         # Route based on what planner returned (the AIMessage before this node)
         tool_name = _get_tool_name_from_message(last_msg)
-        if tool_name == "run_ingestion_pipeline_tool":
+        if tool_name in ("run_ingestion_pipeline_tool", "hydrate_campaign"):
             goto = "ingestion"
         elif tool_name in LOGIC_TOOL_NAMES:
             goto = "action_logic"
@@ -1106,7 +1106,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         """Route: ingestion → ingestion_node (direct, no stale-check needed), all others → clear_mutations."""
         last_msg = state["messages"][-1]
         tool_name = _get_tool_name_from_message(last_msg)
-        if tool_name == "run_ingestion_pipeline_tool":
+        if tool_name in ("run_ingestion_pipeline_tool", "hydrate_campaign"):
             return "ingestion"
         return "clear_mutations"
 
@@ -1120,21 +1120,61 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         """
         Phase 2: Parse raw NPC lore and campaign narrative into KG entities and Storylets.
 
-        Triggered when the planner calls run_ingestion_pipeline_tool.
+        Triggered when the planner calls run_ingestion_pipeline_tool or hydrate_campaign.
         Uses the session LLM (draft_llm from build_graph closure) directly.
         """
         from langchain_core.messages import ToolMessage as LCToolMessage
 
         last_msg = state["messages"][-1]
         tool_name = _get_tool_name_from_message(last_msg)
-        if tool_name != "run_ingestion_pipeline_tool":
+        if tool_name not in ("run_ingestion_pipeline_tool", "hydrate_campaign"):
             return {}  # Not an ingestion call — shouldn't happen
 
         # Extract tool args from the planner's AIMessage
         tc = last_msg.tool_calls[0]
         args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
-
         vault_path = state.get("vault_path", "default")
+
+        if tool_name == "hydrate_campaign":
+            # hydrate_campaign receives CampaignMaterials as a JSON string
+            try:
+                import json
+                materials_raw = args.get("campaign_materials_json", "{}")
+                materials_dict = json.loads(materials_raw) if materials_raw else {}
+                from ingestion_pipeline import CampaignMaterials
+                materials = CampaignMaterials(**materials_dict)
+            except Exception as e:
+                tool_msg = LCToolMessage(
+                    content=f"SYSTEM ERROR: Failed to parse campaign materials: {e}",
+                    tool_call_id=tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "unknown"),
+                    name="hydrate_campaign",
+                )
+                return {"messages": [tool_msg]}
+
+            try:
+                from ingestion_pipeline import CampaignHydrationPipeline
+                pipeline = CampaignHydrationPipeline(draft_llm, vault_path=vault_path)
+                report = await pipeline.run(materials)
+                summary = (
+                    f"MECHANICAL TRUTH: Campaign hydration complete.\n"
+                    f"  KG nodes added: {report.nodes_added}\n"
+                    f"  KG edges added: {report.edges_added}\n"
+                    f"  Storylets created: {report.storylets_created}\n"
+                    f"  Backup storylets: {report.backup_storylets_created}\n"
+                    f"  Effects annotated: {report.effects_annotated}\n"
+                    f"  Three-clue violations: {report.three_clue_violations}"
+                )
+            except Exception as e:
+                summary = f"SYSTEM ERROR: Campaign hydration failed: {e}"
+
+            tool_msg = LCToolMessage(
+                content=summary,
+                tool_call_id=tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "unknown"),
+                name="hydrate_campaign",
+            )
+            return {"messages": [tool_msg]}
+
+        # run_ingestion_pipeline_tool path
         npc_lore = args.get("npc_lore_text", "") or ""
         campaign = args.get("campaign_narrative_text", "") or ""
         try:
