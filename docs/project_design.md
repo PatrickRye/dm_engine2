@@ -75,7 +75,7 @@ The `DramaManager` (`drama_manager.py`) selects the optimal storylet to present 
 ---
 
 ## 8. The 5-Node LangGraph Orchestration
-The core orchestration is a LangGraph state machine with 5 node types (`graph.py`):
+The core orchestration is a LangGraph state machine (`graph.py`) with these node types:
 
 ```
 planner_node → clear_mutations → action/action_logic → drama_manager → narrator → qa → commit → END
@@ -197,7 +197,7 @@ When assigning or implementing tasks, you must respect the boundaries of these d
 - Test-Driven Development (TDD) is highly encouraged.
 - All new features, bug fixes, and mechanical additions MUST be accompanied by updates to the `pytest` suite in `test/server/`.
 - Do not submit Pull Requests unless the local test suite passes perfectly.
-- **Current test count**: 557 passing tests across unit and integration suites.
+- **Current test count**: 812 passing tests across unit and integration suites.
 
 ---
 
@@ -212,17 +212,169 @@ When assigning or implementing tasks, you must respect the boundaries of these d
 
 | File | Purpose |
 |------|---------|
-| `server/graph.py` | 5-node LangGraph: planner → action → drama_manager → narrator → qa → commit |
-| `server/knowledge_graph.py` | KG with CRUD, path-finding, adjacency index, GraphRAG |
-| `server/hard_guardrails.py` | SVO validation, immutable nodes, Wikilink checks |
-| `server/storylet.py` | GraphQuery, GraphMutation, StoryletPrerequisites, Storylet, TensionLevel |
-| `server/storylet_registry.py` | Storylet polling engine + Obsidian vault persistence |
-| `server/drama_manager.py` | TensionArc, DramaManager with relationship-weighted selection |
+| `server/graph.py` | 5-node LangGraph: planner → action → drama_manager → narrator → qa → commit (21 functions) |
+| `server/state.py` | `DMState` TypedDict, `PCDetails`, `NPCDetails`, `LocationDetails`, `FactionDetails`, `ClassLevel` |
+| `server/knowledge_graph.py` | KG with CRUD, path-finding, adjacency index, edge_index (O(1) lookup), GraphRAG |
+| `server/hard_guardrails.py` | SVO validation, immutable nodes, Wikilink checks, backstory consistency |
+| `server/storylet.py` | GraphQuery, GraphMutation, StoryletPrerequisites, Storylet, TensionLevel, UrgencyLevel |
+| `server/storylet_registry.py` | Storylet polling engine + Obsidian vault persistence, `poll()`, `get_by_name()` |
 | `server/storylet_analyzer.py` | ThreeClueAnalyzer for chokepoint detection and backup storylet generation |
+| `server/drama_manager.py` | TensionArc, DramaManager with relationship-weighted selection |
+| `server/narrative_tools.py` | Storylet CRUD, graph mutations, backstory claims, `request_graph_mutations()` with deferred commit |
 | `server/ingestion_pipeline.py` | CampaignHydrationPipeline, IncrementalHydrationPipeline, EmergentWorldBuilder, EffectAnnotationPipeline |
-| `server/registry.py` | Per-vault KG and StoryletRegistry singletons |
+| `server/compendium_hydrators.py` | Parallel sub-hydrators for creatures, locations, factions, NPCs, maps, narrative, items |
+| `server/registry.py` | Per-vault KG and StoryletRegistry singletons, entity registration |
 | `server/graph_sync.py` | Bidirectional sync between flat entity registry and Knowledge Graph |
 | `server/vault_io.py` | YAML/JSON persistence for characters, monsters, KG, storylets |
-| `server/tools.py` | All LangChain tools (+40 tools) |
+| `server/event_handlers.py` | EventBus handlers for combat, movement, rest, conditions (31 functions) |
+| `server/dnd_rules_engine.py` | Core deterministic engine: Creature, Item, Modifier system, EventBus, `roll_dice()` |
+| `server/mutation_manager.py` | MutationManager for pending_mutations, snapshots, rollback, leak detection |
+| `server/tools.py` | All LangChain tools (+40 tools) — backward-compatibility re-exports |
+| `server/world_tools.py` | World/interaction tools: rest, time, social interaction |
+| `server/combat_tools.py` | Combat tools: attack, damage, conditions |
+| `server/entity_tools.py` | Entity creation/spawn/update tools |
+| `server/item_tools.py` | Equipment, inventory, attunement tools |
+| `server/spatial_tools.py` | Movement, positioning, `get_entity_space()` |
+| `server/spatial_engine.py` | GIS-based spatial engine with shapely/rtree |
 | `server/main.py` | FastAPI app, LLM initialization, LangGraph compilation |
-| `test/server/test_*.py` | 557 passing tests |
+| `test/server/test_*.py` | 812 passing tests (pytest collection) |
+
+---
+
+## 18. Dependency Tree
+
+```
+server/
+├── graph.py                    # LangGraph orchestration
+│   └── state.py               # DMState TypedDict
+├── knowledge_graph.py         # KG data structure
+│   ├── registry.py            # KG singletons
+│   └── storylet.py            # GraphMutation, Storylet
+├── hard_guardrails.py         # SVO validation
+│   ├── knowledge_graph.py     # KG queries
+│   └── storylet.py           # GraphMutation
+├── storylet_registry.py       # Storylet storage
+│   ├── storylet.py           # Storylet schema
+│   └── vault_io.py           # Persistence
+├── storylet_analyzer.py       # Three clue analysis
+├── drama_manager.py           # TensionArc, storylet selection
+│   ├── storylet_registry.py   # Polling
+│   └── knowledge_graph.py    # KG queries
+├── narrative_tools.py         # Storylet CRUD, mutations
+│   ├── storylet.py           # Storylet schema
+│   ├── storylet_registry.py  # Registry
+│   └── hard_guardrails.py    # Validation
+├── ingestion_pipeline.py      # NLP hydration
+│   ├── knowledge_graph.py    # KG writes
+│   ├── storylet.py           # Storylet creation
+│   └── narrative_tools.py    # EmergentWorldBuilder
+├── compendium_hydrators.py   # Parallel hydration
+│   └── ingestion_pipeline.py # Uses pipelines
+├── mutation_manager.py       # Pending mutations
+│   └── knowledge_graph.py    # Snapshot/rollback
+├── event_handlers.py         # EventBus handlers
+│   ├── dnd_rules_engine.py   # Core engine
+│   └── spatial_engine.py     # Spatial queries
+├── dnd_rules_engine.py       # Deterministic engine
+│   ├── state.py              # Entity models
+│   └── roll_utils.py         # Dice rolling
+├── spatial_engine.py         # GIS/shapely
+├── registry.py               # Entity registry
+│   └── knowledge_graph.py    # KG access
+├── graph_sync.py            # KG ↔ registry sync
+├── vault_io.py             # YAML persistence
+├── tools.py                # Tool re-exports
+│   ├── world_tools.py
+│   ├── combat_tools.py
+│   ├── entity_tools.py
+│   ├── item_tools.py
+│   ├── spatial_tools.py
+│   └── narrative_tools.py
+└── main.py                # FastAPI + graph build
+```
+
+---
+
+## 19. LangGraph Call Graph (Critical Paths)
+
+### Node Execution Flow
+
+```
+planner_node
+    ├── get_knowledge_graph()
+    ├── get_storylet_registry()
+    └── storylet_injection_prompt()
+
+action_logic_node
+    ├── accumulate_from_tool_calls()
+    ├── validate_full_pipeline()        # HardGuardrails
+    ├── find_node_uuid()
+    └── _get_tool_name_from_message()
+
+drama_manager_node
+    ├── select_next()                  # Storylet selection
+    ├── apply_effects()                # GraphMutation execution
+    ├── check_storylet_integrity()
+    ├── advance_turn()
+    └── write_audit_log()
+
+narrator_node
+    ├── snapshot()                     # KG snapshot for rollback
+    ├── validate()                      # HardGuardrails
+    ├── _build_kg_constraints_prompt()
+    ├── get_knowledge_graph()
+    └── write_audit_log()
+
+qa_node
+    ├── validate()                      # HardGuardrails
+    ├── detect_leak()                   # Mutation leak detection
+    ├── validate_svo_claims()
+    ├── _invalidate_grag_cache()
+    └── write_audit_log()
+
+commit_node
+    ├── commit()                        # Execute pending_mutations
+    ├── get_knowledge_graph()
+    └── write_audit_log()
+
+ingestion_node
+    └── _get_tool_name_from_message()
+
+clear_mutations_node
+    ├── should_clear_on_human_message()
+    └── clear()
+```
+
+### Deferred Mutation Pattern (Critical)
+
+```
+action_logic_node:
+    mutations = request_graph_mutations(..., commit=False)
+    state.pending_mutations.extend(mutations)  # NOT executed here!
+
+narrator_node:
+    if guardrails.approve(narrative, state.pending_mutations):
+        for mutation in state.pending_mutations:
+            mutation.execute()  # Deferred execution HERE
+
+commit_node:
+    kg.commit(state.pending_mutations)
+    EmergentWorldBuilder.on_entity_created(new_entities)
+    _invalidate_grag_cache()
+```
+
+### Hot Paths (Most Frequently Called)
+
+| Rank | Path | Calls per Narrator Inv |
+|------|------|------------------------|
+| 1 | `get_context_for_node()` via KG adjacency | 14× |
+| 2 | `backstory_claim_check()` via storylet | E (outdegree) |
+| 3 | `get_node_by_name()` | Frequent |
+| 4 | `find_node_uuid()` | Frequent |
+| 5 | `_mutation_covers_svo()` | 4-5× per QA |
+
+### Performance-Critical Functions
+
+- **`knowledge_graph.get_context_for_node()`**: O(E) → O(outdegree) via `edge_index` (added 2026-03-22)
+- **`storylet.backstory_claim_check()`**: O(E) → O(outdegree) via adjacency + `get_edge()` (added 2026-03-22)
+- **`registry.get_knowledge_graph()`**: Thread-safe singleton with lock
