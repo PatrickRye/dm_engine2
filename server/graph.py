@@ -1088,6 +1088,8 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         tool_name = _get_tool_name_from_message(last_msg)
         if tool_name in ("run_ingestion_pipeline_tool", "hydrate_campaign"):
             goto = "ingestion"
+        elif tool_name == "hydrate_compendium":
+            goto = "compendium_hydration"
         elif tool_name in LOGIC_TOOL_NAMES:
             goto = "action_logic"
         elif tool_name and tool_name not in ("__end__",):
@@ -1108,6 +1110,8 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         tool_name = _get_tool_name_from_message(last_msg)
         if tool_name in ("run_ingestion_pipeline_tool", "hydrate_campaign"):
             return "ingestion"
+        if tool_name == "hydrate_compendium":
+            return "compendium_hydration"
         return "clear_mutations"
 
     # ------------------------------------------------------------------
@@ -1211,6 +1215,93 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         return {"messages": [tool_msg]}
 
     # ------------------------------------------------------------------
+    # NODE: compendium_hydration_node — parallel compendium hydration coordinator
+    #
+    # Dispatches to sub-hydrators (creature, location, faction, npc, map,
+    # narrative, items) in parallel, aggregates results, writes KG and vault.
+    # Uses the session LLM (draft_llm from build_graph closure) directly.
+    # ------------------------------------------------------------------
+    async def compendium_hydration_node(state: DMState, config: RunnableConfig):
+        """
+        Parallel compendium hydration coordinator.
+
+        Triggered when the planner calls hydrate_compendium.
+        Uses the session LLM (draft_llm from build_graph closure) directly.
+        """
+        from langchain_core.messages import ToolMessage as LCToolMessage
+        import json
+
+        last_msg = state["messages"][-1]
+        tool_name = _get_tool_name_from_message(last_msg)
+        if tool_name != "hydrate_compendium":
+            return {}
+
+        # Extract tool args
+        tc = last_msg.tool_calls[0]
+        args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+        vault_path = state.get("vault_path", "default")
+
+        materials_json = args.get("materials_json", "{}")
+        try:
+            materials_dict = json.loads(materials_json) if materials_json else {}
+        except Exception:
+            tool_msg = LCToolMessage(
+                content="SYSTEM ERROR: Invalid materials_json",
+                tool_call_id=tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "unknown"),
+                name="hydrate_compendium",
+            )
+            return {"messages": [tool_msg]}
+
+        try:
+            from compendium_hydrators import (
+                run_compendium_hydration,
+                CompendiumMaterials,
+            )
+
+            cm = CompendiumMaterials(
+                **{k: v for k, v in materials_dict.items() if v}
+            )
+            report = await run_compendium_hydration(cm, vault_path, draft_llm)
+
+            lines = ["MECHANICAL TRUTH: Compendium hydration complete."]
+
+            def _add(label, section):
+                if section:
+                    for k, v in section.items():
+                        if k != "warnings" and isinstance(v, (int, str)):
+                            lines.append(f"  {k}: {v}")
+
+            _add("creatures", report.get("creatures"))
+            _add("locations", report.get("locations"))
+            _add("factions", report.get("factions"))
+            _add("npcs", report.get("npcs"))
+            _add("maps", report.get("maps"))
+            _add("narrative", report.get("narrative"))
+            _add("items", report.get("items"))
+
+            if report.get("errors"):
+                lines.append(f"\nERRORS ({len(report['errors'])}):")
+                for e in report["errors"]:
+                    lines.append(f"  - {e}")
+
+            if report.get("partial_failures"):
+                lines.append(f"\nPARTIAL FAILURES ({len(report['partial_failures'])}):")
+                for pf in report["partial_failures"]:
+                    lines.append(f"  - {pf}")
+
+            summary = "\n".join(lines)
+
+        except Exception as e:
+            summary = f"SYSTEM ERROR: Compendium hydration failed: {e}"
+
+        tool_msg = LCToolMessage(
+            content=summary,
+            tool_call_id=tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "unknown"),
+            name="hydrate_compendium",
+        )
+        return {"messages": [tool_msg]}
+
+    # ------------------------------------------------------------------
     # ROUTER: qa_router — decides whether to approve or loop back
     # ------------------------------------------------------------------
     def qa_router(state: DMState) -> str:
@@ -1268,13 +1359,14 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     workflow.add_node("commit", commit_node)
     workflow.add_node("clear_mutations", clear_mutations_node)
     workflow.add_node("ingestion", ingestion_node)
+    workflow.add_node("compendium_hydration", compendium_hydration_node)
 
     workflow.set_entry_point("planner")
-    # Planner routes: ingestion → ingestion_node, everything else → clear_mutations (stale check)
+    # Planner routes: ingestion → ingestion_node, compendium → compendium_hydration_node, all else → clear_mutations
     workflow.add_conditional_edges(
         "planner",
         planner_tool_router,
-        {"clear_mutations": "clear_mutations", "ingestion": "ingestion"},
+        {"clear_mutations": "clear_mutations", "ingestion": "ingestion", "compendium_hydration": "compendium_hydration"},
     )
     # clear_mutations_node uses Command(goto=...) to route to action/action_logic/narrator
     # After action (creative or logic), always route to drama_manager to update tension arc
@@ -1282,6 +1374,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     workflow.add_edge("action_logic", "drama_manager")
     # Ingestion goes to drama_manager to continue the session flow
     workflow.add_edge("ingestion", "drama_manager")
+    workflow.add_edge("compendium_hydration", "drama_manager")
     # Drama manager conditionally routes: storylet active → narrator, else → planner
     workflow.add_conditional_edges("drama_manager", drama_manager_router, {"narrator": "narrator", "planner": "planner"})
     workflow.add_edge("narrator", "qa")

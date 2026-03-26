@@ -626,6 +626,97 @@ async def hydrate_delta(
     return "\n".join(lines)
 
 
+@tool
+async def hydrate_compendium(
+    materials_json: str = "{}",
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """
+    Parallel compendium hydration: dispatch raw D&D material (creatures, locations,
+    factions, NPCs, maps, narrative, items) to specialized sub-hydrators that run
+    in parallel, write to the Knowledge Graph and vault, and aggregate results.
+
+    This is the top-level compendium coordinator. It is designed to be called once
+    at the start of a campaign or when loading a large compendium of new material.
+
+    The LLM-DM planner invokes this tool when the DM says something like:
+      "hydrate my compendium" / "load these creatures" / "import my campaign material"
+
+    Results are written directly to the Knowledge Graph, Storylet Registry,
+    and vault storage. Use this for bulk imports; use hydrate_delta for incremental
+    additions.
+
+    Args:
+        materials_json: JSON string of CompendiumMaterials:
+            {{
+              "creatures": "## Goblin\\nMedium humanoid...\\n\\n## Dragon\\nHuge...",
+              "locations": "The city of Saltmere is a coastal trading hub...",
+              "factions": "The Crimson Shield is a mercenary company...",
+              "npcs": "## Zara the Broker\\nHalf-elf female, runs the black market...",
+              "maps": "20x15 dungeon. Main entrance at south...",
+              "campaign_narrative": "The party arrives at Saltmere...",
+              "session_prep_notes": "The warlock will betray...",
+              "storylet_resolutions": {{"The Betrayal": "Zara reveals..."}},
+              "items": "### Fireball\\n3rd-level evocation..."
+            }}
+            All fields are optional — only non-empty fields are processed.
+    """
+    import json as _json
+
+    vault_path = config["configurable"].get("thread_id")
+    if not vault_path:
+        return "SYSTEM ERROR: No vault context found."
+
+    llm = config["configurable"].get("_llm")
+    if llm is None:
+        return (
+            "SYSTEM ERROR: No LLM available in session context. "
+            "The compendium hydration pipeline requires an active LLM session."
+        )
+
+    try:
+        materials = _json.loads(materials_json) if materials_json else {}
+    except Exception:
+        return "SYSTEM ERROR: Invalid materials_json. Provide a valid JSON string."
+
+    try:
+        from compendium_hydrators import run_compendium_hydration, CompendiumMaterials
+
+        cm = CompendiumMaterials(**{k: v for k, v in materials.items() if v})
+        report = run_compendium_hydration(cm, vault_path, llm)
+
+        lines = ["MECHANICAL TRUTH: Compendium hydration complete."]
+
+        def _add(label, section):
+            if section:
+                for k, v in section.items():
+                    if k != "warnings" and isinstance(v, (int, str)):
+                        lines.append(f"  {k}: {v}")
+
+        _add("creatures", report.get("creatures"))
+        _add("locations", report.get("locations"))
+        _add("factions", report.get("factions"))
+        _add("npcs", report.get("npcs"))
+        _add("maps", report.get("maps"))
+        _add("narrative", report.get("narrative"))
+        _add("items", report.get("items"))
+
+        if report.get("errors"):
+            lines.append(f"\nERRORS ({len(report['errors'])}):")
+            for e in report["errors"]:
+                lines.append(f"  - {e}")
+
+        if report.get("partial_failures"):
+            lines.append(f"\nPARTIAL FAILURES ({len(report['partial_failures'])}):")
+            for pf in report["partial_failures"]:
+                lines.append(f"  - {pf}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"SYSTEM ERROR: Compendium hydration failed: {e}"
+
 
 @tool
 async def set_storylet_deadline(
@@ -1169,6 +1260,7 @@ __all__ = [
     "run_ingestion_pipeline_tool",
     "hydrate_campaign",
     "hydrate_delta",
+    "hydrate_compendium",
     "set_storylet_deadline",
     "get_scene_provenance",
     "propose_backstory_claim",
