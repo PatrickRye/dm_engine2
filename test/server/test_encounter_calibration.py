@@ -6,7 +6,7 @@ import math
 from unittest.mock import patch, MagicMock
 import uuid
 
-from world_tools import (
+from encounter_tools import (
     _select_archetype,
     _distribute_xp_to_roles,
     _best_cr_for_xp,
@@ -268,7 +268,7 @@ class TestComputePartyLevelsFromKG:
         """REQ-BUI-007: Summoned creatures (companions, summoned) are excluded."""
         kg = KnowledgeGraph()
         spirit = self._fake_creature("Spirit", [3], summoned_by_uuid=uuid.uuid4())
-        with patch("world_tools.get_all_entities", return_value={spirit.entity_uuid: spirit}):
+        with patch("encounter_tools.get_all_entities", return_value={spirit.entity_uuid: spirit}):
             levels = _compute_party_levels_from_kg(kg, None, "default")
             assert levels == []
 
@@ -277,7 +277,7 @@ class TestComputePartyLevelsFromKG:
         kg = KnowledgeGraph()
         kg.add_node(self._make_kg_node("Spirit", is_remote=True))
         spirit = self._fake_creature("Spirit", [3])
-        with patch("world_tools.get_all_entities", return_value={spirit.entity_uuid: spirit}):
+        with patch("encounter_tools.get_all_entities", return_value={spirit.entity_uuid: spirit}):
             levels = _compute_party_levels_from_kg(kg, None, "default")
             assert levels == []
 
@@ -286,7 +286,7 @@ class TestComputePartyLevelsFromKG:
         kg = KnowledgeGraph()
         kg.add_node(self._make_kg_node("Mercenary", map_id="map_A"))
         mercenary = self._fake_creature("Mercenary", [5])
-        with patch("world_tools.get_all_entities", return_value={mercenary.entity_uuid: mercenary}):
+        with patch("encounter_tools.get_all_entities", return_value={mercenary.entity_uuid: mercenary}):
             # Mercenary is on map_A, query for map_B → excluded
             levels = _compute_party_levels_from_kg(kg, "map_B", "default")
             assert levels == []
@@ -299,7 +299,7 @@ class TestComputePartyLevelsFromKG:
         kg = KnowledgeGraph()
         kg.add_node(self._make_kg_node("Ally NPC", map_id="map_A"))
         ally = self._fake_creature("Ally NPC", [4])
-        with patch("world_tools.get_all_entities", return_value={ally.entity_uuid: ally}):
+        with patch("encounter_tools.get_all_entities", return_value={ally.entity_uuid: ally}):
             levels = _compute_party_levels_from_kg(kg, "map_A", "default")
             assert levels == [4]
 
@@ -308,7 +308,7 @@ class TestComputePartyLevelsFromKG:
         kg = KnowledgeGraph()
         kg.add_node(self._make_kg_node("Multiclass Hero"))
         hero = self._fake_creature("Multiclass Hero", [4, 3])
-        with patch("world_tools.get_all_entities", return_value={hero.entity_uuid: hero}):
+        with patch("encounter_tools.get_all_entities", return_value={hero.entity_uuid: hero}):
             levels = _compute_party_levels_from_kg(kg, None, "default")
             assert levels == [7]
 
@@ -396,7 +396,7 @@ class TestGenerateOrCalibrateEncounterTool:
     @pytest.mark.asyncio
     async def test_empty_party_levels_returns_error(self, mock_config, tool_fn):
         """No party members found and no override → SYSTEM ERROR."""
-        with patch("world_tools._compute_party_levels_from_kg", return_value=[]):
+        with patch("encounter_tools._compute_party_levels_from_kg", return_value=[]):
             result = await tool_fn(
                 party_levels=None,
                 mode="generate",
@@ -510,8 +510,8 @@ class TestGenerateOrCalibrateEncounterTool:
     @pytest.mark.asyncio
     async def test_generate_env_requirements_artillerist_present(self, mock_config, tool_fn):
         """DEGA §4: Artillerist role → cover_elements in generated encounter."""
-        with patch("world_tools.get_knowledge_graph", return_value=KnowledgeGraph()), \
-             patch("world_tools.get_all_entities", return_value={}):
+        with patch("encounter_tools.get_knowledge_graph", return_value=KnowledgeGraph()), \
+             patch("encounter_tools.get_all_entities", return_value={}):
             result = await tool_fn(
                 party_levels=[5, 5, 4, 4],
                 mode="generate",
@@ -527,8 +527,8 @@ class TestGenerateOrCalibrateEncounterTool:
     @pytest.mark.asyncio
     async def test_tactical_demeanor_in_tool_output_generate(self, mock_config, tool_fn):
         """MECHANICAL TRUTH output in generate mode includes TACTICAL DEMEANOR block."""
-        with patch("world_tools.get_knowledge_graph", return_value=KnowledgeGraph()), \
-             patch("world_tools.get_all_entities", return_value={}):
+        with patch("encounter_tools.get_knowledge_graph", return_value=KnowledgeGraph()), \
+             patch("encounter_tools.get_all_entities", return_value={}):
             result = await tool_fn(
                 party_levels=[5, 5, 4, 4],
                 mode="generate",

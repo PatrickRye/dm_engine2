@@ -389,6 +389,42 @@ def _get_tool_name_from_message(msg) -> str | None:
     return None
 
 
+# ------------------------------------------------------------------
+# Router functions — defined at module level for testability.
+# Each router is a pure function of DMState; they are passed to
+# workflow.add_conditional_edges inside build_graph().
+# ------------------------------------------------------------------
+
+def drama_manager_router(state: DMState) -> str:
+    """Route to narrator if a storylet is active, otherwise back to planner."""
+    if state.get("active_storylet_id"):
+        return "narrator"
+    return "planner"
+
+
+def planner_tool_router(state: DMState) -> str:
+    """Route: ingestion → ingestion_node (direct, no stale-check needed), all others → clear_mutations."""
+    if not state.get("messages"):
+        return "clear_mutations"
+    last_msg = state["messages"][-1]
+    tool_name = _get_tool_name_from_message(last_msg)
+    if tool_name in ("run_ingestion_pipeline_tool", "hydrate_campaign"):
+        return "ingestion"
+    if tool_name == "hydrate_compendium":
+        return "compendium_hydration"
+    return "clear_mutations"
+
+
+def qa_router(state: DMState) -> str:
+    """Route: APPROVED/COMMIT → commit_node; max revisions → force commit; rejection → narrator."""
+    if state.get("qa_feedback") == "COMMIT":
+        return "commit"
+    if state.get("revision_count", 0) >= MAX_QA_REVISIONS:
+        print("[QA Agent] - Max revisions reached. Routing to commit_node.")
+        return "commit"
+    return "narrator"
+
+
 def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     """Compile and return the DM Engine LangGraph.
 
@@ -901,11 +937,6 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             "tension_arc": dm.arc.to_dict(),
         }
 
-    def drama_manager_router(state: DMState) -> str:
-        """Route to narrator if a storylet is active, otherwise back to planner."""
-        if state.get("active_storylet_id"):
-            return "narrator"
-        return "planner"
 
     # ------------------------------------------------------------------
     # NODE: action_logic — captures mutations for deferred execution (Gap 6 fix)
@@ -1130,15 +1161,6 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     # ------------------------------------------------------------------
     # ROUTER: planner_tool_router — routes to clear_mutations_node (which handles routing)
     # ------------------------------------------------------------------
-    def planner_tool_router(state: DMState) -> str:
-        """Route: ingestion → ingestion_node (direct, no stale-check needed), all others → clear_mutations."""
-        last_msg = state["messages"][-1]
-        tool_name = _get_tool_name_from_message(last_msg)
-        if tool_name in ("run_ingestion_pipeline_tool", "hydrate_campaign"):
-            return "ingestion"
-        if tool_name == "hydrate_compendium":
-            return "compendium_hydration"
-        return "clear_mutations"
 
     # ------------------------------------------------------------------
     # NODE: ingestion_node — runs the NLP ingestion pipeline with direct LLM access
@@ -1330,16 +1352,6 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     # ------------------------------------------------------------------
     # ROUTER: qa_router — decides whether to approve or loop back
     # ------------------------------------------------------------------
-    def qa_router(state: DMState) -> str:
-        # APPROVED: route to commit_node to execute deferred mutations before ending
-        if state.get("qa_feedback") == "COMMIT":
-            return "commit"
-        # Force approve at max revisions — still route to commit_node to persist mutations
-        if state.get("revision_count", 0) >= MAX_QA_REVISIONS:
-            print("[QA Agent] - Max revisions reached. Routing to commit_node.")
-            return "commit"
-        # Rejection: route back to narrator for revision
-        return "narrator"
 
     # ------------------------------------------------------------------
     # NODE: commit_node — executes deferred mutations after QA approval

@@ -9,7 +9,7 @@ import socket
 import psutil
 import subprocess
 import math
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -224,6 +224,13 @@ LAST_SEEN = {}  # client_id -> timestamp
 LAST_MESSAGE_TIME = {}  # character_name -> timestamp
 ACTIVE_TYPERS = {}  # character_name -> timestamp (for timeout-based expiry)
 CHARACTER_LOCK_MUTEX = asyncio.Lock()  # Serializes mutations to CHARACTER_LOCKS / LAST_SEEN
+
+# Chat idempotency: request_id -> timestamp (TTL 60s)
+CHAT_REQUEST_IDS: Dict[str, float] = {}
+CHAT_REQUEST_IDS_TTL = 60.0  # seconds
+
+# Protocol version — increment when breaking changes are introduced
+PROTOCOL_VERSION = 2
 
 # Server discovery state
 ACTIVE_VAULT_PATH = ""  # Set when DM loads a vault
@@ -463,6 +470,8 @@ class ChatRequest(BaseModel):
     vault_path: str = ""
     client_id: str
     roll_automations: dict = Field(default_factory=dict)
+    request_id: Optional[str] = None  # Idempotency key — server dedupes within 60s window
+    protocol_version: int = 1
 
 
 class ChatResponse(BaseModel):
@@ -474,16 +483,31 @@ class SwitchRequest(BaseModel):
     old_character: str
     new_character: str
     client_id: str
+    protocol_version: int = 1
+
+
+class RollRequest(BaseModel):
+    formula: str = Field(description="Dice formula, e.g. '1d20+5' or '2d6'")
+    reason: str = Field(description="Description of what is being rolled, e.g. 'Attack Roll' or 'Fireball Damage'")
+    character: str = Field(description="Name of the character rolling")
+    client_id: str = Field(description="Client ID of the roller")
+    vault_path: str = ""
+    advantage: bool = False
+    disadvantage: bool = False
+    protocol_version: int = 1
 
 
 class HeartbeatRequest(BaseModel):
     client_id: str
     character: str
     roll_automations: dict = Field(default_factory=dict)
+    include_full_state: bool = False  # When True, returns char_sheet + map_state inline (avoids extra round-trips)
+    protocol_version: int = 1
 
 
 class VaultRequest(BaseModel):
     vault_path: str
+    protocol_version: int = 1
 
 
 class OOCMoveRequest(BaseModel):
@@ -491,6 +515,7 @@ class OOCMoveRequest(BaseModel):
     x: float
     y: float
     vault_path: str
+    protocol_version: int = 1
 
 
 class ProposeMoveRequest(BaseModel):
@@ -498,6 +523,7 @@ class ProposeMoveRequest(BaseModel):
     waypoints: list[tuple[float, float]]
     vault_path: str
     force_execute: bool = False
+    protocol_version: int = 1
 
 
 class ProposeMoveResponse(BaseModel):
@@ -515,11 +541,13 @@ class ProposeMoveResponse(BaseModel):
 class ToggleFoWRequest(BaseModel):
     vault_path: str
     disabled_for: list[str]
+    protocol_version: int = 1
 
 
 class ClearPathRequest(BaseModel):
     entity_name: str
     vault_path: str
+    protocol_version: int = 1
 
 
 class PingRequest(BaseModel):
@@ -528,22 +556,26 @@ class PingRequest(BaseModel):
     x: float
     y: float
     vault_path: str
+    protocol_version: int = 1
 
 
 class ToggleLivePatchRequest(BaseModel):
     client_id: str
     character: str
     enabled: bool
+    protocol_version: int = 1
 
 
 class TypingRequest(BaseModel):
     client_id: str
     character: str
     is_typing: bool
+    protocol_version: int = 1
 
 
 class PartyStatusRequest(BaseModel):
     vault_path: str
+    protocol_version: int = 1
 
 
 @app.post("/toggle_live_patch")
@@ -653,6 +685,7 @@ async def clear_path_endpoint(request: ClearPathRequest):
 async def ping_endpoint(request: PingRequest):
     """Broadcasts a map ping to all connected clients."""
     payload = {
+        "msg": "ping",
         "type": "ping",
         "character": request.character,
         "x": request.x,
@@ -661,7 +694,7 @@ async def ping_endpoint(request: PingRequest):
         "status": "streaming",
     }
     await broadcaster.broadcast("", f"data: {json.dumps(payload)}\n\n")
-    await broadcaster.broadcast("", f"data: {json.dumps({'status': 'done'})}\n\n")
+    await broadcaster.broadcast("", f"data: {json.dumps({'msg': 'control', 'status': 'done'})}\n\n")
     return {"status": "success"}
 
 
@@ -674,7 +707,7 @@ async def typing_endpoint(request: TypingRequest):
         ACTIVE_TYPERS[request.character] = current_time
     elif request.character in ACTIVE_TYPERS:
         del ACTIVE_TYPERS[request.character]
-    payload = {"type": "typing", "character": request.character, "is_typing": request.is_typing}
+    payload = {"msg": "typing", "type": "typing", "character": request.character, "is_typing": request.is_typing}
     await broadcaster.broadcast(request.client_id, f"data: {json.dumps(payload)}\n\n")
     return {"status": "success"}
 
@@ -715,6 +748,62 @@ async def party_status_endpoint(request: PartyStatusRequest):
             )
 
     return {"party": party_members}
+
+
+@app.post("/roll")
+async def roll_endpoint(request: RollRequest):
+    """Rolls dice and returns structured results for inline display."""
+    import re as _re
+
+    if not request.vault_path:
+        request.vault_path = ACTIVE_VAULT_PATH
+
+    formula = request.formula.strip().lower()
+    reason = request.reason
+
+    # Parse formula: supports "NdS", "NdS+N", "NdS-N"
+    match = _re.match(r"(\d+)d(\d+)(?:\s*([+-])\s*(\d+))?", formula)
+    if not match:
+        raise HTTPException(status_code=400, detail=f"Invalid dice format '{formula}'. Use '1d20+5' style.")
+
+    num_dice = int(match.group(1))
+    die_sides = int(match.group(2))
+    modifier_op = match.group(3)
+    modifier_val = int(match.group(4)) if match.group(4) else 0
+
+    if num_dice > 100 or die_sides > 100:
+        raise HTTPException(status_code=400, detail="Dice count or sides exceed maximum (100).")
+
+    rolls = [random.randint(1, die_sides) for _ in range(num_dice)]
+    subtotal = sum(rolls)
+
+    if modifier_op == "+":
+        total = subtotal + modifier_val
+    elif modifier_op == "-":
+        total = subtotal - modifier_val
+    else:
+        total = subtotal
+
+    mod_str = f" {modifier_op}{modifier_val}" if modifier_op else ""
+    formula_display = f"{num_dice}d{die_sides}{mod_str}"
+
+    # Natural crit/fumble detection (d20 single rolls)
+    is_crit = die_sides == 20 and num_dice == 1 and rolls[0] == 20
+    is_fumble = die_sides == 20 and num_dice == 1 and rolls[0] == 1
+
+    return {
+        "formula": formula_display,
+        "reason": reason,
+        "character": request.character,
+        "rolls": rolls,
+        "modifier": modifier_val if modifier_op == "+" else (-modifier_val if modifier_op == "-" else 0),
+        "modifier_op": modifier_op or None,
+        "subtotal": subtotal,
+        "total": total,
+        "is_crit": is_crit,
+        "is_fumble": is_fumble,
+        "roll_str": str(rolls)[1:-1],  # "1, 14, 7" for display
+    }
 
 
 @app.post("/propose_move", response_model=ProposeMoveResponse)
@@ -1066,6 +1155,7 @@ async def list_characters_endpoint(request: VaultRequest):
 class CharSheetRequest(BaseModel):
     vault_path: str
     character: str
+    protocol_version: int = 1
 
 
 @app.post("/character_sheet")
@@ -1223,11 +1313,107 @@ async def map_state_endpoint(request: VaultRequest):
     }
 
 
+# ----------------------------------------------------------------
+# Helpers for bundled heartbeat response (avoids extra round-trips when
+# include_full_state=True)
+# ----------------------------------------------------------------
+async def _build_character_sheet_response(vault_path: str, character: str) -> Dict[str, Any]:
+    """Inlines character sheet data without an extra HTTP round-trip."""
+    if character == "Human DM":
+        return {
+            "sheet": {
+                "name": "Human DM", "role": "Dungeon Master",
+                "hp": "—", "max_hp": "—", "ac": "—",
+                "conditions": [], "speed": "—", "abilities": {},
+            }
+        }
+    file_path = os.path.join(get_journals_dir(vault_path), f"{character}.md")
+    if not os.path.exists(file_path):
+        return {"error": f"Character file {character}.md not found."}
+    sheet = {}
+    try:
+        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            content = await f.read()
+            if content.startswith("---"):
+                parts = content.split("---", 2)
+                if len(parts) >= 3:
+                    sheet = await asyncio.to_thread(yaml.safe_load, parts[1]) or {}
+    except Exception as e:
+        return {"error": str(e)}
+    entity = await _get_entity_by_name(character, vault_path)
+    if entity:
+        sheet["hp"] = entity.hp.base_value if hasattr(entity, "hp") else sheet.get("hp", 0)
+        sheet["max_hp"] = entity.max_hp if hasattr(entity, "max_hp") else sheet.get("max_hp", 0)
+        sheet["ac"] = getattr(entity, "ac", sheet.get("ac", 10))
+        sheet["speed"] = getattr(entity, "speed", sheet.get("speed", "30 ft"))
+        engine_conds = [c.name for c in getattr(entity, "active_conditions", [])]
+        yaml_conds = sheet.get("conditions", [])
+        if isinstance(yaml_conds, str):
+            yaml_conds = [c.strip() for c in yaml_conds.split(",")]
+        all_conds = list(dict.fromkeys(yaml_conds + engine_conds))
+        sheet["conditions"] = all_conds
+        if hasattr(entity, "ability_scores"):
+            sheet["abilities"] = {
+                "str": getattr(entity.ability_scores, "strength", 10),
+                "dex": getattr(entity.ability_scores, "dexterity", 10),
+                "con": getattr(entity.ability_scores, "constitution", 10),
+                "int": getattr(entity.ability_scores, "intelligence", 10),
+                "wis": getattr(entity.ability_scores, "wisdom", 10),
+                "cha": getattr(entity.ability_scores, "charisma", 10),
+            }
+    return {"sheet": sheet}
+
+
+def _build_map_state_response(vault_path: str) -> Dict[str, Any]:
+    """Inlines map state data without an extra HTTP round-trip."""
+    md = spatial_service.get_map_data(vault_path)
+    entities = []
+    for uid, ent in get_all_entities(vault_path).items():
+        if not (hasattr(ent, "x") and hasattr(ent, "y")):
+            continue
+        is_pc = any(t in getattr(ent, "tags", []) for t in ["pc", "player"])
+        icon_path = getattr(ent, "icon_url", "")
+        if icon_path and not os.path.isabs(icon_path):
+            icon_path = os.path.join(vault_path, icon_path)
+        is_invisible = "invisible" in getattr(ent, "tags", []) or any(
+            c.name.lower() == "invisible" for c in getattr(ent, "active_conditions", [])
+        )
+        is_hidden = any(c.name.lower() == "hidden" for c in getattr(ent, "active_conditions", []))
+        entities.append({
+            "name": ent.name, "x": ent.x, "y": ent.y, "size": ent.size,
+            "is_pc": is_pc,
+            "hp": ent.hp.base_value if hasattr(ent, "hp") else 0,
+            "icon_url": icon_path,
+            "is_invisible": is_invisible,
+            "is_hidden": is_hidden,
+        })
+    known_traps = []
+    for wall in md.active_walls:
+        if wall.trap and wall.trap.known_by_players:
+            known_traps.append({
+                "x": (wall.start[0] + wall.end[0]) / 2,
+                "y": (wall.start[1] + wall.end[1]) / 2,
+                "name": wall.trap.hazard_name,
+            })
+    for terrain in md.active_terrain:
+        if terrain.trap and terrain.trap.known_by_players:
+            x = sum(p[0] for p in terrain.points) / len(terrain.points)
+            y = sum(p[1] for p in terrain.points) / len(terrain.points)
+            known_traps.append({"x": x, "y": y, "name": terrain.trap.hazard_name})
+    return {
+        "map_data": md.model_dump(),
+        "entities": entities,
+        "known_traps": known_traps,
+        "active_paths": list(spatial_service.active_paths.get(vault_path, {}).values()),
+    }
+
+
 class VisibilityRequest(BaseModel):
     character: str  # The character whose perspective we're checking
     target_x: float
     target_y: float
     vault_path: str = ""
+    protocol_version: int = 1
 
 
 @app.post("/visibility")
@@ -1328,13 +1514,26 @@ async def heartbeat_endpoint(request: HeartbeatRequest):
     # Get pending state changes (HP updates, condition changes, etc.)
     state_changes = await get_and_clear_state_changes()
 
-    return {
+    response_data = {
+        "protocol_version": PROTOCOL_VERSION,
         "locked_characters": locked_by_others,
         "server_name": SERVER_NAME,
         "campaign": ACTIVE_CAMPAIGN_NAME,
         "party": party_info,
         "state_changes": state_changes,
     }
+
+    # Bundle full state inline when requested (avoids extra client round-trips)
+    if request.include_full_state and ACTIVE_VAULT_PATH:
+        # Inline character sheet
+        if request.character != "Human DM":
+            char_req = CharSheetRequest(vault_path=ACTIVE_VAULT_PATH, character=request.character)
+            response_data["character_sheet"] = await _build_character_sheet_response(char_req)
+        # Inline map state
+        map_req = VaultRequest(vault_path=ACTIVE_VAULT_PATH)
+        response_data["map_state"] = await _build_map_state_response(map_req)
+
+    return response_data
 
 
 @app.post("/switch_character")
@@ -1381,6 +1580,13 @@ async def listen_endpoint(client_id: str, request: Request):
 async def chat_endpoint(request: ChatRequest):  # noqa: C901
     if not dm_engine_app:
         raise HTTPException(status_code=500, detail="DM Engine not initialized.")
+
+    # Idempotency: skip if we've seen this request_id within the TTL window
+    if request.request_id:
+        now = time.time()
+        if request.request_id in CHAT_REQUEST_IDS and now - CHAT_REQUEST_IDS[request.request_id] < CHAT_REQUEST_IDS_TTL:
+            return {"status": "duplicate", "request_id": request.request_id}
+        CHAT_REQUEST_IDS[request.request_id] = now
 
     # Use server's active vault if player didn't specify one
     if not request.vault_path:
@@ -1472,25 +1678,25 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
 
         async def whisper_generator():
             if not target_ent or not target_name:
-                yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Could not find a valid player target for whisper.', 'status': 'error'})}\n\n"
+                yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Could not find a valid player target for whisper.', 'msg': 'error', 'status': 'error'})}\n\n"
                 return
 
             if not whisper_text:
-                yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Whisper message cannot be empty.', 'status': 'error'})}\n\n"
+                yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Whisper message cannot be empty.', 'msg': 'error', 'status': 'error'})}\n\n"
                 return
 
             source_ent = await _get_entity_by_name(request.character, request.vault_path)
             if not source_ent and request.character != "Human DM":
-                yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Source character not found.', 'status': 'error'})}\n\n"
+                yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Source character not found.', 'msg': 'error', 'status': 'error'})}\n\n"
                 return
 
             if request.character != "Human DM":
                 if getattr(source_ent, "current_map", "") != getattr(target_ent, "current_map", ""):
-                    yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_ent.name} is not in the same location.', 'status': 'error'})}\n\n"
+                    yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_ent.name} is not in the same location.', 'msg': 'error', 'status': 'error'})}\n\n"
             if target_name != "DM":
                 source_ent = await _get_entity_by_name(request.character, request.vault_path)
                 if not source_ent and request.character != "Human DM":
-                    yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Source character not found.', 'status': 'error'})}\n\n"
+                    yield f"data: {json.dumps({'reply': '\\n\\n**System Error:** Source character not found.', 'msg': 'error', 'status': 'error'})}\n\n"
                     return
 
                 # Enforce standard 120ft telepathy/message range
@@ -1504,11 +1710,11 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                     request.vault_path,
                 )
                 if dist > 120.0:
-                    yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_ent.name} is too far away to whisper ({dist:.1f}ft > 120ft).', 'status': 'error'})}\n\n"
+                    yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_ent.name} is too far away to whisper ({dist:.1f}ft > 120ft).', 'msg': 'error', 'status': 'error'})}\n\n"
                     return
                 if request.character != "Human DM":
                     if getattr(source_ent, "current_map", "") != getattr(target_ent, "current_map", ""):
-                        yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_name} is not in the same location.', 'status': 'error'})}\n\n"
+                        yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_name} is not in the same location.', 'msg': 'error', 'status': 'error'})}\n\n"
                         return
 
                     # Enforce standard 120ft telepathy/message range
@@ -1522,7 +1728,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                         request.vault_path,
                     )
                     if dist > 120.0:
-                        yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_name} is too far away to whisper ({dist:.1f}ft > 120ft).', 'status': 'error'})}\n\n"
+                        yield f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {target_name} is too far away to whisper ({dist:.1f}ft > 120ft).', 'msg': 'error', 'status': 'error'})}\n\n"
                         return
 
             target_client_ids = []
@@ -1549,19 +1755,19 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
             else:
                 sender_feedback = f"*(Message secretly sent to {target_ent.name})*\\n\\n"
                 sender_feedback = f"*(Message secretly sent to {target_name})*\\n\\n"
-            yield f"data: {json.dumps({'reply': sender_feedback, 'status': 'done'})}\n\n"
+            yield f"data: {json.dumps({'reply': sender_feedback, 'msg': 'control', 'status': 'done'})}\n\n"
 
             # Broadcast secretly to the Target and the DM using the Perspective HTML wrappers
             broadcast_targets = [cid for cid in target_client_ids if cid != request.client_id]
             if broadcast_targets:
                 await broadcaster.broadcast(
                     request.client_id,
-                    f"data: {json.dumps({'reply': f'<div class=\"perspective\" data-target=\"{target_ent.name}\">**[{request.character} whispers]**: {whisper_text}</div>\\n\\n', 'status': 'streaming'})}\n\n",
-                    f"data: {json.dumps({'reply': f'<div class=\"perspective\" data-target=\"{target_name}\">**[{request.character} whispers]**: {whisper_text}</div>\\n\\n', 'status': 'streaming'})}\n\n",
+                    f"data: {json.dumps({'reply': f'<div class=\"perspective\" data-target=\"{target_ent.name}\">**[{request.character} whispers]**: {whisper_text}</div>\\n\\n', 'msg': 'narrative', 'status': 'streaming'})}\n\n",
+                    f"data: {json.dumps({'reply': f'<div class=\"perspective\" data-target=\"{target_name}\">**[{request.character} whispers]**: {whisper_text}</div>\\n\\n', 'msg': 'narrative', 'status': 'streaming'})}\n\n",
                     target_client_ids=broadcast_targets,
                 )
                 await broadcaster.broadcast(
-                    request.client_id, f"data: {json.dumps({'status': 'done'})}\n\n", target_client_ids=broadcast_targets
+                    request.client_id, f"data: {json.dumps({'msg': 'control', 'status': 'done'})}\n\n", target_client_ids=broadcast_targets
                 )
 
         return StreamingResponse(whisper_generator(), media_type="text/event-stream")
@@ -1598,7 +1804,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
     # Broadcast the user's action to listeners
     await broadcaster.broadcast(
         request.client_id,
-        f"data: {json.dumps({'reply': f'**[{request.character}]**: {clean_msg}\\n\\n', 'status': 'streaming'})}\n\n",
+        f"data: {json.dumps({'reply': f'**[{request.character}]**: {clean_msg}\\n\\n', 'msg': 'narrative', 'status': 'streaming'})}\n\n",
         target_client_ids=target_client_ids,
     )
 
@@ -1629,7 +1835,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                 ACTIVE_CAMPAIGN_NAME = os.path.basename(os.path.abspath(request.vault_path.rstrip("/\\"))) or "DM Engine"
 
                 # Yield an initial status
-                yield f"data: {json.dumps({'reply': '*(Thinking...)*\\n\\n', 'status': 'streaming'})}\n\n"
+                yield f"data: {json.dumps({'reply': '*(Thinking...)*\\n\\n', 'msg': 'narrative', 'status': 'streaming'})}\n\n"
 
                 # 2. Run the graph with astream_events to catch token-by-token streams
                 async for event in dm_engine_app.astream_events(initial_state, config=config, version="v2"):
@@ -1640,7 +1846,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                     if kind == "on_chat_model_stream" and node_name == "narrator":
                         chunk = event["data"]["chunk"].content
                         if chunk:
-                            payload = f"data: {json.dumps({'reply': chunk, 'status': 'streaming'})}\n\n"
+                            payload = f"data: {json.dumps({'msg': 'narrative', 'reply': chunk, 'status': 'streaming'})}\n\n"
                             yield payload
                             await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 
@@ -1649,7 +1855,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                         tool_name = event.get("name", "tool")
                         if tool_name not in ["ChatGoogleGenerativeAI", "planner_node"]:
                             msg = f"\n> *(Engine: Executing {tool_name}...)*\n"
-                            payload = f"data: {json.dumps({'reply': msg, 'status': 'streaming'})}\n\n"
+                            payload = f"data: {json.dumps({'reply': msg, 'msg': 'narrative', 'status': 'streaming'})}\n\n"
                             yield payload
                             await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 
@@ -1661,19 +1867,19 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                             # If QA asked a clarifying question, stream it out
                             if "draft_response" in qa_out:
                                 intercept_msg = qa_out.get("draft_response")
-                                payload = f"data: {json.dumps({'reply': f'\\n\\n{intercept_msg}', 'status': 'streaming'})}\n\n"
+                                payload = f"data: {json.dumps({'reply': f'\\n\\n{intercept_msg}', 'msg': 'narrative', 'status': 'streaming'})}\n\n"
                                 yield payload
                                 await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
                             # If QA rejected and forced a rewrite
                             elif feedback and feedback != "APPROVED":
                                 msg = "\n\n> *(QA Intercept: Correcting mechanical discrepancy. Rewriting...)*\n\n"
-                                payload = f"data: {json.dumps({'reply': msg, 'status': 'streaming'})}\n\n"
+                                payload = f"data: {json.dumps({'reply': msg, 'msg': 'narrative', 'status': 'streaming'})}\n\n"
                                 yield payload
                                 await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 
                 # 3. Save combat math back to Obsidian files
                 await sync_engine_to_vault(request.vault_path)
-                payload = f"data: {json.dumps({'reply': '', 'status': 'done'})}\n\n"
+                payload = f"data: {json.dumps({'reply': '', 'msg': 'control', 'status': 'done'})}\n\n"
                 yield payload
                 await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 
@@ -1689,7 +1895,7 @@ async def chat_endpoint(request: ChatRequest):  # noqa: C901
                         },
                     },
                 )
-                payload = f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {str(e)}', 'status': 'error'})}\n\n"
+                payload = f"data: {json.dumps({'reply': f'\\n\\n**System Error:** {str(e)}', 'msg': 'error', 'status': 'error'})}\n\n"
                 yield payload
                 await broadcaster.broadcast(request.client_id, payload, target_client_ids=target_client_ids)
 

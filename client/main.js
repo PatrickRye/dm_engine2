@@ -23,7 +23,306 @@ if (!ItemView) {
 
 const VIEW_TYPE_DM_CHAT = "dm-chat-view";
 
-class DMEngineClientCore {
+// ----------------------------------------------------------------
+// EventEmitter — minimal pub/sub for subsystem decoupling
+// ----------------------------------------------------------------
+class EventEmitter {
+    constructor() { this._listeners = {}; }
+
+    subscribe(event, callback) {
+        if (!this._listeners[event]) this._listeners[event] = [];
+        this._listeners[event].push(callback);
+        return () => this.unsubscribe(event, callback);
+    }
+
+    unsubscribe(event, callback) {
+        if (!this._listeners[event]) return;
+        this._listeners[event] = this._listeners[event].filter(cb => cb !== callback);
+    }
+
+    publish(event, data) {
+        const cbs = this._listeners[event] || [];
+        for (const cb of cbs) {
+            try { cb(data); } catch (e) { console.error(`Event handler error (${event}):`, e); }
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// MapRenderer — owns all Canvas 2D rendering state and drawScene
+// ----------------------------------------------------------------
+class MapRenderer {
+    constructor(core, emitter) {
+        this.core = core;           // DMEngineClientCore (for serverUrl, loadedImages, etc.)
+        this.emitter = emitter;     // EventEmitter (unused in Phase 1, ready for Phase 2+)
+        this.ctx = null;
+        this.canvas = null;
+        this.bgImageRef = null;
+        this.mapData = null;
+        this.entities = [];
+        this.knownTraps = [];
+        this.activePaths = [];
+        this.SCALE = 15;
+        this.activePings = [];
+        this.pingAnimationId = null;
+        this.drawSceneRef = null;
+    }
+
+    is_visible_to_player(x, y) {
+        const explored = this.mapData?.explored_areas || [];
+        for (const area of explored) {
+            const [ax, ay, radius] = area;
+            if (Math.hypot(x - ax, y - ay) <= radius) return true;
+        }
+        return false;
+    }
+
+    drawScene(bgImg) {
+        const bgImageRef = bgImg || this.bgImageRef;
+        this.bgImageRef = bgImageRef;
+        const { mapData, entities, knownTraps, activePaths, ctx, SCALE, canvas } = this;
+        if (!ctx || !mapData) return;
+        this.drawSceneRef = this.drawScene.bind(this);
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (bgImageRef) ctx.drawImage(bgImageRef, 0, 0);
+
+        // Grid
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.05)"; ctx.lineWidth = 1;
+        for (let i = 0; i < canvas.width; i += SCALE * mapData.grid_scale) {
+            ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, canvas.height); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(canvas.width, i); ctx.stroke();
+        }
+
+        // Fog of War
+        ctx.fillStyle = this.core.activeCharacter !== "Human DM" ? "rgba(0, 0, 0, 0.98)" : "rgba(0, 0, 50, 0.4)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.globalCompositeOperation = 'destination-out';
+        (mapData.explored_areas || []).forEach(area => {
+            const [x, y, radius] = area;
+            ctx.beginPath(); ctx.arc(x * SCALE, y * SCALE, radius * SCALE, 0, Math.PI * 2); ctx.fill();
+        });
+        ctx.globalCompositeOperation = 'source-over';
+
+        // Walls
+        const activeWalls = [...(mapData.walls || []), ...(mapData.temporary_walls || [])];
+        activeWalls.forEach(wall => {
+            if (!this.is_visible_to_player(wall.start[0], wall.start[1]) && !this.is_visible_to_player(wall.end[0], wall.end[1])) return;
+            ctx.beginPath(); ctx.moveTo(wall.start[0] * SCALE, wall.start[1] * SCALE);
+            ctx.lineTo(wall.end[0] * SCALE, wall.end[1] * SCALE);
+            if (!wall.is_solid && wall.is_visible) { ctx.strokeStyle = "rgba(40, 167, 69, 0.6)"; ctx.lineWidth = 4; }
+            else if (!wall.is_visible) { ctx.strokeStyle = "rgba(0, 150, 255, 0.4)"; ctx.lineWidth = 2; }
+            else { ctx.strokeStyle = "rgba(220, 53, 69, 0.8)"; ctx.lineWidth = 3; }
+            ctx.stroke();
+        });
+
+        // Set up entity icon loading + draw entities
+        entities.forEach(ent => {
+            if (!ent.icon_url) return;
+            const imgKey = ent.name + "|" + ent.icon_url;
+            if (this.core.loadedImages[imgKey] === undefined) {
+                this.core.loadedImages[imgKey] = "loading";
+                const img = new Image();
+                img.onload = () => { this.core.loadedImages[imgKey] = img; this.drawScene(); };
+                img.onerror = () => { this.core.loadedImages[imgKey] = "failed"; this.drawScene(); };
+                img.src = `${this.core.serverUrl}/vault_media?filepath=${encodeURIComponent(ent.icon_url)}`;
+            }
+        });
+
+        entities.forEach(ent => {
+            if (ent.hp <= 0) return;
+            const px = ent.x * SCALE, py = ent.y * SCALE, pRadius = (ent.size / 2) * SCALE;
+            if (this.core.activeCharacter !== "Human DM" && !ent.is_pc) {
+                if (!this.is_visible_to_player(ent.x, ent.y)) return;
+            }
+            ctx.beginPath(); ctx.arc(px, py, pRadius, 0, Math.PI * 2);
+            const imgKey = ent.name + "|" + (ent.icon_url || "");
+            const imgState = this.core.loadedImages[imgKey];
+            if (ent.icon_url && imgState instanceof Image) {
+                ctx.save(); ctx.clip();
+                ctx.drawImage(imgState, px - pRadius, py - pRadius, pRadius * 2, pRadius * 2);
+                ctx.restore();
+            } else if (ent.icon_url && imgState === "loading") {
+                ctx.save(); ctx.clip();
+                ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; ctx.fill();
+                ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 2;
+                ctx.beginPath(); ctx.arc(px, py, pRadius * 0.6, 0, Math.PI * 1.5); ctx.stroke();
+                ctx.restore();
+            } else if (ent.icon_url && imgState === "failed") {
+                ctx.fillStyle = "#555"; ctx.fill();
+                ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(px - pRadius * 0.4, py - pRadius * 0.4); ctx.lineTo(px + pRadius * 0.4, py + pRadius * 0.4);
+                ctx.moveTo(px + pRadius * 0.4, py - pRadius * 0.4); ctx.lineTo(px - pRadius * 0.4, py + pRadius * 0.4);
+                ctx.stroke();
+            } else {
+                ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; ctx.fill();
+            }
+            ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2; ctx.stroke();
+            ctx.fillStyle = "white"; ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center";
+            ctx.fillText(ent.name, px, py - pRadius - 5);
+        });
+
+        // Traps
+        knownTraps.forEach(trap => {
+            if (this.is_visible_to_player(trap.x, trap.y)) {
+                ctx.fillStyle = "red"; ctx.font = "bold 20px sans-serif"; ctx.textAlign = "center";
+                ctx.fillText("X", trap.x * SCALE, trap.y * SCALE);
+            }
+        });
+
+        // Paths
+        activePaths.forEach(p => {
+            if (this.core.activeCharacter !== "Human DM" && p.entity_name !== this.core.activeCharacter) return;
+            if (p.waypoints && p.waypoints.length > 1) {
+                ctx.beginPath();
+                ctx.moveTo(p.waypoints[0][0] * SCALE, p.waypoints[0][1] * SCALE);
+                for (let i = 1; i < p.waypoints.length; i++) ctx.lineTo(p.waypoints[i][0] * SCALE, p.waypoints[i][1] * SCALE);
+                ctx.strokeStyle = p.is_valid ? "rgba(255, 165, 0, 0.8)" : "rgba(220, 53, 69, 0.8)";
+                ctx.lineWidth = 3; ctx.setLineDash([5, 5]); ctx.stroke(); ctx.setLineDash([]);
+            }
+            if (!p.is_valid && p.alternative_path && p.alternative_path.length > 1) {
+                ctx.beginPath();
+                ctx.moveTo(p.alternative_path[0][0] * SCALE, p.alternative_path[0][1] * SCALE);
+                for (let i = 1; i < p.alternative_path.length; i++) ctx.lineTo(p.alternative_path[i][0] * SCALE, p.alternative_path[i][1] * SCALE);
+                ctx.strokeStyle = "rgba(255, 255, 0, 1.0)"; ctx.lineWidth = 4; ctx.stroke();
+            }
+        });
+
+        // Drag path
+        if (this.core.isMapDragging && canvas.draggedEntity && canvas.dragStartX !== undefined && canvas.dragStartY !== undefined) {
+            const startX = canvas.dragStartX * SCALE, startY = canvas.dragStartY * SCALE;
+            const currentX = canvas.draggedEntity.x * SCALE, currentY = canvas.draggedEntity.y * SCALE;
+            ctx.beginPath(); ctx.moveTo(startX, startY); ctx.lineTo(currentX, currentY);
+            ctx.strokeStyle = this.core.activeCharacter === "Human DM" ? "rgba(255, 200, 0, 0.8)" : "rgba(40, 167, 69, 0.8)";
+            ctx.lineWidth = 4; ctx.setLineDash([8, 6]); ctx.stroke(); ctx.setLineDash([]);
+            const distFt = Math.max(Math.abs(canvas.draggedEntity.x - canvas.dragStartX), Math.abs(canvas.draggedEntity.y - canvas.dragStartY));
+            ctx.fillStyle = "white"; ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+            ctx.fillText(`${Math.round(distFt)} ft`, (startX + currentX) / 2, (startY + currentY) / 2 - 10);
+        }
+
+        // AOE
+        if (this.core.aoeMode) {
+            ctx.fillStyle = "rgba(255, 100, 0, 0.3)"; ctx.strokeStyle = "rgba(255, 100, 0, 0.8)"; ctx.lineWidth = 2;
+            const sizePx = this.core.aoeSize * SCALE, mx = this.core.mouseX * SCALE, my = this.core.mouseY * SCALE;
+            const activeEnt = entities.find(e => e.name === this.core.activeCharacter);
+            if (activeEnt) {
+                const ex = activeEnt.x * SCALE, ey = activeEnt.y * SCALE;
+                ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(mx, my);
+                ctx.strokeStyle = "rgba(255, 255, 255, 0.6)"; ctx.lineWidth = 2; ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]);
+                const distFt = Math.max(Math.abs(this.core.mouseX - activeEnt.x), Math.abs(this.core.mouseY - activeEnt.y));
+                const text = `${Math.round(distFt)} ft`, midX = (ex + mx) / 2, midY = (ey + my) / 2 - 10;
+                ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center"; ctx.lineWidth = 3; ctx.strokeStyle = "black";
+                ctx.strokeText(text, midX, midY); ctx.fillStyle = "white"; ctx.fillText(text, midX, midY);
+                ctx.fillStyle = "rgba(255, 100, 0, 0.3)"; ctx.strokeStyle = "rgba(255, 100, 0, 0.8)"; ctx.lineWidth = 2;
+            }
+            if (this.core.aoeMode === "circle") { ctx.beginPath(); ctx.arc(mx, my, sizePx, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
+            else if (this.core.aoeMode === "cube") { ctx.fillRect(mx - sizePx / 2, my - sizePx / 2, sizePx, sizePx); ctx.strokeRect(mx - sizePx / 2, my - sizePx / 2, sizePx, sizePx); }
+            else if (this.core.aoeMode === "cone" || this.core.aoeMode === "line") {
+                if (activeEnt) {
+                    const ex = activeEnt.x * SCALE, ey = activeEnt.y * SCALE;
+                    const angle = Math.atan2(my - ey, mx - ex);
+                    ctx.beginPath(); ctx.moveTo(ex, ey);
+                    if (this.core.aoeMode === "cone") ctx.arc(ex, ey, sizePx, angle - Math.PI / 6, angle + Math.PI / 6);
+                    else {
+                        const halfWidth = (5 / 2) * SCALE;
+                        const p1x = ex - halfWidth * Math.sin(angle), p1y = ey + halfWidth * Math.cos(angle);
+                        const p2x = ex + halfWidth * Math.sin(angle), p2y = ey - halfWidth * Math.cos(angle);
+                        const p3x = p2x + sizePx * Math.cos(angle), p3y = p2y + sizePx * Math.sin(angle);
+                        const p4x = p1x + sizePx * Math.cos(angle), p4y = p1y + sizePx * Math.sin(angle);
+                        ctx.lineTo(p1x, p1y); ctx.lineTo(p2x, p2y); ctx.lineTo(p3x, p3y); ctx.lineTo(p4x, p4y);
+                    }
+                    ctx.closePath(); ctx.fill(); ctx.stroke();
+                } else {
+                    ctx.fillStyle = "white"; ctx.font = "bold 14px sans-serif";
+                    ctx.fillText("Select your character to project lines/cones", mx, my - 10);
+                }
+            }
+        }
+
+        // Pings
+        if (this.activePings) {
+            const now = Date.now();
+            this.activePings = this.activePings.filter(p => now - p.time < 3000);
+            this.activePings.forEach(p => {
+                const age = now - p.time;
+                if (age > 3000) return;
+                const maxRadius = 45, progress = age / 1000, pulse = progress % 1;
+                const radius = pulse * maxRadius, alpha = 1 - pulse;
+                const px = p.x * SCALE, py = p.y * SCALE;
+                ctx.beginPath(); ctx.arc(px, py, Math.max(0.1, radius), 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(220, 53, 69, ${alpha})`; ctx.lineWidth = 3; ctx.stroke();
+                ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(220, 53, 69, ${Math.max(0, 1 - age / 3000)})`; ctx.fill();
+                ctx.fillStyle = `rgba(255, 255, 255, ${Math.max(0, 1 - age / 3000)})`;
+                ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
+                ctx.fillText(p.character, px, py - 20);
+            });
+            if (this.activePings.length > 0 && !this.pingAnimationId) {
+                this.pingAnimationId = requestAnimationFrame(() => this._animatePings());
+            } else if (this.activePings.length === 0) {
+                this.pingAnimationId = null;
+            }
+        }
+    }
+
+    _animatePings() {
+        if (!this.activePings || this.activePings.length === 0) { this.pingAnimationId = null; return; }
+        this.drawScene();
+        this.pingAnimationId = requestAnimationFrame(() => this._animatePings());
+    }
+
+    animatePings() {
+        this.activePings = this.activePings || [];
+        const now = Date.now();
+        this.activePings = this.activePings.filter(p => now - p.time < 3000);
+        if (this.drawSceneRef) this.drawSceneRef();
+        if (this.activePings.length > 0) {
+            this.pingAnimationId = requestAnimationFrame(() => this._animatePings());
+        } else {
+            this.pingAnimationId = null;
+        }
+    }
+
+    // Called by renderMaps to hand off canvas + map state for the current render cycle
+    beginRender({ mapData, entities, knownTraps, activePaths, canvas, imagePath }) {
+        this.mapData = mapData;
+        this.entities = entities;
+        this.knownTraps = knownTraps;
+        this.activePaths = activePaths;
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d');
+
+        if (imagePath) {
+            if (this.core.loadedImages[imagePath] instanceof Image) {
+                canvas.width = this.core.loadedImages[imagePath].width;
+                canvas.height = this.core.loadedImages[imagePath].height;
+                this.drawScene(this.core.loadedImages[imagePath]);
+            } else if (this.core.loadedImages[imagePath] === "failed") {
+                this.drawScene(null);
+            } else if (this.core.loadedImages[imagePath] === undefined) {
+                this.core.loadedImages[imagePath] = "loading";
+                const img = new Image();
+                img.onload = () => {
+                    this.core.loadedImages[imagePath] = img;
+                    canvas.width = img.width; canvas.height = img.height;
+                    this.drawScene(img);
+                };
+                img.onerror = () => {
+                    this.core.loadedImages[imagePath] = "failed";
+                    this.drawScene(null);
+                };
+                img.src = `${this.core.serverUrl}/vault_media?filepath=${encodeURIComponent(imagePath)}`;
+            } else {
+                this.drawScene(null);
+            }
+        } else {
+            this.drawScene(null);
+        }
+    }
+}
+
+class DMEngineClientCore extends EventEmitter {
     constructor(view, platform) {
         this.view = view;
         this.platform = platform; // "web" or "obsidian"
@@ -88,34 +387,11 @@ class DMEngineClientCore {
                 HTMLElement.prototype.createSpan = function (opt) { return this.createEl('span', opt); };
             }
         }
+
+        // MapRenderer — owns Canvas 2D map rendering
+        this.mapRenderer = new MapRenderer(this, this);
     }
 
-    animatePings() {
-        if (!this.activePings) return;
-        const now = Date.now();
-        this.activePings = this.activePings.filter(p => now - p.time < 3000);
-
-        if (this.drawSceneRef) {
-            this.drawSceneRef();
-        }
-
-        if (this.activePings.length > 0) {
-            this.pingAnimationId = requestAnimationFrame(() => this.animatePings());
-        } else {
-            this.pingAnimationId = null;
-        }
-    }
-
-    is_visible_to_player(x, y) {
-        // Check if a point is within any explored area
-        const explored = this.currentMapData?.explored_areas || [];
-        for (const area of explored) {
-            const [ax, ay, radius] = area;
-            const dist = Math.hypot(x - ax, y - ay);
-            if (dist <= radius) return true;
-        }
-        return false;
-    }
 
     updatePerspectiveStyles() {
         const styleEl = document.getElementById('dm-perspective-styles');
@@ -177,7 +453,13 @@ class DMEngineClientCore {
             const response = await fetch(`${this.serverUrl}/heartbeat`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ client_id: this.clientId, character: this.activeCharacter, roll_automations: this.rollAutomations })
+                body: JSON.stringify({
+                    client_id: this.clientId,
+                    character: this.activeCharacter,
+                    roll_automations: this.rollAutomations,
+                    include_full_state: true,
+                    protocol_version: 2,
+                })
             });
 
             if (response.ok) {
@@ -190,8 +472,14 @@ class DMEngineClientCore {
                     this.renderPartySidebar(data.party);
                 }
 
-                this.fetchCharacterSheet();
-                this.fetchMaps();
+                // Use inlined character_sheet + map_state from heartbeat (avoids extra round-trips)
+                if (data.character_sheet && !data.character_sheet.error) {
+                    this.renderCharacterSheet(data.character_sheet);
+                }
+                if (data.map_state && data.map_state.map_data) {
+                    this.currentMapData = data.map_state.map_data;
+                    if (!this.isMapDragging) this.renderMaps(data.map_state);
+                }
 
                 // Check for updates every 60 seconds (DM only)
                 const now = Date.now();
@@ -309,12 +597,41 @@ class DMEngineClientCore {
                 topRow.appendChild(statusSpan);
 
                 const hpRow = document.createElement("div");
-                hpRow.style.fontSize = "0.85em";
-                hpRow.textContent = `HP: ${m.hp} / ${m.max_hp}`;
-                let hpColor = "var(--text-success)";
-                if (m.hp <= m.max_hp / 2) hpColor = "var(--text-warning)";
-                if (m.hp <= 0) hpColor = "var(--text-error)";
-                hpRow.style.color = hpColor;
+                hpRow.style.display = "flex";
+                hpRow.style.alignItems = "center";
+                hpRow.style.gap = "6px";
+                hpRow.style.fontSize = "0.8em";
+
+                const hpPct = m.max_hp > 0 ? Math.max(0, Math.min(1, m.hp / m.max_hp)) : 0;
+                const hpBarWrap = document.createElement("div");
+                hpBarWrap.style.flex = "1";
+                hpBarWrap.style.height = "6px";
+                hpBarWrap.style.borderRadius = "3px";
+                hpBarWrap.style.background = "var(--background-modifier-border)";
+                hpBarWrap.style.overflow = "hidden";
+                const hpBarFill = document.createElement("div");
+                hpBarFill.style.height = "100%";
+                hpBarFill.style.borderRadius = "3px";
+                hpBarFill.style.width = `${(hpPct * 100).toFixed(1)}%`;
+                hpBarFill.style.transition = "width 0.3s, background 0.3s";
+                if (m.hp <= 0) {
+                    hpBarFill.style.background = "var(--text-error)";
+                } else if (hpPct <= 0.25) {
+                    hpBarFill.style.background = "linear-gradient(90deg, #dc3545, #ff4d5a)";
+                } else if (hpPct <= 0.5) {
+                    hpBarFill.style.background = "linear-gradient(90deg, #e0a800, #f0c000)";
+                } else {
+                    hpBarFill.style.background = "linear-gradient(90deg, #28a745, #34ce57)";
+                }
+                hpBarWrap.appendChild(hpBarFill);
+
+                const hpText = document.createElement("span");
+                hpText.style.color = m.hp <= 0 ? "var(--text-error)" : m.hp <= m.max_hp / 2 ? "var(--text-warning)" : "var(--text-success)";
+                hpText.textContent = `${m.hp}/${m.max_hp}`;
+                hpText.style.whiteSpace = "nowrap";
+
+                hpRow.appendChild(hpBarWrap);
+                hpRow.appendChild(hpText);
 
                 memberDiv.appendChild(topRow);
                 memberDiv.appendChild(hpRow);
@@ -429,11 +746,22 @@ class DMEngineClientCore {
 
         // Spell slots
         const spellSlots = s.spell_slots || null;
+        const hpPct = maxHp > 0 ? Math.max(0, Math.min(1, hp / maxHp)) : 0;
+        const hpColorClass = hp <= 0 ? "var(--text-error)" : hp <= maxHp / 2 ? "var(--text-warning)" : "var(--text-success)";
+        const hpBarColor = hp <= 0 ? "#dc3545" : hpPct <= 0.25 ? "linear-gradient(90deg, #dc3545, #ff4d5a)" : hpPct <= 0.5 ? "linear-gradient(90deg, #e0a800, #f0c000)" : "linear-gradient(90deg, #28a745, #34ce57)";
 
         if (this.view.viewSheet) this.view.viewSheet.innerHTML = `
             <h2 style="margin-top:0;">${s.name || "Unknown"}</h2>
             <div style="display:flex; gap:10px; margin-bottom:15px; flex-wrap:wrap;">
-                <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; min-width:100px; text-align:center;"><b>HP</b><br><span style="font-size:1.5em; color:${hp <= 0 ? 'var(--text-error)' : hp <= maxHp/2 ? 'var(--text-warning)' : 'var(--text-success)'};">${hp} / ${maxHp}</span></div>
+                <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:2; min-width:160px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                        <b>HP</b>
+                        <span style="font-size:1.1em; font-weight:bold; color:${hpColorClass}">${hp} / ${maxHp}</span>
+                    </div>
+                    <div style="height:8px; border-radius:4px; background:var(--background-modifier-border); overflow:hidden;">
+                        <div style="height:100%; border-radius:4px; width:${(hpPct*100).toFixed(1)}%; background:${hpBarColor}; transition:width 0.3s;"></div>
+                    </div>
+                </div>
                 <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; min-width:100px; text-align:center;"><b>AC</b><br><span style="font-size:1.5em;">${s.ac || 10}</span></div>
                 <div style="background:var(--background-modifier-form-field); padding:10px; border-radius:5px; flex:1; min-width:100px; text-align:center;"><b>Speed</b><br><span style="font-size:1.1em;">${speed}</span></div>
             </div>
@@ -520,334 +848,24 @@ class DMEngineClientCore {
             canvas.style.borderRadius = "4px";
             canvasContainer.appendChild(canvas);
 
-            const ctx = canvas.getContext('2d');
-
-            let bgImageRef = null;
-
-            // Track if we should resize canvas when image loads
-            let pendingImageResize = false;
+            // Hand off canvas + state to MapRenderer; handles image loading + initial draw
+            if (imagePath && this.loadedImages[imagePath] instanceof Image) {
+                canvas.width = this.loadedImages[imagePath].width;
+                canvas.height = this.loadedImages[imagePath].height;
+                this.mapRenderer.beginRender({ mapData, entities, knownTraps, activePaths, canvas, imagePath });
+            } else {
+                this.mapRenderer.beginRender({ mapData, entities, knownTraps, activePaths, canvas, imagePath: null });
+            }
 
             aoeShapeSelect.addEventListener("change", (e) => {
                 this.aoeMode = e.target.value === "none" ? null : e.target.value;
-                if (typeof drawScene === 'function') drawScene(bgImageRef);
+                this.mapRenderer.drawScene();
             });
 
             sizeInput.addEventListener("change", (e) => {
                 this.aoeSize = parseInt(e.target.value) || 20;
-                if (typeof drawScene === 'function') drawScene(bgImageRef);
+                this.mapRenderer.drawScene();
             });
-
-            const drawScene = (bgImg) => {
-                this.drawSceneRef = drawScene;
-                bgImageRef = bgImg || bgImageRef;
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-                if (bgImageRef) ctx.drawImage(bgImageRef, 0, 0);
-
-                // Draw Grid
-                ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
-                ctx.lineWidth = 1;
-                for (let i = 0; i < canvas.width; i += SCALE * mapData.grid_scale) {
-                    ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, canvas.height); ctx.stroke();
-                    ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(canvas.width, i); ctx.stroke();
-                }
-
-                // Draw Fog of War Mask
-                if (this.activeCharacter !== "Human DM") {
-                    ctx.fillStyle = "rgba(0, 0, 0, 0.98)"; // Players see solid black
-                } else {
-                    ctx.fillStyle = "rgba(0, 0, 50, 0.4)"; // DM sees a faint blue tint for unexplored areas
-                }
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-                ctx.globalCompositeOperation = 'destination-out';
-                (mapData.explored_areas || []).forEach(area => {
-                    const [x, y, radius] = area;
-                    ctx.beginPath();
-                    ctx.arc(x * SCALE, y * SCALE, radius * SCALE, 0, Math.PI * 2);
-                    ctx.fill(); // Punch a transparent hole through the Fog of War!
-                });
-                ctx.globalCompositeOperation = 'source-over';
-
-                // Draw Walls
-                const activeWalls = [...(mapData.walls || []), ...(mapData.temporary_walls || [])];
-                activeWalls.forEach(wall => {
-                    if (!this.is_visible_to_player(wall.start[0], wall.start[1]) && !this.is_visible_to_player(wall.end[0], wall.end[1])) {
-                        return;
-                    }
-                    ctx.beginPath();
-                    ctx.moveTo(wall.start[0] * SCALE, wall.start[1] * SCALE);
-                    ctx.lineTo(wall.end[0] * SCALE, wall.end[1] * SCALE);
-
-                    if (!wall.is_solid && wall.is_visible) {
-                        ctx.strokeStyle = "rgba(40, 167, 69, 0.6)"; // Open door (Green)
-                        ctx.lineWidth = 4;
-                    } else if (!wall.is_visible) {
-                        ctx.strokeStyle = "rgba(0, 150, 255, 0.4)"; // Window/Glass (Blue)
-                        ctx.lineWidth = 2;
-                    } else {
-                        ctx.strokeStyle = "rgba(220, 53, 69, 0.8)"; // Solid wall (Red)
-                        ctx.lineWidth = 3;
-                    }
-                    ctx.stroke();
-                });
-
-                // Draw Entities
-                entities.forEach(ent => {
-                    if (ent.hp <= 0) return;
-
-                    const px = ent.x * SCALE;
-                    const py = ent.y * SCALE;
-                    const pRadius = (ent.size / 2) * SCALE;
-
-                    // Enforce FoW visibility for players looking at NPCs
-                    if (this.activeCharacter !== "Human DM" && !ent.is_pc) {
-                        if (!this.is_visible_to_player(ent.x, ent.y)) return; // Do not draw hidden monsters!
-                    }
-
-                    ctx.beginPath();
-                    ctx.arc(px, py, pRadius, 0, Math.PI * 2);
-
-                    if (ent.icon_url) {
-                        if (this.loadedImages[ent.icon_url] instanceof Image) {
-                            ctx.save();
-                            ctx.clip(); // Mask the image inside the circle
-                            ctx.drawImage(this.loadedImages[ent.icon_url], px - pRadius, py - pRadius, pRadius * 2, pRadius * 2);
-                            ctx.restore();
-                        } else {
-                            if (this.loadedImages[ent.icon_url] === undefined) {
-                                this.loadedImages[ent.icon_url] = "loading";
-                                const img = new Image();
-                                img.onload = () => { this.loadedImages[ent.icon_url] = img; drawScene(bgImageRef); };
-                                img.onerror = () => { this.loadedImages[ent.icon_url] = "failed"; drawScene(bgImageRef); };
-                                img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(ent.icon_url)}`;
-                            }
-                            ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; ctx.fill(); // Fallback color while loading
-                        }
-                    } else {
-                        ctx.fillStyle = ent.is_pc ? "#0e639c" : "#dc3545"; // Blue for PCs, Red for Monsters
-                        ctx.fill();
-                    }
-
-                    ctx.strokeStyle = "#ffffff";
-                    ctx.lineWidth = 2;
-                    ctx.stroke();
-
-                    ctx.fillStyle = "white";
-                    ctx.font = "bold 12px sans-serif";
-                    ctx.textAlign = "center";
-                    ctx.fillText(ent.name, px, py - pRadius - 5);
-                });
-
-                knownTraps.forEach((trap) => {
-                    if (this.is_visible_to_player(trap.x, trap.y)) {
-                        const px = trap.x * SCALE;
-                        const py = trap.y * SCALE;
-                        ctx.fillStyle = "red";
-                        ctx.font = "bold 20px sans-serif";
-                        ctx.textAlign = "center";
-                        ctx.fillText("X", px, py);
-                    }
-                });
-
-                // Draw server-synchronized proposed paths
-                activePaths.forEach(p => {
-                    if (this.activeCharacter !== "Human DM" && p.entity_name !== this.activeCharacter) return;
-
-                    // Draw proposed path (orange if valid but pending confirm, red if invalid)
-                    if (p.waypoints && p.waypoints.length > 1) {
-                        ctx.beginPath();
-                        ctx.moveTo(p.waypoints[0][0] * SCALE, p.waypoints[0][1] * SCALE);
-                        for (let i = 1; i < p.waypoints.length; i++) {
-                            ctx.lineTo(p.waypoints[i][0] * SCALE, p.waypoints[i][1] * SCALE);
-                        }
-                        ctx.strokeStyle = p.is_valid ? "rgba(255, 165, 0, 0.8)" : "rgba(220, 53, 69, 0.8)";
-                        ctx.lineWidth = 3;
-                        ctx.setLineDash([5, 5]);
-                        ctx.stroke();
-                        ctx.setLineDash([]);
-                    }
-
-                    // Draw alternative path (solid yellow) if invalid
-                    if (!p.is_valid && p.alternative_path && p.alternative_path.length > 1) {
-                        ctx.beginPath();
-                        ctx.moveTo(p.alternative_path[0][0] * SCALE, p.alternative_path[0][1] * SCALE);
-                        for (let i = 1; i < p.alternative_path.length; i++) {
-                            ctx.lineTo(p.alternative_path[i][0] * SCALE, p.alternative_path[i][1] * SCALE);
-                        }
-                        ctx.strokeStyle = "rgba(255, 255, 0, 1.0)";
-                        ctx.lineWidth = 4;
-                        ctx.stroke();
-                    }
-                });
-
-                // Draw Drag Path Line
-                if (this.isMapDragging && canvas.draggedEntity && canvas.dragStartX !== undefined && canvas.dragStartY !== undefined) {
-                    const startX = canvas.dragStartX * SCALE;
-                    const startY = canvas.dragStartY * SCALE;
-                    const currentX = canvas.draggedEntity.x * SCALE;
-                    const currentY = canvas.draggedEntity.y * SCALE;
-
-                    ctx.beginPath();
-                    ctx.moveTo(startX, startY);
-                    ctx.lineTo(currentX, currentY);
-                    ctx.strokeStyle = this.activeCharacter === "Human DM" ? "rgba(255, 200, 0, 0.8)" : "rgba(40, 167, 69, 0.8)";
-                    ctx.lineWidth = 4;
-                    ctx.setLineDash([8, 6]);
-                    ctx.stroke();
-                    ctx.setLineDash([]); // Reset line dash for next renders
-
-                    // Calculate Chebyshev distance (D&D 5e standard grid distance)
-                    const distFt = Math.max(Math.abs(canvas.draggedEntity.x - canvas.dragStartX), Math.abs(canvas.draggedEntity.y - canvas.dragStartY));
-
-                    ctx.fillStyle = "white";
-                    ctx.font = "bold 14px sans-serif";
-                    ctx.textAlign = "center";
-                    ctx.fillText(`${Math.round(distFt)} ft`, (startX + currentX) / 2, (startY + currentY) / 2 - 10);
-                }
-
-                // --- DRAW AOE PREVIEW ---
-                if (this.aoeMode) {
-                    ctx.fillStyle = "rgba(255, 100, 0, 0.3)";
-                    ctx.strokeStyle = "rgba(255, 100, 0, 0.8)";
-                    ctx.lineWidth = 2;
-                    const sizePx = this.aoeSize * SCALE;
-                    const mx = this.mouseX * SCALE;
-                    const my = this.mouseY * SCALE;
-
-                    const activeEnt = entities.find(e => e.name === this.activeCharacter);
-
-                    if (activeEnt) {
-                        const ex = activeEnt.x * SCALE;
-                        const ey = activeEnt.y * SCALE;
-
-                        ctx.beginPath();
-                        ctx.moveTo(ex, ey);
-                        ctx.lineTo(mx, my);
-                        ctx.strokeStyle = "rgba(255, 255, 255, 0.6)";
-                        ctx.lineWidth = 2;
-                        ctx.setLineDash([4, 4]);
-                        ctx.stroke();
-                        ctx.setLineDash([]);
-
-                        const distFt = Math.max(Math.abs(this.mouseX - activeEnt.x), Math.abs(this.mouseY - activeEnt.y));
-                        const text = `${Math.round(distFt)} ft`;
-                        const midX = (ex + mx) / 2;
-                        const midY = (ey + my) / 2 - 10;
-
-                        ctx.font = "bold 14px sans-serif";
-                        ctx.textAlign = "center";
-                        ctx.lineWidth = 3;
-                        ctx.strokeStyle = "black";
-                        ctx.strokeText(text, midX, midY);
-                        ctx.fillStyle = "white";
-                        ctx.fillText(text, midX, midY);
-
-                        // Reset fill/stroke for the AoE shape
-                        ctx.fillStyle = "rgba(255, 100, 0, 0.3)";
-                        ctx.strokeStyle = "rgba(255, 100, 0, 0.8)";
-                        ctx.lineWidth = 2;
-                    }
-
-                    if (this.aoeMode === "circle") {
-                        ctx.beginPath();
-                        ctx.arc(mx, my, sizePx, 0, Math.PI * 2);
-                        ctx.fill(); ctx.stroke();
-                    } else if (this.aoeMode === "cube") {
-                        ctx.fillRect(mx - sizePx / 2, my - sizePx / 2, sizePx, sizePx);
-                        ctx.strokeRect(mx - sizePx / 2, my - sizePx / 2, sizePx, sizePx);
-                    } else if (this.aoeMode === "cone" || this.aoeMode === "line") {
-                        if (activeEnt) {
-                            const ex = activeEnt.x * SCALE;
-                            const ey = activeEnt.y * SCALE;
-                            const angle = Math.atan2(my - ey, mx - ex);
-
-                            ctx.beginPath();
-                            ctx.moveTo(ex, ey);
-                            if (this.aoeMode === "cone") {
-                                ctx.arc(ex, ey, sizePx, angle - Math.PI / 6, angle + Math.PI / 6);
-                            } else {
-                                const halfWidth = (5 / 2) * SCALE;
-                                const p1x = ex - halfWidth * Math.sin(angle);
-                                const p1y = ey + halfWidth * Math.cos(angle);
-                                const p2x = ex + halfWidth * Math.sin(angle);
-                                const p2y = ey - halfWidth * Math.cos(angle);
-                                const p3x = p2x + sizePx * Math.cos(angle);
-                                const p3y = p2y + sizePx * Math.sin(angle);
-                                const p4x = p1x + sizePx * Math.cos(angle);
-                                const p4y = p1y + sizePx * Math.sin(angle);
-                                ctx.moveTo(p1x, p1y);
-                                ctx.lineTo(p2x, p2y);
-                                ctx.lineTo(p3x, p3y);
-                                ctx.lineTo(p4x, p4y);
-                            }
-                            ctx.closePath();
-                            ctx.fill(); ctx.stroke();
-                        } else {
-                            ctx.fillStyle = "white";
-                            ctx.font = "bold 14px sans-serif";
-                            ctx.fillText("Select your character to project lines/cones", mx, my - 10);
-                        }
-                    }
-                }
-
-                // --- DRAW PINGS ---
-                if (this.activePings) {
-                    const now = Date.now();
-                    this.activePings.forEach(p => {
-                        const age = now - p.time;
-                        if (age > 3000) return;
-
-                        const maxRadius = 45;
-                        const progress = age / 1000;
-                        const pulse = progress % 1;
-                        const radius = pulse * maxRadius;
-                        const alpha = 1 - pulse;
-
-                        const px = p.x * SCALE;
-                        const py = p.y * SCALE;
-
-                        ctx.beginPath(); ctx.arc(px, py, Math.max(0.1, radius), 0, Math.PI * 2);
-                        ctx.strokeStyle = `rgba(220, 53, 69, ${alpha})`; ctx.lineWidth = 3; ctx.stroke();
-                        ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2);
-                        ctx.fillStyle = `rgba(220, 53, 69, ${Math.max(0, 1 - age / 3000)})`; ctx.fill();
-                        ctx.fillStyle = `rgba(255, 255, 255, ${Math.max(0, 1 - age / 3000)})`;
-                        ctx.font = "bold 14px sans-serif"; ctx.textAlign = "center";
-                        ctx.fillText(p.character, px, py - 20);
-                    });
-                }
-            };
-
-            if (imagePath) {
-                if (this.loadedImages[imagePath] instanceof Image) {
-                    // Resize canvas to match image
-                    canvas.width = this.loadedImages[imagePath].width;
-                    canvas.height = this.loadedImages[imagePath].height;
-                    drawScene(this.loadedImages[imagePath]);
-                } else if (this.loadedImages[imagePath] === "failed") {
-                    drawScene(null);
-                } else if (this.loadedImages[imagePath] === undefined) {
-                    this.loadedImages[imagePath] = "loading";
-                    const img = new Image();
-                    img.onload = () => {
-                        this.loadedImages[imagePath] = img;
-                        // Resize canvas to match image when it loads
-                        canvas.width = img.width;
-                        canvas.height = img.height;
-                        drawScene(img);
-                    };
-                    img.onerror = () => {
-                        console.error("Failed to load map image:", imagePath);
-                        this.loadedImages[imagePath] = "failed";
-                        drawScene(null);
-                    };
-                    img.src = `${this.serverUrl}/vault_media?filepath=${encodeURIComponent(imagePath)}`;
-                } else {
-                    drawScene(null); // Waiting for load
-                }
-            } else {
-                drawScene(null);
-            }
 
             // --- DRAG AND DROP LOGIC ---
             canvas.addEventListener('mousedown', (e) => {
@@ -932,7 +950,7 @@ class DMEngineClientCore {
 
                     this.aoeMode = null;
                     if (aoeShapeSelect) aoeShapeSelect.value = "none";
-                    drawScene(bgImageRef);
+                    this.mapRenderer.drawScene();
                     return;
                 }
 
@@ -971,11 +989,11 @@ class DMEngineClientCore {
                 this.mouseY = newY;
 
                 if (this.aoeMode) {
-                    drawScene(bgImageRef);
+                    this.mapRenderer.drawScene();
                 } else if (this.isMapDragging && canvas.draggedEntity) {
                     canvas.draggedEntity.x = newX;
                     canvas.draggedEntity.y = newY;
-                    drawScene(bgImageRef); // Live re-render
+                    this.mapRenderer.drawScene(); // Live re-render
                 }
             });
 
@@ -1058,7 +1076,7 @@ class DMEngineClientCore {
                             }
                         } catch (err) {
                             ent.x = canvas.dragStartX; ent.y = canvas.dragStartY;
-                            drawScene(bgImageRef);
+                            this.mapRenderer.drawScene();
                         }
                     }
                 }
@@ -1073,93 +1091,180 @@ class DMEngineClientCore {
     }
 
     async startListening() {
-        if (this.listenController) {
-            this.listenController.abort();
-        }
-        this.listenController = new AbortController();
-        try {
-            const response = await fetch(`${this.serverUrl}/listen?client_id=${this.clientId}`, {
-                method: "GET",
-                signal: this.listenController.signal
-            });
+        const MAX_DELAY_MS = 30000;
+        let delayMs = 1000;
+        while (!this.listenController.signal.aborted) {
+            if (this.listenController) {
+                this.listenController.abort();
+            }
+            this.listenController = new AbortController();
+            try {
+                const response = await fetch(`${this.serverUrl}/listen?client_id=${this.clientId}`, {
+                    method: "GET",
+                    signal: this.listenController.signal
+                });
 
-            if (!response.ok) return;
+                if (!response.ok) {
+                    delayMs = Math.min(delayMs * 2, MAX_DELAY_MS);
+                    await new Promise(r => setTimeout(r, delayMs));
+                    continue;
+                }
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder("utf-8");
-            let buffer = "";
-            let msgDiv = null;
-            let contentDiv = null;
-            let accumulatedText = "";
+                delayMs = 1000; // reset backoff on successful connection
 
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder("utf-8");
+                let buffer = "";
+                let msgDiv = null;
+                let contentDiv = null;
+                let accumulatedText = "";
+                let lastSSEActivity = Date.now();
 
-                buffer += decoder.decode(value, { stream: true });
-                const parts = buffer.split("\n\n");
-                buffer = parts.pop();
+                while (!this.listenController.signal.aborted) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
 
-                let needsRender = false;
-                for (const part of parts) {
-                    if (part.startsWith("data: ")) {
-                        try {
-                            const data = JSON.parse(part.substring(6));
+                    lastSSEActivity = Date.now();
+                    buffer += decoder.decode(value, { stream: true });
+                    const parts = buffer.split("\n\n");
+                    buffer = parts.pop();
 
-                            if (data.type === "ping") {
-                                this.activePings = this.activePings || [];
-                                this.activePings.push({ x: data.x, y: data.y, character: data.character, time: Date.now() });
-                                if (!this.pingAnimationId) this.animatePings();
-                            }
+                    let needsRender = false;
+                    for (const part of parts) {
+                        if (part.startsWith("data: ")) {
+                            try {
+                                const data = JSON.parse(part.substring(6));
 
-                            if (data.type === "typing") {
-                                if (data.is_typing) {
-                                    this.activeTypers.add(data.character);
-                                } else {
-                                    this.activeTypers.delete(data.character);
+                                if (data.type === "ping") {
+                                    this.mapRenderer.activePings = this.mapRenderer.activePings || [];
+                                    this.mapRenderer.activePings.push({ x: data.x, y: data.y, character: data.character, time: Date.now() });
+                                    if (!this.mapRenderer.pingAnimationId) this.mapRenderer.animatePings();
                                 }
-                                this.renderPartySidebar(this.lastPartyData); // Instantly update UI bubble
-                            }
 
-                            if (data.status === "streaming" || data.status === "error") {
-                                if (data.reply) {
-                                    if (!msgDiv) {
-                                        msgDiv = this.view.ui.chatHistory.createDiv({ cls: "dm-message" });
-                                        msgDiv.style.marginBottom = "15px";
-                                        msgDiv.style.lineHeight = "1.5";
-                                        const senderSpan = msgDiv.createSpan({ text: `DM (Broadcast): ` });
-                                        senderSpan.style.fontWeight = "bold";
-                                        senderSpan.style.color = "var(--text-muted)";
-                                        contentDiv = msgDiv.createDiv({ cls: "dm-message-content" });
-                                        contentDiv.style.marginTop = "5px";
+                                if (data.type === "typing") {
+                                    if (data.is_typing) {
+                                        this.activeTypers.add(data.character);
+                                    } else {
+                                        this.activeTypers.delete(data.character);
                                     }
-                                    accumulatedText += data.reply;
-                                    needsRender = true;
+                                    this.renderPartySidebar(this.lastPartyData);
                                 }
-                            } else if (data.status === "done") {
-                                msgDiv = null;
-                                contentDiv = null;
-                                accumulatedText = "";
+
+                                if (data.status === "streaming" || data.status === "error") {
+                                    if (data.reply) {
+                                        if (!msgDiv) {
+                                            msgDiv = this.view.ui.chatHistory.createDiv({ cls: "dm-message" });
+                                            msgDiv.style.marginBottom = "15px";
+                                            msgDiv.style.lineHeight = "1.5";
+                                            const senderSpan = msgDiv.createSpan({ text: `DM (Broadcast): ` });
+                                            senderSpan.style.fontWeight = "bold";
+                                            senderSpan.style.color = "var(--text-muted)";
+                                            contentDiv = msgDiv.createDiv({ cls: "dm-message-content" });
+                                            contentDiv.style.marginTop = "5px";
+                                        }
+                                        accumulatedText += data.reply;
+                                        needsRender = true;
+                                    }
+                                } else if (data.status === "done") {
+                                    msgDiv = null;
+                                    contentDiv = null;
+                                    accumulatedText = "";
+                                }
+                            } catch (e) {
+                                console.error("Error parsing JSON chunk:", e, part);
                             }
-                        } catch (e) {
-                            console.error("Error parsing JSON chunk:", e, part);
                         }
                     }
-                }
 
-                if (needsRender && contentDiv) {
-                    contentDiv.empty();
-                    await MarkdownRenderer.renderMarkdown(accumulatedText, contentDiv, "", this.view);
-                    const paragraphs = contentDiv.querySelectorAll("p");
-                    paragraphs.forEach(p => { p.style.marginTop = "0"; p.style.marginBottom = "0.5em"; });
-                    this.view.ui.chatHistory.scrollTop = this.view.ui.chatHistory.scrollHeight;
+                    if (needsRender && contentDiv) {
+                        contentDiv.empty();
+                        await MarkdownRenderer.renderMarkdown(accumulatedText, contentDiv, "", this.view);
+                        const paragraphs = contentDiv.querySelectorAll("p");
+                        paragraphs.forEach(p => { p.style.marginTop = "0"; p.style.marginBottom = "0.5em"; });
+                        this.view.ui.chatHistory.scrollTop = this.view.ui.chatHistory.scrollHeight;
+                        this._gcChatHistory();
+                    }
+                }
+                // Fallback poll: if SSE stream closed and we've been disconnected >10s, refresh state
+                if (!this.listenController.signal.aborted && Date.now() - lastSSEActivity > 10000) {
+                    this.syncState();
+                }
+            } catch (e) {
+                if (e.name !== "AbortError") {
+                    console.error("Listen Error:", e);
+                    new Notice("Listen stream disconnected. Reconnecting...");
+                    delayMs = Math.min(delayMs * 2, MAX_DELAY_MS);
+                    await new Promise(r => setTimeout(r, delayMs));
                 }
             }
+        }
+    }
+
+    // Remove oldest .dm-message elements when count exceeds limit
+    _gcChatHistory() {
+        const MAX_MESSAGES = 200;
+        const chatHistory = this.view.ui.chatHistory;
+        if (!chatHistory) return;
+        const messages = chatHistory.querySelectorAll(".dm-message");
+        while (messages.length > MAX_MESSAGES) {
+            messages[0].remove();
+            messages.shift();
+        }
+    }
+
+    async rollDice(formula, reason) {
+        if (!formula) return;
+        try {
+            const res = await fetch(`${this.serverUrl}/roll`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    formula,
+                    reason: reason || "Roll",
+                    character: this.activeCharacter,
+                    client_id: this.clientId,
+                    vault_path: this.vaultPath,
+                })
+            });
+            if (!res.ok) return;
+            const data = await res.json();
+
+            const isCrit = data.is_crit;
+            const isFumble = data.is_fumble;
+            const rollColor = isCrit ? "#ffd700" : isFumble ? "#dc3545" : "var(--text-accent)";
+            const rollBorder = isCrit ? "1px solid #ffd700" : isFumble ? "1px solid #dc3545" : "1px solid var(--background-modifier-border)";
+            const rollBg = isCrit ? "rgba(255,215,0,0.08)" : isFumble ? "rgba(220,53,69,0.08)" : "var(--background-modifier-form-field)";
+            const rollLabel = isCrit ? "🎯 CRIT!" : isFumble ? "💀 FUMBLE" : "🎲";
+
+            const modStr = data.modifier_op
+                ? ` ${data.modifier_op}${data.modifier === 0 ? "" : data.modifier}`
+                : "";
+            const totalStr = `${data.total}`;
+            const rollsStr = data.rolls.length > 1
+                ? `[${data.roll_str}]`
+                : `[${data.roll_str}]`;
+
+            const rollHtml = `
+                <div style="background:${rollBg}; border:${rollBorder}; border-radius:6px; padding:8px 10px; margin:4px 0; max-width:340px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-weight:bold; font-size:0.9em;">${rollLabel} ${this.activeCharacter}</span>
+                        <span style="font-size:0.75em; color:var(--text-muted);">${data.formula} — ${data.reason}</span>
+                    </div>
+                    <div style="margin-top:4px; display:flex; align-items:center; gap:8px;">
+                        <span style="font-size:1.4em; font-weight:bold; color:${rollColor};">${totalStr}</span>
+                        <span style="font-size:0.85em; color:var(--text-muted);">${rollsStr}${modStr}</span>
+                    </div>
+                </div>`;
+
+            const msgDiv = this.view.ui.chatHistory.createDiv({ cls: "dm-message" });
+            msgDiv.style.marginBottom = "4px";
+            msgDiv.style.lineHeight = "1.4";
+            msgDiv.innerHTML = rollHtml;
+            this.view.ui.chatHistory.scrollTop = this.view.ui.chatHistory.scrollHeight;
+            this._gcChatHistory();
+
         } catch (e) {
-            if (e.name !== "AbortError") {
-                console.error("Listen Error:", e);
-                new Notice("Listen stream disconnected.");
-            }
+            new Notice("Dice roll failed.");
         }
     }
 
@@ -1197,6 +1302,7 @@ class DMEngineClientCore {
         this.view.ui.chatHistory.scrollTop = this.view.ui.chatHistory.scrollHeight;
 
         try {
+            const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
             const response = await fetch(`${this.serverUrl}/chat`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -1205,7 +1311,9 @@ class DMEngineClientCore {
                     character: this.activeCharacter,
                     vault_path: this.vaultPath,
                     client_id: this.clientId,
-                    roll_automations: this.rollAutomations
+                    roll_automations: this.rollAutomations,
+                    request_id: requestId,
+                    protocol_version: 2,
                 })
             });
 
@@ -1268,6 +1376,7 @@ class DMEngineClientCore {
                     this.view.ui.chatHistory.scrollTop = this.view.ui.chatHistory.scrollHeight;
                 }
             }
+            this._gcChatHistory();
 
         } catch (error) {
             loadingDiv.remove();
@@ -1301,6 +1410,7 @@ class DMEngineClientCore {
         });
 
         this.view.ui.chatHistory.scrollTop = this.view.ui.chatHistory.scrollHeight;
+        this._gcChatHistory();
     }
 
     updateRadioUI(lockedCharacters) {
@@ -1728,6 +1838,75 @@ class DMChatView extends ItemView {
         // Input Container
         const inputContainer = this.viewChat.createDiv({ cls: "dm-input-container" });
 
+        // --- Dice Bar ---
+        const diceBar = inputContainer.createDiv({ cls: "dm-dice-bar" });
+        diceBar.style.display = "flex";
+        diceBar.style.gap = "4px";
+        diceBar.style.alignItems = "center";
+        diceBar.style.flexWrap = "wrap";
+        diceBar.style.padding = "4px 0";
+
+        const DICE_TYPES = [
+            { label: "d4", formula: "1d4" },
+            { label: "d6", formula: "1d6" },
+            { label: "d8", formula: "1d8" },
+            { label: "d10", formula: "1d10" },
+            { label: "d12", formula: "1d12" },
+            { label: "2d6", formula: "2d6" },
+        ];
+
+        const makeDiceBtn = (label, formula, onClick) => {
+            const btn = diceBar.createEl("button");
+            btn.textContent = label;
+            btn.style.padding = "3px 8px";
+            btn.style.fontSize = "0.8em";
+            btn.style.borderRadius = "3px";
+            btn.style.border = "1px solid var(--background-modifier-border)";
+            btn.style.background = "var(--background-modifier-form-field)";
+            btn.style.color = "var(--text-normal)";
+            btn.style.cursor = "pointer";
+            btn.addEventListener("click", onClick);
+        };
+
+        DICE_TYPES.forEach(d => makeDiceBtn(d.label, d.formula, () => {
+            this.clientCore.rollDice(d.formula, this.ui.diceReasonInput.value || d.label + " roll");
+        }));
+
+        // Modifier input
+        const modInput = diceBar.createEl("input");
+        modInput.type = "number";
+        modInput.placeholder = "+MOD";
+        modInput.style.width = "44px";
+        modInput.style.padding = "3px 4px";
+        modInput.style.fontSize = "0.8em";
+        modInput.style.borderRadius = "3px";
+        modInput.style.border = "1px solid var(--background-modifier-border)";
+        modInput.style.background = "var(--background-modifier-form-field)";
+        modInput.style.color = "var(--text-normal)";
+        modInput.style.textAlign = "center";
+
+        // d20 button — uses modifier if provided
+        makeDiceBtn("d20", "1d20", () => {
+            const modVal = modInput.value;
+            const modStr = modVal ? (parseInt(modVal) >= 0 ? "+" + modVal : modVal) : "";
+            this.clientCore.rollDice("1d20" + modStr, this.ui.diceReasonInput.value || "d20 roll");
+        });
+
+        // Reason input
+        const reasonInput = diceBar.createEl("input");
+        reasonInput.type = "text";
+        reasonInput.placeholder = "Reason (e.g. Attack)";
+        reasonInput.style.flex = "1";
+        reasonInput.style.minWidth = "80px";
+        reasonInput.style.padding = "3px 6px";
+        reasonInput.style.fontSize = "0.8em";
+        reasonInput.style.borderRadius = "3px";
+        reasonInput.style.border = "1px solid var(--background-modifier-border)";
+        reasonInput.style.background = "var(--background-modifier-form-field)";
+        reasonInput.style.color = "var(--text-normal)";
+        this.ui.diceReasonInput = reasonInput;
+
+
         inputContainer.style.flex = "0 0 auto";
         inputContainer.style.display = "flex";
         inputContainer.style.flexDirection = "column";
@@ -1773,7 +1952,7 @@ What do you do? (Shift+Enter for new line)`;
         this.clientCore.renderCharacterRadios();
 
         // Start the heartbeat synchronization loop
-        this.clientCore.pollInterval = setInterval(() => this.clientCore.syncState(), 5000);
+        this.clientCore.pollInterval = setInterval(() => this.clientCore.syncState(), 10000);
         this.clientCore.syncState();
     }
 }
