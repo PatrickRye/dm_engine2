@@ -1957,6 +1957,8 @@ What do you do? (Shift+Enter for new line)`;
     }
 }
 
+// Test environment: expose DMEngineClientCore globally so Jest can require() it
+typeof global !== "undefined" && (global.DMEngineClientCore = DMEngineClientCore);
 if (typeof module !== "undefined" && module.exports) {
     module.exports = class DMEnginePlugin extends Plugin {
         async onload() {
@@ -1986,5 +1988,7 @@ if (typeof module !== "undefined" && module.exports) {
             }
             if (leaf) workspace.revealLeaf(leaf);
         }
-    }
+    };
+    // Also export DMEngineClientCore as a named export (after module.exports is set)
+    module.exports.DMEngineClientCore = DMEngineClientCore;
 }
