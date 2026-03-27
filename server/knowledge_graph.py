@@ -86,7 +86,16 @@ class KnowledgeGraph(BaseModel):
     Stores nodes and edges with:
     - adjacency index: O(1) outgoing edge UUID lookup by predicate
     - edge_index: O(1) edge object lookup by (subject, predicate, object)
-    Callers must call _rebuild_adjacency() after manually modifying .edges.
+    - name_index: O(1) node UUID lookup by lowercase name
+
+    IMPORTANT — name_index invariant:
+    The name_index is maintained ONLY through add_node(), remove_node(), and
+    _rebuild_adjancy(). Direct assignments to kg.nodes[uuid] = node will NOT
+    update name_index and will cause get_node_by_name() / find_node_uuid() to
+    return stale or missing results. Use add_node() or call _sync_name_index()
+    after any bulk modification to .nodes.
+
+    Thread-safe: all mutating methods are decorated with @locked.
     """
     nodes: Dict[uuid.UUID, KnowledgeGraphNode] = Field(default_factory=dict)
     edges: List[KnowledgeGraphEdge] = Field(default_factory=list)
@@ -126,6 +135,18 @@ class KnowledgeGraph(BaseModel):
             self.adjacency[edge.subject_uuid][edge.predicate].add(edge.object_uuid)
             self.edge_index[(edge.subject_uuid, edge.predicate, edge.object_uuid)] = edge
 
+    @locked
+    def _sync_name_index(self) -> None:
+        """
+        Rebuild name_index from current nodes.
+
+        Call this after any direct bulk modification of .nodes (e.g. loading from a
+        snapshot or bulk-adding nodes without using add_node()).
+        """
+        self.name_index.clear()
+        for node in self.nodes.values():
+            self.name_index[node.name.lower()] = node.node_uuid
+
     def _resolve_uuid(self, identifier: Optional[uuid.UUID | str], name: Optional[str]) -> Optional[uuid.UUID]:
         if identifier:
             return identifier if isinstance(identifier, uuid.UUID) else uuid.UUID(identifier)
@@ -161,7 +182,16 @@ class KnowledgeGraph(BaseModel):
 
     def get_node_by_name(self, name: str) -> Optional[KnowledgeGraphNode]:
         uid = self.name_index.get(name.lower())
-        return self.nodes.get(uid) if uid else None
+        if uid:
+            return self.nodes.get(uid)
+        # name_index miss — if the node actually exists in .nodes, rebuild name_index
+        # (this handles direct kg.nodes[uuid] = node assignments that bypassed add_node)
+        name_lower = name.lower()
+        for node in self.nodes.values():
+            if node.name.lower() == name_lower:
+                self.name_index[name_lower] = node.node_uuid
+                return node
+        return None
 
     def find_node_uuid(self, name: str) -> Optional[uuid.UUID]:
         return self.name_index.get(name.lower())
