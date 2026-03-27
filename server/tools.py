@@ -161,6 +161,7 @@ from knowledge_tools import (
     query_bestiary,
     query_rulebook,
     query_campaign_module,
+    get_creature_tactics,
 )
 
 # -------------------------------------------------------------------

@@ -138,8 +138,14 @@ async def start_combat(
                 "x": float(enemy.get("x", 0.0)),
                 "y": float(enemy.get("y", 0.0)),
                 "z": float(enemy.get("z", 0.0)),
+                "surprised": enemy_name in surprised_set,
             }
         )
+
+    # Enrich all combatants with Ammann tactical fields from the engine entity
+    for c in combatants:
+        if not c.get("is_pc"):
+            c = await _enrich_combatant_with_ammann(c, vault_path)
 
     combatants = sorted(combatants, key=lambda x: x["init"], reverse=True)
     yaml_str = yaml.dump(
@@ -152,11 +158,15 @@ async def start_combat(
         "const p = dv.current(); if (!p || !p.combatants) return;\n"
         "let tbl = p.combatants.map((c, i) => [\n"
         '  i === p.current_turn_index ? "👉 "+c.init : c.init,\n'
-        "  c.name, `${c.hp}/${c.max_hp}`, c.ac, `(${c.x||0}, ${c.y||0}, ${c.z||0})`,\n"
+        "  c.name,\n"
+        "  `${c.hp}/${c.max_hp}`,\n"
+        "  c.ac,\n"
+        "  (c.ammann && c.ammann.creature_role ? c.ammann.creature_role.join(', ') : '—'),\n"
+        "  `(${c.x||0}, ${c.y||0}, ${c.z||0})`,\n"
         '  c.hp <= 0 ? "💀 Dead" : (c.conditions.length ? c.conditions.join(", ") : "Healthy")\n'
         "]);\n"
         'dv.header(2, "⚔️ Active Combat Tracker ⚔️"); dv.paragraph(`**Round:** ${p.round}`);\n'
-        'dv.table(["Init", "Combatant", "HP", "AC", "Pos (x,y,z)", "Status"], tbl);\n'
+        'dv.table(["Init", "Combatant", "HP", "AC", "Role (Ammann)", "Pos (x,y,z)", "Status"], tbl);\n'
         "if (p.readied_actions && p.readied_actions.length > 0) {\n"
         '  dv.header(3, "⏱️ Readied Actions");\n'
         "  let raData = p.readied_actions.map(ra => [ra.character, ra.trigger, ra.action]);\n"
@@ -286,6 +296,12 @@ async def update_combat_state(  # noqa: C901
                 await EventBus.adispatch(sot_event)
                 if "results" in sot_event.payload and sot_event.payload["results"]:
                     log_msg.extend(sot_event.payload["results"])
+
+                # Ammann tactical guidance for the creature whose turn is starting
+                new_combatant = combatants[yaml_data["current_turn_index"]]
+                guidance = _generate_tactical_guidance(new_combatant, vault_path)
+                if guidance:
+                    log_msg.append(guidance)
     except Exception as e:
         return str(e)
 
@@ -351,3 +367,107 @@ __all__ = [
     "update_combat_state",
     "end_combat",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Ammann Tactical Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _enrich_combatant_with_ammann(combatant: dict, vault_path: str) -> dict:
+    """
+    Load an enemy combatant's entity and enrich their dict with Ammann tactical fields.
+    These are read-only per-encounter annotations stored on ACTIVE_COMBAT.md.
+    """
+    entity = await _get_entity_by_name(combatant["name"], vault_path)
+    if not entity or not hasattr(entity, "creature_role"):
+        return combatant
+
+    # Phase-change tracking: reset for a fresh encounter
+    phase_trigger = getattr(entity, "phase_change_trigger_hp_pct", 0)
+    combatant["ammann"] = {
+        "creature_role": getattr(entity, "creature_role", []) or [],
+        "engagement_style": getattr(entity, "engagement_style", "") or "default",
+        "combat_flow_priority": getattr(entity, "combat_flow_priority", "") or "",
+        "recharge_priority": getattr(entity, "recharge_priority", False),
+        "action_synergies": getattr(entity, "action_synergies", []) or [],
+        "targeting_heuristic": getattr(entity, "targeting_heuristic", "") or "standard",
+        "retreat_threshold_hp_pct": getattr(entity, "retreat_threshold_hp_pct", 0),
+        "evasion_vector": getattr(entity, "evasion_vector", "") or "none",
+        "fanaticism_override": getattr(entity, "fanaticism_override", False),
+        "phase_change_trigger_hp_pct": phase_trigger,
+        "phase_change_description": getattr(entity, "phase_change_description", "") or "",
+        "unexpected_tactic": getattr(entity, "unexpected_tactic", "") or "",
+        "metaphorical_damage": getattr(entity, "metaphorical_damage", "") or "",
+        "expected_environment": getattr(entity, "expected_environment", []) or [],
+        # Per-encounter state (reset each combat)
+        "phase_used": False,
+        "retreat_attempted": False,
+        "surprised": combatant.get("surprised", False),
+    }
+    return combatant
+
+
+def _generate_tactical_guidance(combatant: dict, vault_path: str) -> str:
+    """
+    Generate Ammann-based tactical guidance for a creature's turn.
+    Returns a human-readable advisory string (or "" if nothing notable).
+    """
+    ammann = combatant.get("ammann")
+    if not ammann:
+        return ""
+
+    hp_pct = int((combatant["hp"] / max(combatant["max_hp"], 1)) * 100)
+    role = ammann.get("creature_role", [])
+    engagement = ammann.get("engagement_style", "")
+    priority = ammann.get("combat_flow_priority", "")
+    recharge = ammann.get("recharge_priority", False)
+    synergies = ammann.get("action_synergies", [])
+    targeting = ammann.get("targeting_heuristic", "")
+    retreat_pct = ammann.get("retreat_threshold_hp_pct", 0)
+    evasion = ammann.get("evasion_vector", "")
+    fanaticism = ammann.get("fanaticism_override", False)
+    phase_trigger = ammann.get("phase_change_trigger_hp_pct", 0)
+    phase_desc = ammann.get("phase_change_description", "")
+    unexpected = ammann.get("unexpected_tactic", "")
+    metaphor = ammann.get("metaphorical_damage", "")
+    phase_used = ammann.get("phase_used", False)
+    retreat_attempted = ammann.get("retreat_attempted", False)
+
+    msgs = []
+
+    # Phase change check
+    if phase_trigger > 0 and hp_pct <= phase_trigger and not phase_used:
+        msgs.append(f"[AMMANN] {combatant['name']} has reached {phase_trigger}% HP — activating phase change: {phase_desc}")
+
+    # Recharge ability alert
+    if recharge:
+        msgs.append(f"[AMMANN] {combatant['name']} (Brute/Controller) — prioritize recharge abilities immediately.")
+
+    # Action synergy reminder
+    if synergies:
+        msgs.append(f"[AMMANN] {combatant['name']} synergies: {' | '.join(synergies)}")
+
+    # Targeting tier
+    if targeting == "master_tactician":
+        msgs.append(f"[AMMANN] {combatant['name']} (Master Tactician) — targets healers/spellcasters first. Coordinate flanks before committing AoE.")
+    elif targeting == "strategic":
+        msgs.append(f"[AMMANN] {combatant['name']} (Strategic) — bypasses tanks to strike fragile backline.")
+    elif targeting == "reckless":
+        msgs.append(f"[AMMANN] {combatant['name']} (Reckless) — attacks nearest large target indiscriminately.")
+
+    # Retreat check (non-fanatics only)
+    if retreat_pct > 0 and not fanaticism and not retreat_attempted and hp_pct <= retreat_pct:
+        msgs.append(f"[AMMANN] {combatant['name']} has reached retreat threshold ({hp_pct}% ≤ {retreat_pct}%).")
+        if evasion and evasion != "none":
+            msgs.append(f"[AMMANN] Evasion: use {evasion} to disengage.")
+        else:
+            msgs.append(f"[AMMANN] No evasion vector — considers Dodge to Disengage.")
+
+    # Engagement style reminders
+    if engagement == "ambush":
+        msgs.append(f"[AMMANN] {combatant['name']} (Ambush/Lurker) — seeks stealth positioning for burst on next round.")
+    elif engagement == "seek_elevation":
+        msgs.append(f"[AMMANN] {combatant['name']} (Artillerist) — seeks high ground or cover before attacking.")
+
+    return " ".join(msgs)

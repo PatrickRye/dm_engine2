@@ -419,6 +419,21 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
             summoned_by_uuid=summoned_by_uuid,
             summon_spell=summon_spell,
             mounted_on_uuid=uuid.UUID(yaml_data["mounted_on_uuid"]) if yaml_data.get("mounted_on_uuid") else None,
+            # Ammann tactical fields (populated during creature hydration)
+            creature_role=yaml_data.get("creature_role", []),
+            engagement_style=yaml_data.get("engagement_style", ""),
+            combat_flow_priority=yaml_data.get("combat_flow_priority", ""),
+            recharge_priority=bool(yaml_data.get("recharge_priority", False)),
+            action_synergies=yaml_data.get("action_synergies", []),
+            targeting_heuristic=yaml_data.get("targeting_heuristic", ""),
+            retreat_threshold_hp_pct=int(yaml_data.get("retreat_threshold_hp_pct", 0)),
+            evasion_vector=yaml_data.get("evasion_vector", ""),
+            fanaticism_override=bool(yaml_data.get("fanaticism_override", False)),
+            phase_change_trigger_hp_pct=int(yaml_data.get("phase_change_trigger_hp_pct", 0)),
+            phase_change_description=yaml_data.get("phase_change_description", ""),
+            unexpected_tactic=yaml_data.get("unexpected_tactic", ""),
+            metaphorical_damage=yaml_data.get("metaphorical_damage", ""),
+            expected_environment=yaml_data.get("expected_environment", []),
         )
 
         # Explicit registration (BaseGameEntity no longer auto-registers)
@@ -663,6 +678,35 @@ async def sync_engine_to_vault(vault_path: str):
                 yaml_data["mounted_on_uuid"] = str(entity.mounted_on_uuid)
             elif "mounted_on_uuid" in yaml_data:
                 yaml_data["mounted_on_uuid"] = None
+
+            # Ammann tactical fields (read-only tactical data — preserved on sync)
+            if isinstance(entity, Creature):
+                if entity.creature_role:
+                    yaml_data["creature_role"] = entity.creature_role
+                if entity.engagement_style:
+                    yaml_data["engagement_style"] = entity.engagement_style
+                if entity.combat_flow_priority:
+                    yaml_data["combat_flow_priority"] = entity.combat_flow_priority
+                if entity.action_synergies:
+                    yaml_data["action_synergies"] = entity.action_synergies
+                if entity.targeting_heuristic:
+                    yaml_data["targeting_heuristic"] = entity.targeting_heuristic
+                if entity.retreat_threshold_hp_pct:
+                    yaml_data["retreat_threshold_hp_pct"] = entity.retreat_threshold_hp_pct
+                if entity.evasion_vector:
+                    yaml_data["evasion_vector"] = entity.evasion_vector
+                if entity.fanaticism_override:
+                    yaml_data["fanaticism_override"] = entity.fanaticism_override
+                if entity.phase_change_trigger_hp_pct:
+                    yaml_data["phase_change_trigger_hp_pct"] = entity.phase_change_trigger_hp_pct
+                if entity.phase_change_description:
+                    yaml_data["phase_change_description"] = entity.phase_change_description
+                if entity.unexpected_tactic:
+                    yaml_data["unexpected_tactic"] = entity.unexpected_tactic
+                if entity.metaphorical_damage:
+                    yaml_data["metaphorical_damage"] = entity.metaphorical_damage
+                if entity.expected_environment:
+                    yaml_data["expected_environment"] = entity.expected_environment
 
             # Reconstruct the file
             new_yaml_str = await asyncio.to_thread(yaml.dump, yaml_data, sort_keys=False)

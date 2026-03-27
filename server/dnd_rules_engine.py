@@ -318,6 +318,64 @@ class Creature(BaseGameEntity):
     companion_of_uuid: Optional[uuid.UUID] = None
     # REQ-PET-006: Beast Master Companion — True if currently commanded by ranger this turn
     companion_commanded_this_turn: bool = False
+    # ---- Ammann Tactical Analysis Fields ----
+    # Deduced from stat blocks during hydration; used by combat director and DM narration
+    creature_role: List[str] = Field(
+        default_factory=list,
+        description="Ammann role: Artillerist, Brute, Controller, Elite, Lurker, Minion, Skirmisher, Solo, Support, Tank",
+    )
+    engagement_style: str = Field(
+        default="",
+        description="How the creature initiates combat: ambush, charge, seek_elevation, reveal_from_cover, circle_flank, intercept, or default",
+    )
+    combat_flow_priority: str = Field(
+        default="",
+        description="Priority order for action selection: 'saving_throw_abilities > recharge > synergies > attacks' or abbreviated notes",
+    )
+    recharge_priority: bool = Field(
+        default=False,
+        description="True if creature has recharge abilities; should use them immediately on Round 1",
+    )
+    action_synergies: List[str] = Field(
+        default_factory=list,
+        description="Action combinations that create combat synergies, e.g. 'grapple then bite', 'prone then multiattack'",
+    )
+    targeting_heuristic: str = Field(
+        default="",
+        description="Ammann targeting tier: reckless (Int/Wis <=7), reactive (8-11), strategic (12-13), master_tactician (14+)",
+    )
+    retreat_threshold_hp_pct: int = Field(
+        default=0,
+        description="HP percentage at which creature retreats (0 = never). 70=moderate_wound, 40=serious_wound",
+    )
+    evasion_vector: str = Field(
+        default="",
+        description="How creature escapes when retreating: dodge, dash, burrow, fly, swim, or none",
+    )
+    fanaticism_override: bool = Field(
+        default=False,
+        description="True if mindless/undead/zealot — creature fights to 0 HP regardless of retreat_threshold",
+    )
+    phase_change_trigger_hp_pct: int = Field(
+        default=0,
+        description="HP percentage at which creature changes tactics (0 = no phase change)",
+    )
+    phase_change_description: str = Field(
+        default="",
+        description="Description of the behavioral pivot at phase_change_trigger_hp_pct",
+    )
+    unexpected_tactic: str = Field(
+        default="",
+        description="One unexpected control tactic beyond damage (forced movement, terrain, psychology, etc.)",
+    )
+    metaphorical_damage: str = Field(
+        default="",
+        description="How to narratively describe damage: e.g. 'Fire = Wrath', 'Psychic = Trauma', 'Necrotic = Despair'",
+    )
+    expected_environment: List[str] = Field(
+        default_factory=list,
+        description="Inferred preferred environments: burrow, climb_stealth, swim, fire_immune, underground, etc.",
+    )
     _load_snapshot: int = PrivateAttr(default=0)
 
     def _compute_snapshot(self) -> int:

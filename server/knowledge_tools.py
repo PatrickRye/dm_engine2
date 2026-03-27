@@ -129,6 +129,85 @@ def query_bestiary(
     return _search_markdown_for_keywords(vault_path, "bestiary", f"{creature_name} {specific_section}".strip(), top_n=1)
 
 
+@tool
+def get_creature_tactics(
+    creature_name: str, *, config: Annotated[RunnableConfig, InjectedToolArg]
+) -> str:
+    """
+    Retrieves the Ammann tactical analysis for a creature: role, engagement style,
+    action priorities, targeting heuristic, retreat thresholds, phase changes,
+    and synergies. Use this when planning combat, narrating NPC tactics,
+    or deciding how a creature behaves mid-battle.
+    Returns a human-readable tactical briefing.
+    """
+    vault_path = config["configurable"].get("thread_id")
+    entity = _get_entity_by_name(creature_name, vault_path)
+    if not entity or not hasattr(entity, "creature_role"):
+        return f"No tactical data found for '{creature_name}'. It may not have been hydrated as a creature yet."
+
+    role = entity.creature_role or []
+    engagement = entity.engagement_style or "default"
+    priority = entity.combat_flow_priority or "standard attacks"
+    recharge = "Yes — use recharge abilities immediately on Round 1" if entity.recharge_priority else "No recharge abilities"
+    synergies = ", ".join(entity.action_synergies) if entity.action_synergies else "None identified"
+    targeting = entity.targeting_heuristic or "standard"
+    retreat_pct = entity.retreat_threshold_hp_pct
+    if retreat_pct == 0 or entity.fanaticism_override:
+        retreat = "Never retreats (fanaticism override)" if entity.fanaticism_override else "Never retreats"
+    else:
+        retreat = f"Retreat threshold: {retreat_pct}% HP remaining"
+    evasion = entity.evasion_vector or "none"
+    phase_pct = entity.phase_change_trigger_hp_pct
+    phase_desc = entity.phase_change_description or "no phase change"
+    unexpected = entity.unexpected_tactic or "none recorded"
+    metaphor = entity.metaphorical_damage or "standard damage narration"
+    environment = ", ".join(entity.expected_environment) if entity.expected_environment else "any environment"
+
+    # Derive role description from Ammann role
+    role_descriptions = {
+        "Artillerist": "Seeks extreme range and cover, fires from safety",
+        "Brute": "Charges the center, relies on kinetic close-quarters damage",
+        "Controller": "Alters terrain, inflicts conditions, shapes the battlefield",
+        "Elite": "Multi-stage mechanics, often accompanied by minions",
+        "Lurker": "Ambush predator — stealth, burst damage, then retreat",
+        "Minion": "Fights exclusively in packs, low HP, low Intelligence",
+        "Skirmisher": "Hit-and-run, uses mobility for attrition",
+        "Solo": "Designed to fight groups alone with Legendary/Lair actions",
+        "Support": "Heals, buffs, or mitigates damage for allies",
+        "Tank": "High AC + Con, protects softer allies",
+    }
+    role_text = ", ".join(f"{r} ({role_descriptions.get(r, r)})" for r in role) if role else "Role not yet deduced"
+
+    # Targeting tier description
+    targeting_descriptions = {
+        "reckless": "Int/Wis ≤7: Attacks nearest source of pain or largest visual target",
+        "reactive": "Int/Wis 8-11: Indiscriminate targeting, minor adjustments if tactics fail",
+        "strategic": "Int/Wis 12-13: Bypasses tanks to strike fragile backline, coordinates flanks",
+        "master_tactician": "Int/Wis ≥14: Targets healers/spellcasters first, delays AoE until targets cluster",
+    }
+    targeting_text = targeting_descriptions.get(targeting.lower(), targeting)
+
+    return f"""
+=== AMMANN TACTICAL BRIEFING: {entity.name} ===
+{'':═<50}
+
+ROLE(S): {role_text}
+ENGAGEMENT: {engagement}
+ACTION PRIORITY: {priority}
+RECHARGE ABILITIES: {recharge}
+ACTION SYNERGIES: {synergies}
+TARGETING: {targeting_text}
+RETREAT: {retreat}
+EVASION VECTOR: {evasion}
+ENVIRONMENT: Prefers {environment}
+
+METAPHORICAL DAMAGE: {metaphor}
+UNEXPECTED TACTIC: {unexpected}
+
+PHASE CHANGE: {"At " + str(phase_pct) + "% HP — " + phase_desc if phase_pct > 0 else "No phase change"}
+{'':═<50}
+""".strip()
+
 
 @tool
 def query_rulebook(topic: str, *, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:

@@ -105,3 +105,53 @@ If missing, derive from locomotion and damage immunities:
 - **Metaphorical Damage:** Determine how its primary damage type (Acid = Spite, Cold = Apathy, Fire = Wrath, Psychic = Trauma, Necrotic = Despair) should be narratively described by the Game Master.
     
 - **Phase Change:** Suggest a behavioral pivot (e.g., at 50% HP, sheds armor for increased speed/damage).
+
+---
+
+### OUTPUT FORMAT
+
+Return a JSON object with **all of the following fields explicitly populated**. Do NOT leave fields blank or as empty arrays — if a deduction cannot be made, write "unknown" or "none". The machine-readable fields are consumed by the DM Engine combat director and must be present.
+
+```json
+{
+  "node_name": "Canonical name",
+  "size": "Medium",
+  "creature_type": "humanoid",
+  "ac": 15,
+  "hp": 45,
+  "speed": "30 ft",
+  "str_score": 16,
+  "dex_score": 12,
+  "con_score": 14,
+  "int_score": 10,
+  "wis_score": 11,
+  "cha_score": 8,
+  "cr": "2",
+  "special_abilities": ["Pack Tactics", "Relentless Endurance"],
+  "actions": ["Multiattack", "Bite"],
+  "legendary_actions": [],
+  "lair_actions": [],
+
+  "creature_role": ["Skirmisher", "Minion"],
+  "behavior_social": "pack",
+  "wants": "caloric_intake",
+  "engagement_style": "ambush",
+  "combat_flow_priority": "standard_attacks",
+  "recharge_priority": false,
+  "action_synergies": [],
+  "targeting_heuristic": "reactive",
+  "retreat_threshold_hp_pct": 70,
+  "evasion_vector": "dash",
+  "fanaticism_override": false,
+  "phase_change_trigger_hp_pct": 0,
+  "phase_change_description": "",
+  "unexpected_tactic": "none recorded",
+  "metaphorical_damage": "Fire = Wrath",
+  "expected_environment": ["burrow", "underground"],
+
+  "tags": ["creature", "goblin"],
+  "edges": [
+    { "predicate": "HOSTILE_TOWARD", "target_node": "PartyName", "weight": 0.9 }
+  ]
+}
+```

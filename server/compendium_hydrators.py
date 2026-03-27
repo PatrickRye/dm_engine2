@@ -238,6 +238,7 @@ def _kg_node_to_yaml(node: Dict[str, Any], vault_path: str) -> str:
     tags = node.get("tags", [])
     attributes = node.get("attributes", {})
 
+    # Build frontmatter — include all standard fields plus Ammann tactical fields
     frontmatter = {
         "id": str(uuid.uuid4()),
         "name": safe_name,
@@ -245,6 +246,22 @@ def _kg_node_to_yaml(node: Dict[str, Any], vault_path: str) -> str:
         "tags": tags,
         "attributes": attributes,
     }
+
+    # Ammann tactical fields — unpack if present
+    ammann_fields = [
+        "creature_role", "behavior_social", "wants", "engagement_style",
+        "combat_flow_priority", "recharge_priority", "action_synergies",
+        "targeting_heuristic", "retreat_threshold_hp_pct", "evasion_vector",
+        "fanaticism_override", "phase_change_trigger_hp_pct",
+        "phase_change_description", "unexpected_tactic",
+        "metaphorical_damage", "expected_environment",
+        "size", "creature_type", "ac", "hp", "speed",
+        "str_score", "dex_score", "con_score", "int_score", "wis_score", "cha_score",
+        "cr", "legendary_actions", "lair_actions", "special_abilities", "actions",
+    ]
+    for field in ammann_fields:
+        if field in node:
+            frontmatter[field] = node[field]
 
     body = f"\n# {safe_name}\n\n"
     if attributes.get("description"):
@@ -375,7 +392,88 @@ async def _hydrate_creatures(
     class CreatureSpec(BaseModel):
         node_name: str = Field(description="Canonical creature name")
         node_type: str = Field(default="creature")
-        attributes: Dict[str, Any] = Field(default_factory=dict)
+        # Standard D&D stat block fields
+        size: str = Field(default="", description="Size: Tiny, Small, Medium, Large, Huge, Gargantuan")
+        creature_type: str = Field(default="", description="Type: humanoid, beast, undead, fiend, etc.")
+        ac: int = Field(default=10, description="Armor Class")
+        hp: int = Field(default=0, description="Hit Points")
+        speed: str = Field(default="30 ft", description="Movement speed")
+        str_score: int = Field(default=10)
+        dex_score: int = Field(default=10)
+        con_score: int = Field(default=10)
+        int_score: int = Field(default=10)
+        wis_score: int = Field(default=10)
+        cha_score: int = Field(default=10)
+        cr: str = Field(default="0", description="Challenge Rating")
+        legendary_actions: List[str] = Field(default_factory=list)
+        lair_actions: List[str] = Field(default_factory=list)
+        special_abilities: List[str] = Field(default_factory=list)
+        actions: List[str] = Field(default_factory=list)
+        # Ammann tactical analysis fields
+        creature_role: List[str] = Field(
+            default_factory=list,
+            description="Ammann role(s): Artillerist, Brute, Controller, Elite, Lurker, Minion, Skirmisher, Solo, Support, Tank",
+        )
+        behavior_social: str = Field(
+            default="",
+            description="Social/ecological structure: pack, swarm, solitary, territorial, hierarchical",
+        )
+        wants: str = Field(
+            default="",
+            description="Primary motivation: caloric_intake, territory, wealth, domination, fanaticism, survival",
+        )
+        engagement_style: str = Field(
+            default="",
+            description="How creature initiates combat: ambush, charge_center, seek_elevation, reveal_from_cover, circle_flank, intercept, default",
+        )
+        combat_flow_priority: str = Field(
+            default="",
+            description="Action priority order: saving_throw_abilities > recharge > synergies > standard_attacks",
+        )
+        recharge_priority: bool = Field(
+            default=False,
+            description="True if creature has recharge abilities — use immediately on Round 1",
+        )
+        action_synergies: List[str] = Field(
+            default_factory=list,
+            description="Combos: grapple_then_bite, prone_then_multiattack, shove_then_attack, etc.",
+        )
+        targeting_heuristic: str = Field(
+            default="",
+            description="Ammann targeting: reckless (Int/Wis <=7), reactive (8-11), strategic (12-13), master_tactician (14+)",
+        )
+        retreat_threshold_hp_pct: int = Field(
+            default=0,
+            description="HP % at which creature retreats (0=never, 70=moderate_wound, 40=serious_wound)",
+        )
+        evasion_vector: str = Field(
+            default="",
+            description="Retreat method: dodge, dash, burrow, fly, swim, or none",
+        )
+        fanaticism_override: bool = Field(
+            default=False,
+            description="True if mindless/undead/zealot — fights to 0 HP regardless of retreat_threshold",
+        )
+        phase_change_trigger_hp_pct: int = Field(
+            default=0,
+            description="HP % triggering behavioral pivot (0=no change)",
+        )
+        phase_change_description: str = Field(
+            default="",
+            description="What the creature does at phase_change_trigger_hp_pct",
+        )
+        unexpected_tactic: str = Field(
+            default="",
+            description="One unexpected control effect beyond damage",
+        )
+        metaphorical_damage: str = Field(
+            default="",
+            description="Narrative damage type: Fire=Wrath, Cold=Apathy, Psychic=Trauma, Necrotic=Despair, etc.",
+        )
+        expected_environment: List[str] = Field(
+            default_factory=list,
+            description="Preferred terrain: burrow, climb_stealth, swim, fire_immune, underground, volcanic, aquatic",
+        )
         tags: List[str] = Field(default_factory=list)
         edges: List[Dict[str, Any]] = Field(default_factory=list)
 
@@ -386,13 +484,50 @@ async def _hydrate_creatures(
                 warnings.append(f"Failed to parse creature block: {block[:50]}...")
                 continue
 
-            # Write to vault
+            # Build node_dict with all explicit fields — _kg_node_to_yaml unpacks top-level fields
             node_dict = {
                 "node_name": spec.node_name,
                 "node_type": "creature",
+                # Legacy attributes dict (any freeform data the LLM returned)
                 "attributes": spec.attributes,
+                # Tags
                 "tags": spec.tags,
+                # KG edges
                 "edges": spec.edges,
+                # Standard stat block fields
+                "size": spec.size,
+                "creature_type": spec.creature_type,
+                "ac": spec.ac,
+                "hp": spec.hp,
+                "speed": spec.speed,
+                "str_score": spec.str_score,
+                "dex_score": spec.dex_score,
+                "con_score": spec.con_score,
+                "int_score": spec.int_score,
+                "wis_score": spec.wis_score,
+                "cha_score": spec.cha_score,
+                "cr": spec.cr,
+                "legendary_actions": spec.legendary_actions,
+                "lair_actions": spec.lair_actions,
+                "special_abilities": spec.special_abilities,
+                "actions": spec.actions,
+                # Ammann tactical analysis fields
+                "creature_role": spec.creature_role,
+                "behavior_social": spec.behavior_social,
+                "wants": spec.wants,
+                "engagement_style": spec.engagement_style,
+                "combat_flow_priority": spec.combat_flow_priority,
+                "recharge_priority": spec.recharge_priority,
+                "action_synergies": spec.action_synergies,
+                "targeting_heuristic": spec.targeting_heuristic,
+                "retreat_threshold_hp_pct": spec.retreat_threshold_hp_pct,
+                "evasion_vector": spec.evasion_vector,
+                "fanaticism_override": spec.fanaticism_override,
+                "phase_change_trigger_hp_pct": spec.phase_change_trigger_hp_pct,
+                "phase_change_description": spec.phase_change_description,
+                "unexpected_tactic": spec.unexpected_tactic,
+                "metaphorical_damage": spec.metaphorical_damage,
+                "expected_environment": spec.expected_environment,
             }
             filepath = _write_kg_entity_to_vault(node_dict, vault_path)
             entities_written.append(filepath)
