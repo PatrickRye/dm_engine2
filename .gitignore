@@ -17,6 +17,9 @@ __pycache__/
 # Engine & State Locks
 tasks/active_locks.json
 *.lock
+checkpoints.db
+checkpoints.db-wal
+checkpoints.db-shm
 
 # Environment Variables
 .env

@@ -16,12 +16,16 @@ This is the "fishbowl" — the deterministic walls that prevent the LLM from
 violating established world facts, thematic boundaries, or storylet contracts.
 """
 
+from __future__ import annotations
+
 import re
 import uuid
-from typing import Dict, Any, List, NamedTuple, Optional, Tuple
+from typing import Dict, Any, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
 from knowledge_graph import GraphPredicate
-from storylet import GraphMutation
+
+if TYPE_CHECKING:
+    from storylet import GraphMutation
 
 
 class GuardrailResult:
@@ -451,6 +455,11 @@ class HardGuardrails:
         Returns GuardrailResult.disallowed if any SVO claim lacks a covering mutation.
         """
         if not narrative_text:
+            return GuardrailResult(allowed=True)
+
+        # Fast-path gate: skip expensive _extract_svo_triples (KG lookups per capitalized word)
+        # if the text contains no transfer verb phrases at all.
+        if not any(verb in narrative_text.lower() for verb in self._TRANSFER_VERBS):
             return GuardrailResult(allowed=True)
 
         triples = self._extract_svo_triples(narrative_text)

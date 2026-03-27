@@ -194,6 +194,36 @@ def _load_modifiable_value(yaml_data: dict, field_name: str, fallback_base_value
     return mv
 
 
+# ---------------------------------------------------------------------
+# Entity schema versioning — enables forward migration when the model evolves
+# ---------------------------------------------------------------------
+_CURRENT_ENTITY_SCHEMA_VERSION = 1
+
+# Migration functions: schema_version (from) -> migration_function(dict -> dict)
+_MIGRATION_FUNCTIONS: dict[int, callable] = {
+    # Add migrations here as the schema evolves, e.g.:
+    # 1: _migrate_v1_to_v2,
+    # 2: _migrate_v2_to_v3,
+}
+
+
+def _migrate_entity_schema(yaml_data: dict) -> None:
+    """
+    Apply all pending migrations to entity YAML data in-place.
+
+    Reads schema_version from yaml_data (defaulting to 1 for legacy files),
+    then runs each migration function in order until current version is reached.
+    """
+    current_version = yaml_data.get("schema_version", 1)
+    while current_version < _CURRENT_ENTITY_SCHEMA_VERSION:
+        migrate_fn = _MIGRATION_FUNCTIONS.get(current_version)
+        if migrate_fn is None:
+            # No migration defined for this version — assume file is already current
+            break
+        migrate_fn(yaml_data)
+        current_version = yaml_data.get("schema_version", current_version + 1)
+
+
 from compendium_manager import CompendiumManager
 from spatial_engine import spatial_service
 from registry import clear_registry, get_all_entities, register_entity
@@ -305,6 +335,9 @@ async def load_entity_into_engine(filepath: str, vault_path: str) -> Optional[Cr
         yaml_data, _ = await read_markdown_entity_no_lock(filepath)
         if not yaml_data:
             return None
+
+        # Schema version migration: run pending migrations before loading
+        _migrate_entity_schema(yaml_data)
 
         tags = yaml_data.get("tags", [])
         # Only load entities that have stats
@@ -558,6 +591,9 @@ async def sync_engine_to_vault(vault_path: str):
         filepath = entity._filepath
         try:
             yaml_data, markdown_body = await read_markdown_entity_no_lock(filepath)
+
+            # Mark current schema version — used for future migration when entity model evolves
+            yaml_data["schema_version"] = 1
 
             # Update the YAML with the new deterministic values
             if isinstance(entity, Creature):

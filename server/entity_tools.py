@@ -812,6 +812,9 @@ async def mark_entity_immutable(
         f"Storylet effects attempting to modify this entity will be rejected by Hard Guardrails."
     )
 
+# Tool marker: mutations from this tool require Hard Guardrail validation before committing
+mark_entity_immutable.metadata = {"defer_mutations": True}
+
 
 
 __all__ = [

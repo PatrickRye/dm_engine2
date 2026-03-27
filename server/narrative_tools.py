@@ -193,6 +193,8 @@ async def create_storylet(  # noqa: C901
         f"Effects: {len(effects_list)} mutations."
     )
 
+# Tool marker: mutations from this tool require Hard Guardrail validation before committing
+create_storylet.metadata = {"defer_mutations": True}
 
 
 @tool
@@ -336,6 +338,9 @@ async def request_graph_mutations(
             pass
 
     return f"MECHANICAL TRUTH: {len(parsed_mutations)} graph mutations committed. Knowledge Graph updated."
+
+# Tool marker: mutations from this tool require Hard Guardrail validation before committing
+request_graph_mutations.metadata = {"defer_mutations": True}
 
 
 

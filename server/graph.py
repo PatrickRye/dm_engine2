@@ -36,8 +36,12 @@ _mutation_manager = MutationManager()
 # ---------------------------------------------------------------------
 _GRAG_CACHE_TTL_SECONDS = 60.0
 _GRAG_CACHE_MAX_SIZE = 32
-# { (vault_path, active_character): (timestamp, result_str) }
-_grag_cache: Dict[Tuple[str, str], Tuple[float, str]] = {}
+# Increment _SYSTEM_PROMPT_VERSION when planner_node or narrator_node system prompt
+# strings change — this invalidates all GraphRAG cache entries so the new prompts
+# are used for fresh KG context on the next request.
+_SYSTEM_PROMPT_VERSION = 1
+# { (vault_path, active_character, system_prompt_version): (timestamp, result_str) }
+_grag_cache: Dict[Tuple[str, str, int], Tuple[float, str]] = {}
 _grag_cache_lock = threading.RLock()
 
 # KG immutable constraints are vault-wide (don't depend on active_character)
@@ -124,7 +128,7 @@ def _get_grag_context(kg, vault_path: str = None, active_character: str = None, 
     """
     # Opt E: TTL + LRU cache with max size
     if vault_path and active_character:
-        cache_key = (vault_path, active_character)
+        cache_key = (vault_path, active_character, _SYSTEM_PROMPT_VERSION)
         with _grag_cache_lock:
             now = time.monotonic()
             if cache_key in _grag_cache:
@@ -346,15 +350,29 @@ def _build_kg_constraints_prompt(kg, vault_path: str = "default") -> str:
         _kg_constraints_cache[vault_path] = (now, result, kg_id)
     return result
 
-# Names of tools that require Hard Guardrail validation before committing mutations.
-# These are routed through action_logic (separate ToolNode) to enforce privilege segregation:
-# the Creative LLM (planner/narrator) can PROPOSE mutations only via these tools,
-# but must route through Hard Guardrails in action_logic to commit them.
+# DEPRECATED: Replaced by per-tool metadata["defer_mutations"] flag.
+# See _build_defer_mutations_frozenset() inside build_graph() which reads tool metadata.
+# Kept here for reference during migration only.
 LOGIC_TOOL_NAMES = frozenset({
     "request_graph_mutations",
     "mark_entity_immutable",
     "create_storylet",
 })
+
+
+def _build_defer_mutations_frozenset(master_tools_list):
+    """Build frozenset of tool names that carry defer_mutations=True in their metadata.
+
+    This replaces the static LOGIC_TOOL_NAMES frozenset with a metadata-driven approach.
+    Adding defer_mutations=True to a tool's metadata is now the canonical way to route
+    that tool through action_logic for Hard Guardrail validation.
+    """
+    result = set()
+    for t in master_tools_list:
+        name = getattr(t, "name", None)
+        if name and getattr(t, "metadata", None) and t.metadata.get("defer_mutations"):
+            result.add(name)
+    return frozenset(result)
 
 
 def _get_tool_name_from_message(msg) -> str | None:
@@ -382,6 +400,10 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     """
     if checkpointer is None:
         checkpointer = MemorySaver()
+
+    # Build metadata-driven frozenset: tools with defer_mutations=True in their metadata
+    # replace the static LOGIC_TOOL_NAMES frozenset
+    defer_mutations_set = _build_defer_mutations_frozenset(master_tools_list)
 
     # ------------------------------------------------------------------
     # NODE: Planner — translates player intent into tool calls
@@ -911,7 +933,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
 
         last_msg = state["messages"][-1]
         tool_name = _get_tool_name_from_message(last_msg)
-        if not tool_name or tool_name not in LOGIC_TOOL_NAMES:
+        if not tool_name or tool_name not in defer_mutations_set:
             # No mutation tool was called; this is a no-op passthrough
             return {}
 
@@ -1077,12 +1099,16 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
         if _mutation_manager.should_clear_on_human_message(state):
             _mutation_manager.clear(state)
             updates["pending_mutations"] = []
-            await write_audit_log(
-                state.get("vault_path", "default"),
-                "ClearMutations",
-                "Stale Mutations Cleared",
-                "New player turn detected. Cleared pending_mutations from rejected turn.",
-            )
+            try:
+                await write_audit_log(
+                    state.get("vault_path", "default"),
+                    "ClearMutations",
+                    "Stale Mutations Cleared",
+                    "New player turn detected. Cleared pending_mutations from rejected turn.",
+                )
+            except Exception as e:
+                import sys
+                print(f"[WARNING] write_audit_log failed in clear_mutations_node: {e}", file=sys.stderr)
 
         # Route based on what planner returned (the AIMessage before this node)
         tool_name = _get_tool_name_from_message(last_msg)
@@ -1090,7 +1116,7 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
             goto = "ingestion"
         elif tool_name == "hydrate_compendium":
             goto = "compendium_hydration"
-        elif tool_name in LOGIC_TOOL_NAMES:
+        elif tool_name in defer_mutations_set:
             goto = "action_logic"
         elif tool_name and tool_name not in ("__end__",):
             goto = "action"
@@ -1326,25 +1352,43 @@ def build_graph(draft_llm, qa_llm, master_tools_list, checkpointer=None):
     # committed but the narrative is rejected — fixing the rollback/checkpointer
     # issue that required speculative execution.
     async def commit_node(state: DMState, config: RunnableConfig):
-        from registry import get_knowledge_graph
+        """
+        Commits approved mutations and marks the turn as complete.
 
-        vault_path = state.get("vault_path", "default")
-        kg = get_knowledge_graph(vault_path)
-        narrative_context = state.get("draft_response", "")
+        On error: captures the exception in mutation_errors and exits gracefully
+        via Command(goto=END) instead of propagating the exception.
+        """
+        try:
+            from registry import get_knowledge_graph
 
-        errors = await _mutation_manager.commit(state, kg, vault_path, draft_llm)
+            vault_path = state.get("vault_path", "default")
+            kg = get_knowledge_graph(vault_path)
+            narrative_context = state.get("draft_response", "")
 
-        await write_audit_log(
-            vault_path, "CommitNode", "Turn Complete",
-            f"Draft approved. Errors: {len(errors)}"
-        )
+            errors = await _mutation_manager.commit(state, kg, vault_path, draft_llm)
 
-        return {
-            "qa_feedback": "APPROVED",
-            # Explicitly return cleared lists so LangGraph state merge picks them up
-            "pending_mutations": [],
-            "mutation_errors": errors,
-        }
+            await write_audit_log(
+                vault_path, "CommitNode", "Turn Complete",
+                f"Draft approved. Errors: {len(errors)}"
+            )
+
+            return {
+                "qa_feedback": "APPROVED",
+                # Explicitly return cleared lists so LangGraph state merge picks them up
+                "pending_mutations": [],
+                "mutation_errors": errors,
+            }
+        except Exception as e:
+            import sys
+            error_msg = f"CommitNode error: {type(e).__name__}: {e}"
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            from langgraph.types import Command
+            return Command(
+                goto=END,
+                update={
+                    "mutation_errors": list(state.get("mutation_errors", [])) + [error_msg],
+                },
+            )
 
     # ------------------------------------------------------------------
     # GRAPH ASSEMBLY

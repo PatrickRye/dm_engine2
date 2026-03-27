@@ -13,12 +13,19 @@ Provides:
 No LLM calls — pure Python deterministic models.
 """
 
+from __future__ import annotations
+
 import uuid
 from enum import Enum
-from typing import List, Dict, Any, Optional, Union, Set
+from typing import List, Dict, Any, Optional, Union, Set, TYPE_CHECKING
 from pydantic import BaseModel, Field
 
-from knowledge_graph import KnowledgeGraph, KnowledgeGraphNode, GraphPredicate, GraphNodeType
+# GraphPredicate and GraphNodeType are used in RUNTIME code (enum constructors,
+# comparisons), not just annotations — keep them as real imports.
+from knowledge_graph import GraphPredicate, GraphNodeType
+
+if TYPE_CHECKING:
+    from knowledge_graph import KnowledgeGraph, KnowledgeGraphNode
 
 
 class TensionLevel(str, Enum):
